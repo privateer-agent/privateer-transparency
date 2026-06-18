@@ -1,0 +1,23 @@
+# Secrets — never commit. Nothing real should ever live in this transparency repo.
+.env
+.env.*
+!.env.example
+*.env
+config.env
+*.pem
+*.key
+*.keystore
+*.jks
+*.p12
+*.mobileprovision
+
+# Dependencies / build output
+node_modules/
+dist/
+build/
+*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
