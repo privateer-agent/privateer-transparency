@@ -295,4 +295,53 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
   return { inputTokens, outputTokens, costUsd, providerCostUsd, sources: [] };
 }
 
-module.exports = { isNearModel, toUpstreamId, generateText, generateTextStream };
+/**
+ * Faithful OpenAI-compatible passthrough for the agent CLI billed endpoint.
+ * Unlike generateText/generateTextStream (which massage messages for the mobile
+ * app — NO_TABLES, table→bullet, history windowing), this forwards the client's
+ * OpenAI body untouched so agent **tool_calls** pass through both ways. Mirrors
+ * inferenceService.proxyChatCompletion's contract but targets the NEAR TEE host:
+ * there is no ZDR two-key dance or provider routing here — confidential compute
+ * (the TEE) is the privacy guarantee, and every NEAR call uses the single server
+ * key. Returns the raw upstream Response for the caller to pipe; billing uses
+ * calcNearCost. Non-OK responses are returned (not thrown) so the route can
+ * forward NEAR's OpenAI-shaped error body verbatim.
+ *
+ * @returns {Promise<{ response: Response, modelId: string }>} modelId stays
+ *   `near/`-prefixed so the caller bills via the NEAR pricing path.
+ */
+async function proxyChatCompletion(openaiBody) {
+  const modelId = openaiBody?.model;
+  const headers = nearHeaders(); // throws NEAR_KEY_UNAVAILABLE (503) if unset
+  const body = { ...openaiBody, model: toUpstreamId(modelId) };
+  if (body.stream) {
+    // vLLM only emits the usage chunk when this is set — without it the usage
+    // stays 0 and the turn under-bills.
+    body.stream_options = { ...(body.stream_options || {}), include_usage: true };
+  }
+
+  // Cover time-to-headers with the NEAR timeout; the body stream is unbounded
+  // (the route owns inactivity handling), so we clear the timer once headers land.
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), NEAR_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(`${NEAR_BASE()}/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: abort.signal,
+    });
+  } catch (fetchErr) {
+    if (fetchErr?.name === 'AbortError') {
+      throw asProviderError(`NEAR AI request timed out after ${NEAR_TIMEOUT_MS}ms for ${modelId}`, modelId, { timedOut: true, statusCode: 504 });
+    }
+    throw fetchErr;
+  } finally {
+    clearTimeout(timer);
+  }
+
+  return { response, modelId };
+}
+
+module.exports = { isNearModel, toUpstreamId, generateText, generateTextStream, proxyChatCompletion, calcNearCost };

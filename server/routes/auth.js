@@ -27,6 +27,7 @@ const router = express.Router();
 const nacl = require('tweetnacl');
 const User = require('../models/userModel');
 const UserAuthMethod = require('../models/userAuthMethodModel');
+const UserSession = require('../models/userSessionModel');
 const EmailService = require('../services/emailService');
 const tokenService = require('../services/tokenService');
 const redis = require('../services/redisClient');
@@ -331,6 +332,91 @@ router.post('/logout', authenticate, async (req, res) => {
     Sentry.captureException(error, { tags: { op: 'auth_logout' } });
     logger.error('Logout error:', error);
     res.status(500).json({ message: 'Error signing out' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Session registry (linked devices)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /auth/sessions
+ * Lists the user's active sessions, one row per device (grouped by familyId;
+ * legacy rows without one are listed individually). Powers the app's
+ * "Linked terminals" screen and is the device directory future remote-access
+ * will pick from. The caller's own session is flagged `current`.
+ */
+router.get('/sessions', authenticate, async (req, res) => {
+  try {
+    const now = new Date();
+    const rows = await UserSession.find({
+      userId: req.user._id,
+      revokedAt: null,
+      expiresAt: { $gt: now },
+    }).sort({ createdAt: -1 }).lean();
+
+    // Collapse a device's many access-token rows into a single entry.
+    const byDevice = new Map();
+    let currentKey = null;
+    for (const row of rows) {
+      const key = row.familyId || row.jti;
+      if (row.jti === req.jti) currentKey = key;
+      const existing = byDevice.get(key);
+      if (!existing) {
+        byDevice.set(key, {
+          id: key,
+          client: row.client || 'app',
+          deviceLabel: row.deviceLabel || null,
+          authMethod: row.authMethod,
+          createdAt: row.createdAt,   // first seen (oldest, since we overwrite downward)
+          lastSeenAt: row.createdAt,  // most recent (first row wins — sorted desc)
+        });
+      } else {
+        // rows are newest-first, so later iterations are older → push createdAt back
+        existing.createdAt = row.createdAt;
+      }
+    }
+
+    const sessions = Array.from(byDevice.values()).map((s) => ({
+      ...s,
+      current: s.id === currentKey,
+    }));
+
+    res.json({ sessions });
+  } catch (error) {
+    Sentry.captureException(error, { tags: { op: 'auth_sessions_list' } });
+    logger.error('Sessions list error:', error);
+    res.status(500).json({ message: 'Error loading sessions' });
+  }
+});
+
+/**
+ * DELETE /auth/sessions/:id
+ * Revokes one device lineage (id = familyId). Scoped to the caller's userId so
+ * no one can revoke another user's session. Falls back to a single jti for
+ * legacy rows that predate familyId.
+ */
+router.delete('/sessions/:id', authenticate, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const revoked = await tokenService.revokeSessionFamily(req.user._id, id);
+
+    if (revoked === 0) {
+      // Legacy session without a familyId — revoke the single access jti.
+      const result = await UserSession.updateOne(
+        { userId: req.user._id, jti: id, revokedAt: null },
+        { $set: { revokedAt: new Date() } }
+      );
+      if (!result.matchedCount) {
+        return res.status(404).json({ message: 'Session not found' });
+      }
+    }
+
+    res.json({ message: 'Session revoked' });
+  } catch (error) {
+    Sentry.captureException(error, { tags: { op: 'auth_sessions_revoke' } });
+    logger.error('Session revoke error:', error);
+    res.status(500).json({ message: 'Error revoking session' });
   }
 });
 

@@ -1280,6 +1280,51 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
 }
 
 /**
+ * Faithful OpenAI-compatible chat-completions proxy for the Privateer Agent
+ * CLI. Unlike generateTextStream (text-only, reshaped for the mobile/graph UI),
+ * this preserves the upstream wire format end to end — tool_calls, multi-part
+ * content, finish_reason — so an agentic client can function-call against the
+ * user's account. It only (a) pins the request to the right model + ZDR
+ * key/provider routing and (b) asks for usage so the caller can bill, then
+ * returns the raw upstream Response for the caller to pipe.
+ *
+ * NEAR AI (TEE) models route to a different confidential-compute host. They ARE
+ * supported here — confidential compute is our strongest privacy guarantee, so
+ * the agent CLI should be able to use it — via a dedicated NEAR passthrough that
+ * preserves tool_calls. No OpenRouter ZDR/provider routing applies to that path
+ * (the TEE is the guarantee); billing routes to NEAR pricing via calcInferenceCost.
+ *
+ * @returns {Promise<{ response: Response, modelId: string }>}
+ */
+async function proxyChatCompletion(openaiBody, { requireZdr = true } = {}) {
+  const nearAiService = require('./nearAiService');
+  if (nearAiService.isNearModel(openaiBody?.model)) {
+    return nearAiService.proxyChatCompletion(openaiBody);
+  }
+
+  const effectiveModelId = await resolveModelId(openaiBody?.model);
+
+  // Pass the client body through unchanged except for the fields we own: the
+  // resolved model, and (when streaming) usage accounting so we can bill.
+  const body = { ...openaiBody, model: effectiveModelId };
+  if (body.stream) {
+    body.stream_options = { ...(body.stream_options || {}), include_usage: true };
+  }
+
+  const useZdrKey = await resolveUseZdrKey({ requireZdr, modelId: effectiveModelId });
+  await applyZdrRouting(body, effectiveModelId, { useZdrKey });
+  applyProviderRouting(body);
+
+  const response = await fetch(`${OPENROUTER_BASE}/chat/completions`, orFetchInit({
+    method: 'POST',
+    headers: orHeaders(useZdrKey),
+    body: JSON.stringify(body),
+  }));
+
+  return { response, modelId: effectiveModelId };
+}
+
+/**
  * Convert an OpenRouter image-gen failure into a user-facing assistant message.
  * Errors arrive as `Error("OpenRouter error 400: {<json>}")`; we lift the
  * provider's `error.message`, strip the version-stamped model id back to its
@@ -1558,6 +1603,6 @@ async function extractMemoryCandidates({ userMessage, aiResponse, existingMemori
   }
 }
 
-module.exports = { generateText, generateTextStream, generateImage, submitVideoGeneration, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, formatImageGenErrorForUser, formatVideoGenErrorForUser, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
+module.exports = { generateText, generateTextStream, proxyChatCompletion, calcOpenRouterCost, calcInferenceCost, generateImage, submitVideoGeneration, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, formatImageGenErrorForUser, formatVideoGenErrorForUser, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
   // Shared formatting helpers reused by nearAiService (OpenAI-compatible NEAR path).
   NO_TABLES_DIRECTIVE, withNoTables, convertTablesToBullets, createStreamingTableConverter };
