@@ -34,7 +34,12 @@ const tokenService = require('../services/tokenService');
 const redis = require('../services/redisClient');
 const relayHub = require('../services/relayHub');
 const { authenticate } = require('../middleware/auth');
-const { loginRateLimiter, registerRateLimiter, nonceLimiter, walletVerifyLimiter, resendVerificationLimiter, resetLimit } = require('../middleware/rateLimiter');
+const { loginRateLimiter, registerRateLimiter, nonceLimiter, walletVerifyLimiter, resendVerificationLimiter, resetLimit, deviceApproveLimiter, sessionSpawnLimiter } = require('../middleware/rateLimiter');
+
+// Max concurrent live child (per-terminal) sessions a single machine login may
+// spawn. Bounds credential amplification: even with a leaked credential set, a
+// refresh token can't be turned into an unbounded fleet of billable sessions.
+const MAX_CHILD_SESSIONS_PER_FAMILY = Number(process.env.MAX_CHILD_SESSIONS_PER_FAMILY) || 16;
 const { validateEmail, validatePassword } = require('../services/validation');
 const Sentry = require('@sentry/node');
 
@@ -328,21 +333,65 @@ router.post('/refresh', async (req, res) => {
  * lineage) from a machine login's refresh token, WITHOUT rotating that parent
  * token. Each running terminal calls this once at startup so it rotates its own
  * token in isolation — many terminals on one machine no longer share (and fight
- * over) a single rotating refresh token. The child is tagged with the parent's
- * familyId so it's hidden from the device list and revoked with the parent.
+ * over) a single rotating refresh token. Children surface in GET /auth/sessions
+ * and are individually revocable; revoking the parent device cascades to them.
+ *
+ * Security (hardened): this is NOT unauthenticated. The caller must present BOTH
+ *   (a) a valid (non-revoked, non-expired) parent refresh token in the body, AND
+ *   (b) a real, RS256-signed access token for the SAME account as a Bearer header
+ *       (allowed to be expired — the refresh token is the liveness proof; the
+ *       signed access JWT is a possession proof that raises the bar above
+ *       "refresh token alone").
+ * Plus: per-IP rate limit and a hard per-family cap on concurrent live children
+ * so a leaked credential set can't be amplified into an unbounded billable fleet.
  */
-router.post('/session/spawn', async (req, res) => {
+router.post('/session/spawn', sessionSpawnLimiter, async (req, res) => {
   try {
     const { refreshToken, deviceLabel } = req.body || {};
     if (!refreshToken) {
       return res.status(400).json({ message: 'Refresh token is required' });
     }
+
+    // Possession proof: a real signed access token (expiry not enforced here).
+    const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+    if (!bearer) {
+      return res.status(401).json({ message: 'Authorization required', code: 'AUTH_REQUIRED' });
+    }
+    let claims;
+    try {
+      claims = tokenService.verifyAccessTokenAllowExpired(bearer);
+    } catch (_) {
+      return res.status(401).json({ message: req.t('errors.invalidToken') || 'Invalid token', code: 'INVALID_TOKEN' });
+    }
+
     const parent = await RefreshToken.findValid(refreshToken);
     if (!parent) {
       return res.status(401).json({ message: req.t('errors.invalidRefreshToken'), code: 'INVALID_TOKEN' });
     }
+    // The access JWT and the refresh token must belong to the same account.
+    if (!claims?.sub || parent.userId.toString() !== claims.sub.toString()) {
+      return res.status(403).json({ message: 'Token mismatch', code: 'TOKEN_MISMATCH' });
+    }
+
     // A child can't itself parent more children — root the lineage at the device.
     const parentFamilyId = parent.parentFamilyId || parent.familyId || parent.jti;
+
+    // Anti-amplification: cap concurrent live children per machine login. Count
+    // DISTINCT child familyIds (a child rotating its access token creates extra
+    // UserSession rows under the same familyId — those must not inflate the count).
+    const liveChildFamilies = await UserSession.distinct('familyId', {
+      userId: parent.userId,
+      parentFamilyId,
+      revokedAt: null,
+      expiresAt: { $gt: new Date() },
+    });
+    if (liveChildFamilies.length >= MAX_CHILD_SESSIONS_PER_FAMILY) {
+      return res.status(429).json({
+        message: 'Too many active terminals for this device. Sign one out and try again.',
+        code: 'CHILD_SESSION_CAP',
+      });
+    }
+
     const label = typeof deviceLabel === 'string' && deviceLabel.trim()
       ? deviceLabel.trim().slice(0, 100)
       : (parent.deviceLabel || undefined);
@@ -393,9 +442,11 @@ router.get('/sessions', authenticate, async (req, res) => {
       userId: req.user._id,
       revokedAt: null,
       expiresAt: { $gt: now },
-      // Hide per-terminal child sessions — they're ephemeral and surfaced live in
-      // "Active terminals" (relay registry), not as manageable linked devices.
-      parentFamilyId: { $exists: false },
+      // Per-terminal child sessions ARE included now (security: they must be
+      // visible and individually revocable, not invisible long-lived credentials).
+      // They carry parentFamilyId so the app can nest them under their device; a
+      // child whose access tokens have all expired drops off here automatically,
+      // and revoking the parent cascades to any it can't see.
     }).sort({ createdAt: -1 }).lean();
 
     // Collapse a device's many access-token rows into a single entry.
@@ -411,6 +462,11 @@ router.get('/sessions', authenticate, async (req, res) => {
           client: row.client || 'app',
           deviceLabel: row.deviceLabel || null,
           authMethod: row.authMethod,
+          // Per-terminal child session → the parent device's familyId it belongs
+          // to (null for top-level devices). Lets the app nest terminals under
+          // their machine login; each is still independently revocable by `id`.
+          parentId: row.parentFamilyId || null,
+          isChild: !!row.parentFamilyId,
           createdAt: row.createdAt,   // first seen (oldest, since we overwrite downward)
           lastSeenAt: row.createdAt,  // most recent (first row wins — sorted desc)
         });
