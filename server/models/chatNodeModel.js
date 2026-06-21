@@ -235,6 +235,13 @@ const chatNodeSchema = new mongoose.Schema(
       default: 0,
       min: 0
     },
+    // Resolved model id that produced this node's AI response (e.g. "near/…",
+    // "openai/gpt-4o"). Non-sensitive metadata — NOT user content — so stored
+    // plaintext; drives the client ZDR/TEE privacy shield on the node card.
+    modelId: {
+      type: String,
+      default: null
+    },
     metadata: {
       type: Map,
       of: mongoose.Schema.Types.Mixed,
@@ -393,7 +400,8 @@ chatNodeSchema.statics.createGraphNode = async function(data) {
     imageUrl = null,
     imageAttachments = null,
     videoAttachments = null,
-    fileAttachments = null
+    fileAttachments = null,
+    modelId = null
   } = data;
 
   const colorByType = {
@@ -417,6 +425,7 @@ chatNodeSchema.statics.createGraphNode = async function(data) {
     imageAttachments: imageAttachments || [],
     videoAttachments: videoAttachments || [],
     fileAttachments: fileAttachments || [],
+    modelId,
     visualMetadata: {
       position,
       color: colorByType[nodeType] || '#4F46E5',
