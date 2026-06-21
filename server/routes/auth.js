@@ -28,9 +28,11 @@ const nacl = require('tweetnacl');
 const User = require('../models/userModel');
 const UserAuthMethod = require('../models/userAuthMethodModel');
 const UserSession = require('../models/userSessionModel');
+const RefreshToken = require('../models/refreshTokenModel');
 const EmailService = require('../services/emailService');
 const tokenService = require('../services/tokenService');
 const redis = require('../services/redisClient');
+const relayHub = require('../services/relayHub');
 const { authenticate } = require('../middleware/auth');
 const { loginRateLimiter, registerRateLimiter, nonceLimiter, walletVerifyLimiter, resendVerificationLimiter, resetLimit } = require('../middleware/rateLimiter');
 const { validateEmail, validatePassword } = require('../services/validation');
@@ -320,6 +322,44 @@ router.post('/refresh', async (req, res) => {
   }
 });
 
+/**
+ * POST /auth/session/spawn
+ * Mints a NEW, independent CLI session (its own familyId + refresh-token
+ * lineage) from a machine login's refresh token, WITHOUT rotating that parent
+ * token. Each running terminal calls this once at startup so it rotates its own
+ * token in isolation — many terminals on one machine no longer share (and fight
+ * over) a single rotating refresh token. The child is tagged with the parent's
+ * familyId so it's hidden from the device list and revoked with the parent.
+ */
+router.post('/session/spawn', async (req, res) => {
+  try {
+    const { refreshToken, deviceLabel } = req.body || {};
+    if (!refreshToken) {
+      return res.status(400).json({ message: 'Refresh token is required' });
+    }
+    const parent = await RefreshToken.findValid(refreshToken);
+    if (!parent) {
+      return res.status(401).json({ message: req.t('errors.invalidRefreshToken'), code: 'INVALID_TOKEN' });
+    }
+    // A child can't itself parent more children — root the lineage at the device.
+    const parentFamilyId = parent.parentFamilyId || parent.familyId || parent.jti;
+    const label = typeof deviceLabel === 'string' && deviceLabel.trim()
+      ? deviceLabel.trim().slice(0, 100)
+      : (parent.deviceLabel || undefined);
+
+    const { accessToken, refreshToken: childRefresh } = await tokenService.issueTokenPair(
+      parent.userId,
+      parent.authMethod,
+      { client: 'cli', deviceLabel: label, parentFamilyId }
+    );
+    res.json({ accessToken, refreshToken: childRefresh });
+  } catch (error) {
+    Sentry.captureException(error, { tags: { op: 'auth_session_spawn' } });
+    logger.error('Session spawn error:', error);
+    res.status(500).json({ message: 'Error creating session' });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Logout
 // ---------------------------------------------------------------------------
@@ -353,6 +393,9 @@ router.get('/sessions', authenticate, async (req, res) => {
       userId: req.user._id,
       revokedAt: null,
       expiresAt: { $gt: now },
+      // Hide per-terminal child sessions — they're ephemeral and surfaced live in
+      // "Active terminals" (relay registry), not as manageable linked devices.
+      parentFamilyId: { $exists: false },
     }).sort({ createdAt: -1 }).lean();
 
     // Collapse a device's many access-token rows into a single entry.
@@ -377,9 +420,15 @@ router.get('/sessions', authenticate, async (req, res) => {
       }
     }
 
+    const ids = Array.from(byDevice.keys());
+    // Which of these devices currently has a live agent on the relay (so the
+    // app can show "online" + enable remote-access). Ephemeral, Redis-backed.
+    const online = await relayHub.onlineMap(ids);
+
     const sessions = Array.from(byDevice.values()).map((s) => ({
       ...s,
       current: s.id === currentKey,
+      online: !!online[s.id],
     }));
 
     res.json({ sessions });
@@ -417,6 +466,44 @@ router.delete('/sessions/:id', authenticate, async (req, res) => {
     Sentry.captureException(error, { tags: { op: 'auth_sessions_revoke' } });
     logger.error('Session revoke error:', error);
     res.status(500).json({ message: 'Error revoking session' });
+  }
+});
+
+/**
+ * PATCH /auth/sessions/:id
+ * Renames one device lineage (id = familyId) — sets its human-friendly
+ * deviceLabel. Scoped to the caller's userId. Lets a user tell apart multiple
+ * terminals running on the same machine. Falls back to a single jti for legacy
+ * rows that predate familyId.
+ */
+router.patch('/sessions/:id', authenticate, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const raw = req.body?.deviceLabel;
+    if (typeof raw !== 'string' || !raw.trim()) {
+      return res.status(400).json({ message: 'deviceLabel is required' });
+    }
+    // Cap matches the device-flow label limit (deviceAuth.js).
+    const deviceLabel = raw.trim().slice(0, 100);
+
+    const renamed = await tokenService.renameSessionFamily(req.user._id, id, deviceLabel);
+
+    if (renamed === 0) {
+      // Legacy session without a familyId — rename the single access jti.
+      const result = await UserSession.updateOne(
+        { userId: req.user._id, jti: id, revokedAt: null },
+        { $set: { deviceLabel } }
+      );
+      if (!result.matchedCount) {
+        return res.status(404).json({ message: 'Session not found' });
+      }
+    }
+
+    res.json({ message: 'Session renamed', deviceLabel });
+  } catch (error) {
+    Sentry.captureException(error, { tags: { op: 'auth_sessions_rename' } });
+    logger.error('Session rename error:', error);
+    res.status(500).json({ message: 'Error renaming session' });
   }
 });
 
