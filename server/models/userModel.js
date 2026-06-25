@@ -67,6 +67,35 @@ const userSchema = new mongoose.Schema(
         enum: ['active', 'cancelled', 'expired', 'pending', 'past_due', 'none'],
         default: 'pending'
       },
+      // Which billing provider owns this subscription. 'stripe' for web / dApp
+      // Store (native PaymentSheet) subs; 'play' for Google Play Billing subs.
+      // null for the default free plan (no provider). Used to branch
+      // cancellation (Stripe API vs Play deep-link) and to keep each provider's
+      // webhook from mutating the other's subscriptions.
+      provider: {
+        type: String,
+        enum: ['stripe', 'play', null],
+        default: null
+      },
+      // Google Play Billing state — populated only when provider === 'play'.
+      // Mirrors the role of stripeSubscriptionId/stripePriceId for Play. The
+      // shared fields above (plan/status/startDate/endDate/autoRenew/
+      // billingInterval) stay authoritative for entitlement regardless of
+      // provider, so entitlementService needs no provider-specific logic.
+      play: {
+        // Current active purchase token (the Play subscription identity). Sparse
+        // + unique via the index below so one token can't bind to two users.
+        purchaseToken: String,
+        // Play subscription product id (one product per paid tier).
+        productId: String,
+        // 'monthly' | 'annual' base plan within the product.
+        basePlanId: String,
+        // latestOrderId from the Play Developer API (for support/refund lookups).
+        orderId: String,
+        // Prior token in an upgrade/downgrade chain (Play replaces the token on
+        // a plan change); retained for reconciliation against RTDN.
+        linkedToken: String
+      },
       stripeSubscriptionId: String,
       // Which Stripe price the user is currently billed on — used to tell
       // monthly/annual apart for the same plan tier.
@@ -217,6 +246,10 @@ const userSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+// One Play purchase token binds to exactly one user. Sparse so the vast
+// majority of users (no Play sub) aren't indexed and don't collide on null.
+userSchema.index({ 'subscription.play.purchaseToken': 1 }, { unique: true, sparse: true });
 
 userSchema.pre('save', async function(next) {
   if (this.password && (this.isModified('password') || this.isNew)) {

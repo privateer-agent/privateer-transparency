@@ -38,7 +38,7 @@
 
 const ModelRateConfig = require('../models/modelRateConfigModel');
 const billingService = require('./billingService');
-const { getRatioParamMode } = require('../data/imageModelCapabilities');
+const { getRatioParamMode, supportsTransparency } = require('../data/imageModelCapabilities');
 const { isZdrModel } = require('../data/zdrProviders');
 const { safeFetch } = require('../utils/safeFetch');
 const Sentry = require('@sentry/node');
@@ -882,17 +882,25 @@ async function generateText(parts, options = {}) {
  * the user prompt instead. All other OpenRouter image models receive
  * image_config.
  */
-function buildOpenRouterAspectFields(modelId, aspectRatio, imageSize) {
+function buildOpenRouterAspectFields(modelId, aspectRatio, imageSize, transparentBackground = false) {
   const mode = getRatioParamMode(modelId);
 
   if (mode === 'prompt') {
-    // Caller embeds the ratio in the user prompt — no body field.
+    // Caller embeds the ratio in the user prompt — no body field. These models
+    // (Nano Banana) also have no transparency param; a transparent background is
+    // requested via the prompt text instead.
     return {};
   }
 
   const image_config = {};
   if (aspectRatio) image_config.aspect_ratio = aspectRatio;
   if (imageSize)   image_config.image_size   = imageSize;
+  // Transparent background only for models that honor it. Force PNG (alpha-capable)
+  // so the transparency survives the provider's encode step.
+  if (transparentBackground && supportsTransparency(modelId)) {
+    image_config.background = 'transparent';
+    image_config.output_format = 'png';
+  }
   return Object.keys(image_config).length > 0 ? { image_config } : {};
 }
 
@@ -947,7 +955,7 @@ async function generateImage(parts, options = {}) {
       modalities: ['image', 'text'],
       isMediaAction: true,
       requireZdr: options.requireZdr,
-      ...buildOpenRouterAspectFields(modelId, options.aspectRatio, options.imageSize),
+      ...buildOpenRouterAspectFields(modelId, options.aspectRatio, options.imageSize, options.transparentBackground),
     });
   } catch (err) {
     logger.warn('[generateImage] OpenRouter call failed:', { modelId, ms: Date.now() - _t0, code: err?.code, timedOut: !!err?.timedOut });
