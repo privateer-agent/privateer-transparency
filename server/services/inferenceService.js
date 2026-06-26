@@ -1549,9 +1549,11 @@ async function selectRelevantMemories({ memories, userMessage, requireZdr = fals
 }
 
 /**
- * Inspect a finished chat turn and propose at most a couple of durable memory
- * candidates the assistant should remember next time. Returns plaintext only;
- * the caller is responsible for encrypting + persisting via the standard
+ * Inspect a finished chat turn and propose AT MOST ONE durable memory
+ * candidate the assistant should remember next time — and only when it clears
+ * a high bar (the model must rate it "high" importance; everything else is
+ * dropped). The default, expected result is an empty list. Returns plaintext
+ * only; the caller is responsible for encrypting + persisting via the standard
  * memory CRUD flow.
  *
  * @param {{ userMessage: string, aiResponse: string, existingMemories: string[] }} args
@@ -1566,12 +1568,15 @@ async function extractMemoryCandidates({ userMessage, aiResponse, existingMemori
     : [];
 
   const system = [
-    'You extract DURABLE, REUSABLE facts about the user that are worth remembering across future conversations.',
-    'Keep: stable preferences, ongoing projects, persistent context, role, tools, names of people/pets the user mentions naturally.',
-    'Skip: one-off questions, ephemeral state ("I\'m running this now"), opinions about your reply, anything already implied by EXISTING MEMORIES.',
-    'At most 2 candidates. Empty array is the correct answer when nothing is worth keeping. Precision over recall.',
+    'You extract DURABLE, HIGH-VALUE facts about the user that will materially improve future conversations.',
+    'The bar is HIGH. Saving a memory is a long-term commitment, so the default answer is to save NOTHING.',
+    'Only keep a fact that is ALL of: (a) stable over months, (b) volunteered as a fact about the user themselves (not the topic), (c) likely to change how you answer an UNRELATED future message, and (d) not already implied by EXISTING MEMORIES.',
+    'Keep ONLY things like: a durable stated preference, a long-running project or role, an enduring personal constraint, or the name of a person/pet/place tied to the user.',
+    'Skip everything else, including: one-off questions or tasks, the topic or subject matter being discussed, facts about the world, anything the ASSISTANT said, transient or in-progress state, opinions about your reply, restatable trivia, and anything an unrelated future chat would not benefit from.',
+    'When in doubt, SKIP. An empty array is the correct and expected answer for the large majority of turns. Precision massively over recall.',
+    'At most 1 candidate. Rate each candidate\'s importance as "high", "medium", or "low" — only "high" will be kept, so do not bother emitting a candidate you would not rate "high".',
     'Phrase each as a concise third-person fact (e.g. "Prefers dark mode in all apps", "Owns a 2019 Tesla Model 3").',
-    'Return JSON ONLY of the form: {"candidates":[{"content":"..."}]}.'
+    'Return JSON ONLY of the form: {"candidates":[{"content":"...","importance":"high"}]}.'
   ].join('\n');
 
   const existingBlock = existing.length > 0
@@ -1590,7 +1595,7 @@ async function extractMemoryCandidates({ userMessage, aiResponse, existingMemori
     'ASSISTANT RESPONSE:',
     trimmedResponse,
     '',
-    'Return JSON: {"candidates":[{"content":"..."}]}'
+    'Return JSON: {"candidates":[{"content":"...","importance":"high|medium|low"}]}'
   ].join('\n');
 
   const EXTRACT_TIMEOUT_MS = 6000;
@@ -1614,9 +1619,13 @@ async function extractMemoryCandidates({ userMessage, aiResponse, existingMemori
     const parsed = JSON.parse(match[0]);
     const list = Array.isArray(parsed.candidates) ? parsed.candidates : [];
     const candidates = list
-      .map(c => (c && typeof c.content === 'string' ? c.content.trim() : ''))
+      // Strict gate: only explicitly "high" importance survives. A missing or
+      // non-"high" rating is dropped — the default is to save nothing.
+      .filter(c => c && typeof c.content === 'string'
+        && String(c.importance || '').trim().toLowerCase() === 'high')
+      .map(c => c.content.trim())
       .filter(s => s.length > 0 && s.length <= 500)
-      .slice(0, 2)
+      .slice(0, 1)
       .map(content => ({ content }));
     return { candidates };
   } catch (err) {
