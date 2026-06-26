@@ -68,13 +68,14 @@ const userSchema = new mongoose.Schema(
         default: 'pending'
       },
       // Which billing provider owns this subscription. 'stripe' for web / dApp
-      // Store (native PaymentSheet) subs; 'play' for Google Play Billing subs.
-      // null for the default free plan (no provider). Used to branch
-      // cancellation (Stripe API vs Play deep-link) and to keep each provider's
-      // webhook from mutating the other's subscriptions.
+      // Store (native PaymentSheet) subs; 'play' for Google Play Billing subs;
+      // 'apple' for App Store (StoreKit) subs. null for the default free plan
+      // (no provider). Used to branch cancellation (Stripe API vs Play/App Store
+      // deep-link) and to keep each provider's webhook from mutating another's
+      // subscriptions.
       provider: {
         type: String,
-        enum: ['stripe', 'play', null],
+        enum: ['stripe', 'play', 'apple', null],
         default: null
       },
       // Google Play Billing state — populated only when provider === 'play'.
@@ -95,6 +96,24 @@ const userSchema = new mongoose.Schema(
         // Prior token in an upgrade/downgrade chain (Play replaces the token on
         // a plan change); retained for reconciliation against RTDN.
         linkedToken: String
+      },
+      // App Store (StoreKit) state — populated only when provider === 'apple'.
+      // The originalTransactionId is the stable subscription identity across
+      // renewals (it never changes for the life of the subscription), so it's
+      // what we bind to the account + dedupe on; the App Store Server
+      // Notifications and re-validations key on it. Mirrors the role of
+      // stripeSubscriptionId / play.purchaseToken. The shared fields above
+      // (plan/status/startDate/endDate/autoRenew/billingInterval) stay
+      // authoritative for entitlement regardless of provider.
+      apple: {
+        // Stable across renewals; sparse + unique via the index below so one
+        // subscription can't bind to two accounts.
+        originalTransactionId: String,
+        // Most recent transactionId seen (per-period; changes each renewal).
+        transactionId: String,
+        // App Store product id (one product per tier+interval).
+        productId: String,
+        environment: String
       },
       stripeSubscriptionId: String,
       // Which Stripe price the user is currently billed on — used to tell
@@ -250,6 +269,7 @@ const userSchema = new mongoose.Schema(
 // One Play purchase token binds to exactly one user. Sparse so the vast
 // majority of users (no Play sub) aren't indexed and don't collide on null.
 userSchema.index({ 'subscription.play.purchaseToken': 1 }, { unique: true, sparse: true });
+userSchema.index({ 'subscription.apple.originalTransactionId': 1 }, { unique: true, sparse: true });
 
 userSchema.pre('save', async function(next) {
   if (this.password && (this.isModified('password') || this.isNew)) {
