@@ -46,6 +46,7 @@ const { getNearPricing, NEAR_PREFIX } = require('../data/nearModels');
 
 const NEAR_BASE = () => process.env.NEAR_AI_BASE_URL || 'https://cloud-api.near.ai/v1';
 const NEAR_TIMEOUT_MS = Number(process.env.NEAR_TEXT_TIMEOUT_MS) || 240_000;
+const NEAR_MEDIA_TIMEOUT_MS = Number(process.env.NEAR_MEDIA_TIMEOUT_MS) || 120_000;
 
 // Billing knobs mirror inferenceService's fallbacks so cost is comparable.
 const DEFAULT_MARKUP = parseFloat(process.env.BILLING_MARKUP_FACTOR || '2.5');
@@ -344,4 +345,141 @@ async function proxyChatCompletion(openaiBody) {
   return { response, modelId };
 }
 
-module.exports = { isNearModel, toUpstreamId, generateText, generateTextStream, proxyChatCompletion, calcNearCost };
+// ── Confidential image generation (FLUX) ─────────────────────────────────────
+//
+// NEAR's image models (e.g. FLUX.2) are raw OpenAI-compatible vLLM endpoints, so
+// they use the dedicated POST /v1/images/generations route (NOT chat/completions
+// with modalities, which is OpenRouter's convention). Returns the same shape as
+// inferenceService.generateImage — { images: [{buffer, mimeType}], responseText,
+// inputTokens } — so chatController's persistence/billing path is untouched.
+
+// Map our aspect-ratio + size selection to the pixel `size` ("WxH") the OpenAI
+// images API expects. Long edge tracks the size tier; both edges snapped to a
+// multiple of 32 (FLUX latent stride).
+function ratioToPixelSize(aspectRatio, imageSize) {
+  const base = imageSize === '4K' ? 4096 : imageSize === '2K' ? 2048 : imageSize === '0.5K' ? 512 : 1024;
+  let [w, h] = String(aspectRatio || '1:1').split(':').map(Number);
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) { w = 1; h = 1; }
+  const long = Math.max(w, h);
+  const snap = (px) => Math.max(256, Math.round((base * px / long) / 32) * 32);
+  return `${snap(w)}x${snap(h)}`;
+}
+
+async function nearMediaRequest(path, init, modelId) {
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), NEAR_MEDIA_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(`${NEAR_BASE()}${path}`, { ...init, signal: abort.signal });
+  } catch (fetchErr) {
+    if (fetchErr?.name === 'AbortError') {
+      throw asProviderError(`NEAR AI request timed out after ${NEAR_MEDIA_TIMEOUT_MS}ms for ${modelId}`, modelId, { timedOut: true });
+    }
+    throw fetchErr;
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    if (res.status === 404 || res.status === 503 || res.status >= 500) {
+      throw asProviderError(`The selected model (${modelId}) is currently unavailable. Please choose a different model in Settings.`, modelId, { statusCode: res.status });
+    }
+    const err = new Error(`NEAR AI error ${res.status}: ${errText}`);
+    if (res.status === 429) err.statusCode = 429;
+    throw err;
+  }
+  return res;
+}
+
+async function generateImage(parts, options = {}) {
+  const modelId = options.modelId;
+  const upstream = toUpstreamId(modelId);
+  const normalizedParts = Array.isArray(parts) ? parts : [parts];
+
+  // FLUX via the images endpoint is text→image: collapse the parts into a single
+  // prompt string. (Reference-image edits use a different multipart endpoint we
+  // don't surface yet; the controller's fallback covers that case.)
+  const prompt = normalizedParts
+    .map((p) => (typeof p === 'string' ? p : (p?.text || p?.textBlock || '')))
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+
+  const body = {
+    model: upstream,
+    prompt,
+    n: 1,
+    size: ratioToPixelSize(options.aspectRatio, options.imageSize),
+    response_format: 'b64_json',
+  };
+
+  let data;
+  try {
+    const res = await nearMediaRequest('/images/generations', {
+      method: 'POST',
+      headers: nearHeaders(),
+      body: JSON.stringify(body),
+    }, modelId);
+    data = await res.json();
+  } catch (err) {
+    if (!err.__sentryReported) {
+      Sentry.captureException(err, { tags: { op: 'near_image' }, extra: { modelId } });
+      err.__sentryReported = true;
+    }
+    throw err;
+  }
+
+  const images = [];
+  for (const item of (Array.isArray(data?.data) ? data.data : [])) {
+    if (item?.b64_json) {
+      images.push({ buffer: Buffer.from(item.b64_json, 'base64'), mimeType: 'image/png' });
+    } else if (typeof item?.url === 'string') {
+      try {
+        const r = await fetch(item.url);
+        if (r.ok) {
+          images.push({ buffer: Buffer.from(await r.arrayBuffer()), mimeType: r.headers.get('content-type') || 'image/png' });
+        }
+      } catch { /* skip unfetchable url */ }
+    }
+  }
+
+  return { images, responseText: '', inputTokens: data?.usage?.prompt_tokens || 0 };
+}
+
+// ── Confidential transcription (Whisper) ─────────────────────────────────────
+//
+// NEAR's Whisper is an OpenAI-compatible vLLM ASR endpoint: multipart/form-data
+// POST to /v1/audio/transcriptions with a `file` part (NOT OpenRouter's JSON
+// `input_audio` body). Returns { text, providerCostUsd } so the audio route bills
+// identically; provider cost is estimated from token pricing since the ASR
+// response carries no cost/generation-id.
+async function transcribe({ audioBase64, format, language, modelId }) {
+  const upstream = toUpstreamId(modelId);
+  const bytes = Buffer.from(audioBase64, 'base64');
+  const ext = (format || 'm4a').replace(/[^a-z0-9]/gi, '') || 'm4a';
+
+  const form = new FormData();
+  form.append('model', upstream);
+  form.append('file', new Blob([bytes]), `audio.${ext}`);
+  form.append('temperature', '0');
+  if (language) form.append('language', language);
+
+  const { Authorization } = nearHeaders(); // throws NEAR_KEY_UNAVAILABLE if unset
+  const res = await nearMediaRequest('/audio/transcriptions', {
+    method: 'POST',
+    headers: { Authorization }, // let fetch set the multipart Content-Type + boundary
+    body: form,
+  }, modelId);
+  const data = await res.json();
+  const text = typeof data?.text === 'string' ? data.text : '';
+
+  // No cost/generation-id on the response → estimate from completion pricing.
+  const pricing = await getNearPricing(modelId).catch(() => null);
+  const estTokens = Math.ceil(text.length / 4);
+  const providerCostUsd = pricing?.completionPerToken != null
+    ? estTokens * pricing.completionPerToken
+    : 0;
+  return { text, providerCostUsd };
+}
+
+module.exports = { isNearModel, toUpstreamId, generateText, generateTextStream, proxyChatCompletion, calcNearCost, generateImage, transcribe };

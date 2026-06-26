@@ -625,6 +625,13 @@ const IMAGE_MODEL_CACHE_MS = 5 * 60 * 1000;
 
 async function isImageInputModel(modelId) {
   if (!modelId || typeof modelId !== 'string') return false;
+  // NEAR vision models (Qwen-VL, Gemma, Kimi…) aren't in OpenRouter's catalog, so
+  // the lookup below would miss them and silently substitute an OpenRouter vision
+  // model — breaking the confidential guarantee. Honor the NEAR catalog instead.
+  if (modelId.startsWith('near/')) {
+    const { isNearImageInputModel } = require('../data/nearModels');
+    return isNearImageInputModel(modelId);
+  }
   try {
     const now = Date.now();
     if (!_imageModelCache.ids || now - _imageModelCache.at > IMAGE_MODEL_CACHE_MS) {
@@ -905,6 +912,14 @@ function buildOpenRouterAspectFields(modelId, aspectRatio, imageSize, transparen
 }
 
 async function generateImage(parts, options = {}) {
+  // NEAR confidential image models (FLUX) use the dedicated /v1/images endpoint,
+  // not OpenRouter's chat-completions-with-modalities convention. Delegate before
+  // resolveModelId so the `near/` id is preserved.
+  const nearAiService = require('./nearAiService');
+  if (nearAiService.isNearModel(options.modelId)) {
+    return nearAiService.generateImage(parts, options);
+  }
+
   const normalizedParts = Array.isArray(parts) ? parts : [parts];
   const modelId = await resolveModelId(options.modelId);
 
@@ -1611,6 +1626,6 @@ async function extractMemoryCandidates({ userMessage, aiResponse, existingMemori
   }
 }
 
-module.exports = { generateText, generateTextStream, proxyChatCompletion, calcOpenRouterCost, calcInferenceCost, generateImage, submitVideoGeneration, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, formatImageGenErrorForUser, formatVideoGenErrorForUser, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
+module.exports = { generateText, generateTextStream, proxyChatCompletion, calcOpenRouterCost, calcInferenceCost, calcImageGenCost, generateImage, submitVideoGeneration, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, formatImageGenErrorForUser, formatVideoGenErrorForUser, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
   // Shared formatting helpers reused by nearAiService (OpenAI-compatible NEAR path).
   NO_TABLES_DIRECTIVE, withNoTables, convertTablesToBullets, createStreamingTableConverter };
