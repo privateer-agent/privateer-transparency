@@ -26,6 +26,7 @@ const router = express.Router();
 const {
   sendMessage,
   streamMessage,
+  planNodes,
   getTokenStatus,
   uploadImage,
   uploadFile,
@@ -58,6 +59,10 @@ router.post('/message', limitTextInput, requireDailyCap('message'), checkCreditB
 
 // Stream message — same gating as /message; delivers tokens via SSE.
 router.post('/stream', limitTextInput, requireDailyCap('message'), checkCreditBalance(0.05), requireConcurrencySlot(), streamMessage);
+
+// Plan multi-node fan-out (graph). Cheap planner call (no concurrency slot,
+// minimal balance floor); the actual node generations each go through /stream.
+router.post('/plan', limitTextInput, checkCreditBalance(0), planNodes);
 
 // Generate or edit image based on intent
 router.post('/generate-or-edit-image', limitTextInput, requireCloudBackend(), requireDailyCap('imageGen'), checkCreditBalance(0), requireConcurrencySlot(), async (req, res) => {
