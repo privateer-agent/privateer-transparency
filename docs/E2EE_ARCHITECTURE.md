@@ -156,7 +156,7 @@ Content models: `Chat`, `ChatGraph`, `ChatNode`, `ChatEdge`, `Message`,
 Client:
 - `client/services/cryptoService.ts` — KDF, wrap/unwrap, encrypt/decrypt.
 - `client/services/authService.ts` — login, register, password change, refresh.
-- `client/services/walletAuthService.ts` — SIWS + wallet KEK derivation.
+- `client/services/walletAuthShared.ts` + `walletAuthService.{web,android,ios}.ts` — SIWS + wallet KEK derivation (shared HKDF-from-signature core, with per-platform signing adapters).
 - `client/contexts/AuthContext.tsx` — auth state, lifecycle.
 - `client/screens/LoginScreen.tsx`, `SignupScreen.tsx`, `SecurityScreen.tsx`.
 

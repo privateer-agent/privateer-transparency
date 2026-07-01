@@ -39,7 +39,7 @@ crypto + the wire format + the inference routing in this repo.
 | Area | Files | What it proves |
 |---|---|---|
 | **Client crypto core** | [`client/services/cryptoService.ts`](client/services/cryptoService.ts) | KDF/KEK derivation, master-key wrap/unwrap, `encryptText`/`encryptBinary` — the heart of the claim |
-| **Wallet auth + KEK** | [`client/services/walletAuthService.ts`](client/services/walletAuthService.ts), [`walletAuthShared.ts`](client/services/walletAuthShared.ts), [`internal/argon2.ts`](client/services/internal/argon2.ts), [`internal/secureKv.ts`](client/services/internal/secureKv.ts) | wallet-signature → key derivation; on-device secure storage |
+| **Wallet auth + KEK** | [`walletAuthShared.ts`](client/services/walletAuthShared.ts), [`walletAuthService.web.ts`](client/services/walletAuthService.web.ts), [`walletAuthService.android.ts`](client/services/walletAuthService.android.ts), [`internal/argon2.ts`](client/services/internal/argon2.ts), [`internal/secureKv.ts`](client/services/internal/secureKv.ts) | wallet-signature → key derivation; on-device secure storage |
 | **Auth/vault flow** | [`client/services/authService.ts`](client/services/authService.ts) | register/login/password-change never send the key or password-derived KEK |
 | **Sharing** | [`client/services/shareService.ts`](client/services/shareService.ts) | E2EE-preserving public shares via a URL-fragment key |
 | **Confidential models** | [`client/components/AttestationSheet.tsx`](client/components/AttestationSheet.tsx) | how TEE attestation is surfaced to users |

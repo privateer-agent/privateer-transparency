@@ -6,8 +6,9 @@ client/services/internal/argon2.web.ts
 client/services/internal/secureKv.ts
 client/services/internal/secureKv.web.ts
 client/services/shareService.ts
-client/services/walletAuthService.ts
 client/services/walletAuthService.web.ts
+client/services/walletAuthService.android.ts
+client/services/walletAuthService.ios.ts
 client/services/walletAuthShared.ts
 docs/CONTENT_ENCRYPTION.md
 docs/E2EE_ARCHITECTURE.md
