@@ -145,7 +145,7 @@ const chatSchema = new mongoose.Schema(
       // and re-fetch paths are uniform. Legacy docs carry plaintext
       // filename/mimeType and no storageRef — read-only fallback.
       fileAttachments: [{
-        type: { type: String, enum: ['pdf', 'audio', 'docx', 'csv', 'code'], required: true },
+        type: { type: String, enum: ['pdf', 'audio', 'video', 'docx', 'csv', 'code'], required: true },
         storageType: { type: String, enum: ['cloud', 'local'], default: 'cloud' },
         // S3 object key for cloud ciphertext, or local fileId for on-device bytes.
         storageRef: { type: String, default: null },

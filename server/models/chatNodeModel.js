@@ -75,7 +75,7 @@ const chatNodeSchema = new mongoose.Schema(
     // File attachments for file/note nodes — binaries are stored either in S3 (cloud)
     // or on-device (local); only encrypted metadata/refs live here.
     fileAttachments: [{
-      fileType:          { type: String, enum: ['text', 'pdf', 'docx', 'csv', 'code', 'audio'] },
+      fileType:          { type: String, enum: ['text', 'pdf', 'docx', 'csv', 'code', 'audio', 'video'] },
       storageType:       { type: String, enum: ['cloud', 'local'], default: 'cloud' },
       s3Key:             { type: String, default: '' },
       s3Url:             { type: String, default: '' },
