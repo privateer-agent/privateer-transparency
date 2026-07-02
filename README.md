@@ -44,7 +44,7 @@ crypto + the wire format + the inference routing in this repo.
 | **Sharing** | [`client/services/shareService.ts`](client/services/shareService.ts) | E2EE-preserving public shares via a URL-fragment key |
 | **Confidential models** | [`client/components/AttestationSheet.tsx`](client/components/AttestationSheet.tsx) | how TEE attestation is surfaced to users |
 | **Server vault + auth** | [`server/models/userModel.js`](server/models/userModel.js), [`server/routes/auth.js`](server/routes/auth.js), [`server/middleware/auth.js`](server/middleware/auth.js) | server stores only the *wrapped* master key |
-| **Ciphertext-only storage** | content models + [`server/routes/`](server/routes/) (chat, graph, projects, images, share) | every persisted content field is `encrypted*` |
+| **Ciphertext-only storage** | content models + [`server/routes/`](server/routes/) (chat, graph, projects, images, share, cargo) | every persisted content field is `encrypted*` |
 | **ZDR inference routing** | [`server/services/inferenceService.js`](server/services/inferenceService.js), [`server/services/nearAiService.js`](server/services/nearAiService.js) | two-key ZDR enforcement + NEAR AI TEE attestation |
 | **Specs** | [`docs/E2EE_ARCHITECTURE.md`](docs/E2EE_ARCHITECTURE.md), [`docs/CONTENT_ENCRYPTION.md`](docs/CONTENT_ENCRYPTION.md) | threat model, KEK derivation, wire format `{"iv":…,"ct":…}` |
 

@@ -53,15 +53,19 @@ const {
 const ShareSnapshot = require('../models/shareSnapshotModel');
 const Chat = require('../models/chatModel');
 const ChatGraph = require('../models/chatGraphModel');
+const Cargo = require('../models/cargoModel');
+
+const { validateCargoPayload } = require('../utils/shareCargoValidation');
 
 const MAX_ASSETS = 200;
 const SHARE_ASSET_CONTENT_TYPE = 'application/octet-stream';
+const SHARE_SOURCE_TYPES = ['chat', 'graph', 'cargo'];
 
 function newToken() {
   return crypto.randomBytes(16).toString('base64url');
 }
 
-// Verify the authenticated user owns the chat/graph being shared. Local sources
+// Verify the authenticated user owns the chat/graph/cargo being shared. Local sources
 // live only on the owner's device — there's nothing to verify against, and
 // ownership is implicit (the snapshot is keyed to req.user), so allow them.
 async function assertOwnsSource(userId, sourceType, sourceId, sourceBackend) {
@@ -73,6 +77,10 @@ async function assertOwnsSource(userId, sourceType, sourceId, sourceBackend) {
   if (sourceType === 'graph') {
     const graph = await ChatGraph.findOne({ _id: sourceId, userId }).select('_id').lean();
     return !!graph;
+  }
+  if (sourceType === 'cargo') {
+    const cargo = await Cargo.findOne({ _id: sourceId, userId }).select('_id').lean();
+    return !!cargo;
   }
   return false;
 }
@@ -86,7 +94,7 @@ router.post('/assets/presign', authenticate, async (req, res) => {
     const userId = req.user._id;
     const { sourceType, sourceId, count, sourceBackend = 'cloud' } = req.body || {};
 
-    if (!['chat', 'graph'].includes(sourceType) || typeof sourceId !== 'string' || !sourceId) {
+    if (!SHARE_SOURCE_TYPES.includes(sourceType) || typeof sourceId !== 'string' || !sourceId) {
       return res.status(400).json({ message: 'sourceType and sourceId are required' });
     }
     if (!['cloud', 'local'].includes(sourceBackend)) {
@@ -148,10 +156,15 @@ router.post('/', authenticate, async (req, res) => {
       nodes = [],
       edges = [],
       entryNodeIds = [],
+      cargo = null,
     } = req.body || {};
 
-    if (!token || !['chat', 'graph'].includes(sourceType) || typeof sourceId !== 'string' || !sourceId || !wrappedShareKey) {
+    if (!token || !SHARE_SOURCE_TYPES.includes(sourceType) || typeof sourceId !== 'string' || !sourceId || !wrappedShareKey) {
       return res.status(400).json({ message: 'token, sourceType, sourceId and wrappedShareKey are required' });
+    }
+    if (sourceType === 'cargo') {
+      const invalid = validateCargoPayload(cargo);
+      if (invalid) return res.status(invalid.status).json({ message: invalid.message });
     }
     if (!['cloud', 'local'].includes(sourceBackend)) {
       return res.status(400).json({ message: 'invalid sourceBackend' });
@@ -173,6 +186,9 @@ router.post('/', authenticate, async (req, res) => {
     snapshot.nodes = sourceType === 'graph' ? nodes : [];
     snapshot.edges = sourceType === 'graph' ? edges : [];
     snapshot.entryNodeIds = sourceType === 'graph' ? entryNodeIds : [];
+    snapshot.cargo = sourceType === 'cargo'
+      ? { encryptedMeta: cargo.encryptedMeta, encryptedContent: cargo.encryptedContent }
+      : null;
     snapshot.revokedAt = null;
     await snapshot.save();
 
@@ -185,6 +201,10 @@ router.post('/', authenticate, async (req, res) => {
 
 // ── GET /api/share/source/:sourceId ──────────────────────────────────────────
 // Owner-scoped lookup so the share sheet can show "copy existing link".
+// wrappedShareKey (share key sealed under the owner's master key — useless
+// without it) lets the client reuse the same share key on re-share, so
+// previously distributed links keep decrypting. Owner-only route; the public
+// GET never returns it.
 router.get('/source/:sourceId', authenticate, async (req, res) => {
   try {
     const snapshot = await ShareSnapshot.findOne({
@@ -192,7 +212,7 @@ router.get('/source/:sourceId', authenticate, async (req, res) => {
       sourceId: req.params.sourceId,
     }).lean();
     if (!snapshot || snapshot.revokedAt) return res.json({ token: null });
-    res.json({ token: snapshot.token });
+    res.json({ token: snapshot.token, wrappedShareKey: snapshot.wrappedShareKey || null });
   } catch (err) {
     logger.error('[share/source] error:', err);
     res.status(500).json({ message: 'Failed to look up share' });
@@ -251,6 +271,10 @@ router.get('/:token', publicShareViewLimiter, async (req, res) => {
           files: mapFiles(m.files),
         }))
       );
+    } else if (snapshot.sourceType === 'cargo') {
+      out.cargo = snapshot.cargo
+        ? { encryptedMeta: snapshot.cargo.encryptedMeta, encryptedContent: snapshot.cargo.encryptedContent }
+        : null;
     } else {
       out.nodes = await Promise.all(
         snapshot.nodes.map(async (nd) => ({

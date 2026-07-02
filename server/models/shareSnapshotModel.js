@@ -23,7 +23,8 @@
 const mongoose = require('mongoose');
 
 /**
- * ShareSnapshot — a public, read-only, point-in-time copy of a chat or graph.
+ * ShareSnapshot — a public, read-only, point-in-time copy of a chat, graph, or
+ * cargo artifact.
  *
  * E2EE is preserved: at share time the client re-encrypts the conversation
  * under a fresh 32-byte *share key* (separate from the account master key) and
@@ -75,7 +76,7 @@ const shareSnapshotSchema = new mongoose.Schema(
 
     ownerUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
 
-    sourceType: { type: String, enum: ['chat', 'graph'], required: true },
+    sourceType: { type: String, enum: ['chat', 'graph', 'cargo'], required: true },
     // Where the original chat/graph lives. `cloud` sources exist in our DB (and
     // ownership is verified against it); `local` sources live only on the user's
     // device — the owner uploads their own re-encrypted snapshot, so there is no
@@ -126,6 +127,20 @@ const shareSnapshotSchema = new mongoose.Schema(
       },
     ],
     entryNodeIds: { type: [String], default: [] },
+
+    // Cargo snapshot: one inline artifact, re-encrypted under the share key.
+    // encryptedMeta is {iv,ct} of JSON {title, kind} — the artifact kind stays
+    // inside the ciphertext so the server remains kind-blind.
+    cargo: {
+      type: new mongoose.Schema(
+        {
+          encryptedMeta: { type: String, required: true },
+          encryptedContent: { type: String, required: true },
+        },
+        { _id: false }
+      ),
+      default: null,
+    },
 
     viewCount: { type: Number, default: 0 },
     revokedAt: { type: Date, default: null },

@@ -1,5 +1,6 @@
 /**
- * Share service — turns an E2EE chat/graph into a public, read-only snapshot.
+ * Share service — turns an E2EE chat/graph/cargo artifact into a public,
+ * read-only snapshot.
  *
  * At share time we (the owner, holding the master key) decrypt the conversation,
  * re-encrypt every text field and media binary under a fresh 32-byte *share
@@ -17,10 +18,13 @@ import * as graphService from './graphService';
 import { getLocalChat } from './localChatService';
 import { resolveChatBackend } from './chatService';
 import { readLocal } from './localStorageService';
+import { getCargoContent } from './cargoService';
+import type { CargoKind } from '../utils/cargoKinds';
 import {
   generateShareKey,
   getMasterKey,
   wrapMasterKey,
+  unwrapMasterKey,
   encryptTextWithKey,
   decryptText,
   decryptBinaryRaw,
@@ -32,7 +36,7 @@ import {
 const req = (endpoint: string, options: RequestInit = {}): Promise<Response> =>
   authService.makeAuthenticatedRequest(endpoint, options);
 
-export type ShareSourceType = 'chat' | 'graph';
+export type ShareSourceType = 'chat' | 'graph' | 'cargo';
 export type ShareSourceBackend = 'cloud' | 'local';
 
 export interface ShareSource {
@@ -41,6 +45,10 @@ export interface ShareSource {
   // Where the source lives. The UI knows this at share time; if omitted we
   // resolve it. Only linear chats can be `local` (local graphs don't exist).
   backend?: ShareSourceBackend;
+  // Cargo only: metadata the caller already holds (CargoScreen has the
+  // decrypted row) — saves re-listing at share time. Ends up encrypted under
+  // the share key; never sent plaintext.
+  cargo?: { title: string; kind: CargoKind };
 }
 
 interface PresignSlot {
@@ -117,8 +125,9 @@ export async function getExistingShare(source: ShareSource): Promise<string | nu
 }
 
 /**
- * Create or refresh a public snapshot for a chat/graph and return the full
- * share URL (with the share key in the #fragment). Requires the master key.
+ * Create or refresh a public snapshot for a chat/graph/cargo artifact and
+ * return the full share URL (with the share key in the #fragment). Requires
+ * the master key.
  */
 export async function createOrUpdateShare(source: ShareSource): Promise<string> {
   if (!isMasterKeyLoaded()) {
@@ -127,21 +136,26 @@ export async function createOrUpdateShare(source: ShareSource): Promise<string> 
   const masterKey = getMasterKey();
   if (!masterKey) throw new Error('Master key not available.');
 
-  const shareKey = generateShareKey();
+  const shareKey = await resolveShareKey(source, masterKey);
 
   // Resolve the backend (the caller usually knows it; fall back to a lookup).
-  // Only linear chats can be local; graphs are always cloud.
+  // Only linear chats can be local; graphs are always cloud. Cargo callers
+  // pass the row's storageType (getCargoContent resolves its own backend).
   const backend: ShareSourceBackend =
     source.type === 'graph'
       ? 'cloud'
-      : source.backend ?? ((await resolveChatBackend(source.id)) === 'local' ? 'local' : 'cloud');
+      : source.type === 'cargo'
+        ? source.backend ?? 'cloud'
+        : source.backend ?? ((await resolveChatBackend(source.id)) === 'local' ? 'local' : 'cloud');
 
   const built =
     source.type === 'graph'
       ? await buildGraphSnapshot(source.id, shareKey)
-      : backend === 'local'
-        ? await buildLocalChatSnapshot(source.id, shareKey)
-        : await buildChatSnapshot(source.id, shareKey);
+      : source.type === 'cargo'
+        ? await buildCargoSnapshot(source, shareKey)
+        : backend === 'local'
+          ? await buildLocalChatSnapshot(source.id, shareKey)
+          : await buildChatSnapshot(source.id, shareKey);
 
   // 1) Reserve a token + presigned upload slots for the media.
   const presign = await postJson('/api/share/assets/presign', {
@@ -184,9 +198,33 @@ export async function createOrUpdateShare(source: ShareSource): Promise<string> 
     nodes: built.nodes,
     edges: built.edges,
     entryNodeIds: built.entryNodeIds,
+    cargo: built.cargo ?? null,
   });
 
   return buildShareUrl(token, shareKey);
+}
+
+/**
+ * Re-sharing must be an in-place content update, not a key rotation: the key
+ * lives in the already-distributed URL fragment, so minting a new one would
+ * silently kill every copy of the old link (same token, key mismatch). Reuse
+ * the existing share key by unwrapping the server-stored wrappedShareKey with
+ * the master key; fall back to a fresh key for first shares or on any
+ * lookup/unwrap failure (e.g. the share was created under a previous master
+ * key after an account change — the old link is undecryptable then anyway).
+ */
+async function resolveShareKey(source: ShareSource, masterKey: Uint8Array): Promise<Uint8Array> {
+  try {
+    const response = await req(`/api/share/source/${encodeURIComponent(source.id)}`);
+    if (response.ok) {
+      const data = await response.json().catch(() => ({}));
+      if (data?.token && typeof data?.wrappedShareKey === 'string' && data.wrappedShareKey) {
+        const key = unwrapMasterKey(data.wrappedShareKey, masterKey);
+        if (key.length === 32) return key;
+      }
+    }
+  } catch { /* fall through to a fresh key */ }
+  return generateShareKey();
 }
 
 export async function revokeShare(token: string): Promise<void> {
@@ -241,6 +279,9 @@ export interface PublicSnapshot {
   }>;
   edges?: Array<{ sourceNodeId: string; targetNodeId: string; edgeType: string }>;
   entryNodeIds?: string[];
+  // Cargo artifact: {iv,ct} blobs under the share key. encryptedMeta decrypts
+  // to JSON {title, kind}.
+  cargo?: { encryptedMeta: string; encryptedContent: string } | null;
 }
 
 /** Fetch a public snapshot by token. No auth — used by PublicShareScreen. */
@@ -262,6 +303,7 @@ interface BuiltSnapshot {
   nodes: any[];
   edges: any[];
   entryNodeIds: string[];
+  cargo?: { encryptedMeta: string; encryptedContent: string } | null;
   // Flat list of media to upload; the message/node attachment entries hold
   // references into this list (filled with s3Key/newIv after upload).
   assets: PendingAsset[];
@@ -480,6 +522,28 @@ async function buildGraphSnapshot(graphId: string, shareKey: Uint8Array): Promis
     edges,
     entryNodeIds,
     assets,
+  };
+}
+
+// Build a snapshot for a Cargo artifact — the simplest share type: one inline
+// content blob + a {title, kind} meta blob, both under the share key. Content
+// is decrypted via getCargoContent (handles both storage backends); metadata
+// rides in from the caller's already-decrypted row. No media assets.
+async function buildCargoSnapshot(source: ShareSource, shareKey: Uint8Array): Promise<BuiltSnapshot> {
+  const content = await getCargoContent(source.id);
+  const title = source.cargo?.title || '';
+  const kind: CargoKind = source.cargo?.kind || 'webpage';
+  return {
+    encryptedTitle: encTitle(title, shareKey),
+    cargo: {
+      encryptedMeta: encryptTextWithKey(JSON.stringify({ title, kind }), shareKey),
+      encryptedContent: encryptTextWithKey(content, shareKey),
+    },
+    messages: [],
+    nodes: [],
+    edges: [],
+    entryNodeIds: [],
+    assets: [],
   };
 }
 

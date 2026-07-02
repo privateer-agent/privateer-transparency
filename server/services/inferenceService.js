@@ -38,7 +38,7 @@
 
 const ModelRateConfig = require('../models/modelRateConfigModel');
 const billingService = require('./billingService');
-const { getRatioParamMode, supportsTransparency } = require('../data/imageModelCapabilities');
+const { getRatioParamMode, supportsTransparency, getMaxImageSize } = require('../data/imageModelCapabilities');
 const { isZdrModel } = require('../data/zdrProviders');
 const { safeFetch } = require('../utils/safeFetch');
 const Sentry = require('@sentry/node');
@@ -923,6 +923,13 @@ async function generateImage(parts, options = {}) {
   const normalizedParts = Array.isArray(parts) ? parts : [parts];
   const modelId = await resolveModelId(options.modelId);
 
+  // "Upscale" toggle: when the user picked no explicit size, request the model's
+  // largest supported image_size. Resolved here (per call, per model) so a retry
+  // on the fallback model never inherits a size the fallback rejects. Unknown
+  // models resolve to null → image_size stays unset; the prompt directive the
+  // controller appends is the only upscale signal that reaches them.
+  const imageSize = options.imageSize || (options.upscale ? getMaxImageSize(modelId) : null);
+
   const messages = [];
   const contentArray = [];
 
@@ -970,7 +977,7 @@ async function generateImage(parts, options = {}) {
       modalities: ['image', 'text'],
       isMediaAction: true,
       requireZdr: options.requireZdr,
-      ...buildOpenRouterAspectFields(modelId, options.aspectRatio, options.imageSize, options.transparentBackground),
+      ...buildOpenRouterAspectFields(modelId, options.aspectRatio, imageSize, options.transparentBackground),
     });
   } catch (err) {
     logger.warn('[generateImage] OpenRouter call failed:', { modelId, ms: Date.now() - _t0, code: err?.code, timedOut: !!err?.timedOut });
