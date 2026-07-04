@@ -409,6 +409,35 @@ router.post('/session/spawn', sessionSpawnLimiter, async (req, res) => {
   }
 });
 
+/**
+ * DELETE /auth/session/current
+ * Revokes the CALLER's own session lineage (the familyId behind the presented
+ * access token) — access tokens and refresh token, cascading to any children.
+ * This is the counterpart to /session/spawn: a terminal calls it on exit so its
+ * per-terminal child session disappears from Linked Devices immediately instead
+ * of lingering until the access-token rows expire. Self-scoped by design — it
+ * can only ever revoke the session that authenticates the request.
+ */
+router.delete('/session/current', authenticate, async (req, res) => {
+  try {
+    const own = await UserSession.findOne({ userId: req.user._id, jti: req.jti }).lean();
+    if (own?.familyId) {
+      await tokenService.revokeSessionFamily(req.user._id, own.familyId);
+    } else {
+      // Legacy session without a familyId — revoke just this access jti.
+      await UserSession.updateOne(
+        { userId: req.user._id, jti: req.jti, revokedAt: null },
+        { $set: { revokedAt: new Date() } }
+      );
+    }
+    res.json({ message: 'Session revoked' });
+  } catch (error) {
+    Sentry.captureException(error, { tags: { op: 'auth_session_self_revoke' } });
+    logger.error('Self session revoke error:', error);
+    res.status(500).json({ message: 'Error revoking session' });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Logout
 // ---------------------------------------------------------------------------

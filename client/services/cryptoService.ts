@@ -19,7 +19,10 @@
  */
 
 import './internal/randomPolyfill';
-import { gcm } from '@noble/ciphers/aes';
+// AES-GCM backend: react-native-quick-crypto (OpenSSL/JSI) on native,
+// crypto.subtle on web, @noble/ciphers as the universal fallback. All three
+// share one wire format (12-byte IV, ct ‖ 16-byte tag) — see internal/aesGcm.
+import { gcmEncrypt, gcmDecrypt, gcmEncryptAsync, gcmDecryptAsync } from './internal/aesGcm';
 import { hkdf } from '@noble/hashes/hkdf';
 import { sha256 } from '@noble/hashes/sha256';
 import { deriveArgon2idHash } from './internal/argon2';
@@ -182,7 +185,7 @@ export function wrapMasterKey(masterKey: Uint8Array, kek: Uint8Array): string {
   if (masterKey.length !== 32) throw new Error('Master key must be 32 bytes');
   if (kek.length !== 32) throw new Error('KEK must be 32 bytes');
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = gcm(kek, iv).encrypt(masterKey);
+  const ct = gcmEncrypt(kek, iv, masterKey);
   const out = new Uint8Array(iv.length + ct.length);
   out.set(iv, 0);
   out.set(ct, iv.length);
@@ -199,7 +202,7 @@ export function unwrapMasterKey(wrapped: string, kek: Uint8Array): Uint8Array {
   if (blob.length < 12 + 16) throw new Error('Wrapped master key is too short');
   const iv = blob.slice(0, 12);
   const ct = blob.slice(12);
-  return gcm(kek, iv).decrypt(ct);
+  return gcmDecrypt(kek, iv, ct);
 }
 
 /**
@@ -295,55 +298,65 @@ export async function clearAllKeyMaterial(): Promise<void> {
 export function encryptTextWithKey(plaintext: string, key: Uint8Array): string {
   if (key.length !== 32) throw new Error('Encryption key must be 32 bytes');
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = gcm(key, iv).encrypt(new TextEncoder().encode(plaintext));
+  const ct = gcmEncrypt(key, iv, new TextEncoder().encode(plaintext));
   return JSON.stringify({ iv: toBase64(iv), ct: toBase64(ct) });
 }
 
 export function decryptTextWithKey(payload: string, key: Uint8Array): string {
   if (key.length !== 32) throw new Error('Decryption key must be 32 bytes');
   const { iv, ct } = JSON.parse(payload);
-  const plaintext = gcm(key, fromBase64(iv)).decrypt(fromBase64(ct));
+  const plaintext = gcmDecrypt(key, fromBase64(iv), fromBase64(ct));
   return new TextDecoder().decode(plaintext);
 }
 
 export function encryptBinaryWithKey(buf: Uint8Array, key: Uint8Array): { iv: string; ct: string } {
   if (key.length !== 32) throw new Error('Encryption key must be 32 bytes');
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = gcm(key, iv).encrypt(buf);
+  const ct = gcmEncrypt(key, iv, buf);
   return { iv: toBase64(iv), ct: toBase64(ct) };
 }
 
 export function decryptBinaryWithKey(iv: string, ct: string, key: Uint8Array): Uint8Array {
   if (key.length !== 32) throw new Error('Decryption key must be 32 bytes');
-  return gcm(key, fromBase64(iv)).decrypt(fromBase64(ct));
+  return gcmDecrypt(key, fromBase64(iv), fromBase64(ct));
 }
 
 /**
  * Encrypt a UTF-8 string. Returns a JSON string: `{ iv, ct }` (both base64).
+ *
+ * The async master-key helpers below route through the async backend variants
+ * (not the sync *WithKey siblings) so web gets crypto.subtle for real
+ * payloads; on native both variants hit the same OpenSSL path.
  */
 export async function encryptText(plaintext: string): Promise<string> {
   if (!_masterKey) throw new Error('Master key not loaded.');
-  return encryptTextWithKey(plaintext, _masterKey);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await gcmEncryptAsync(_masterKey, iv, new TextEncoder().encode(plaintext));
+  return JSON.stringify({ iv: toBase64(iv), ct: toBase64(ct) });
 }
 
 export async function decryptText(payload: string): Promise<string> {
   if (!_masterKey) throw new Error('Master key not loaded.');
-  return decryptTextWithKey(payload, _masterKey);
+  const { iv, ct } = JSON.parse(payload);
+  const plaintext = await gcmDecryptAsync(_masterKey, fromBase64(iv), fromBase64(ct));
+  return new TextDecoder().decode(plaintext);
 }
 
 export async function encryptBinary(buf: Uint8Array): Promise<{ iv: string; ct: string }> {
   if (!_masterKey) throw new Error('Master key not loaded.');
-  return encryptBinaryWithKey(buf, _masterKey);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await gcmEncryptAsync(_masterKey, iv, buf);
+  return { iv: toBase64(iv), ct: toBase64(ct) };
 }
 
 export async function decryptBinary(iv: string, ct: string): Promise<Uint8Array> {
   if (!_masterKey) throw new Error('Master key not loaded.');
-  return decryptBinaryWithKey(iv, ct, _masterKey);
+  return gcmDecryptAsync(_masterKey, fromBase64(iv), fromBase64(ct));
 }
 
 export async function decryptBinaryRaw(iv: string, ctBytes: Uint8Array): Promise<Uint8Array> {
   if (!_masterKey) throw new Error('Master key not loaded.');
-  return gcm(_masterKey, fromBase64(iv)).decrypt(ctBytes);
+  return gcmDecryptAsync(_masterKey, fromBase64(iv), ctBytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -369,13 +382,13 @@ export function generateShareKey(): Uint8Array {
 export function encryptBinaryRawWithKey(buf: Uint8Array, key: Uint8Array): { iv: string; ct: Uint8Array } {
   if (key.length !== 32) throw new Error('Encryption key must be 32 bytes');
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = gcm(key, iv).encrypt(buf);
+  const ct = gcmEncrypt(key, iv, buf);
   return { iv: toBase64(iv), ct };
 }
 
 export function decryptBinaryRawWithKey(iv: string, ctBytes: Uint8Array, key: Uint8Array): Uint8Array {
   if (key.length !== 32) throw new Error('Decryption key must be 32 bytes');
-  return gcm(key, fromBase64(iv)).decrypt(ctBytes);
+  return gcmDecrypt(key, fromBase64(iv), ctBytes);
 }
 
 /** Base64url (no padding) — safe to drop into a URL fragment. */

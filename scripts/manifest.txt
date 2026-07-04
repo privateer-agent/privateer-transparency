@@ -1,6 +1,8 @@
 client/components/AttestationSheet.tsx
 client/services/authService.ts
 client/services/cryptoService.ts
+client/services/internal/aesGcm.ts
+client/services/internal/aesGcm.web.ts
 client/services/internal/argon2.ts
 client/services/internal/argon2.web.ts
 client/services/internal/secureKv.ts
