@@ -14,7 +14,7 @@
  * through noble keeps the "throws on bad tag" contract intact either way.
  */
 
-import { gcm } from '@noble/ciphers/aes';
+import { gcm } from '@noble/ciphers/aes.js';
 
 export function gcmEncrypt(key: Uint8Array, iv: Uint8Array, plaintext: Uint8Array): Uint8Array {
   return gcm(key, iv).encrypt(plaintext);
@@ -29,8 +29,8 @@ const subtle: SubtleCrypto | undefined = globalThis.crypto?.subtle;
 export async function gcmEncryptAsync(key: Uint8Array, iv: Uint8Array, plaintext: Uint8Array): Promise<Uint8Array> {
   if (subtle) {
     try {
-      const k = await subtle.importKey('raw', key, 'AES-GCM', false, ['encrypt']);
-      return new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv }, k, plaintext));
+      const k = await subtle.importKey('raw', key as BufferSource, 'AES-GCM', false, ['encrypt']);
+      return new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv: iv as BufferSource }, k, plaintext as BufferSource));
     } catch {
       // Environment quirk (blocked subtle, detached buffer, …) — noble below.
     }
@@ -41,8 +41,8 @@ export async function gcmEncryptAsync(key: Uint8Array, iv: Uint8Array, plaintext
 export async function gcmDecryptAsync(key: Uint8Array, iv: Uint8Array, ctAndTag: Uint8Array): Promise<Uint8Array> {
   if (subtle) {
     try {
-      const k = await subtle.importKey('raw', key, 'AES-GCM', false, ['decrypt']);
-      return new Uint8Array(await subtle.decrypt({ name: 'AES-GCM', iv }, k, ctAndTag));
+      const k = await subtle.importKey('raw', key as BufferSource, 'AES-GCM', false, ['decrypt']);
+      return new Uint8Array(await subtle.decrypt({ name: 'AES-GCM', iv: iv as BufferSource }, k, ctAndTag as BufferSource));
     } catch {
       // subtle reports a bad auth tag as a bare OperationError —
       // indistinguishable from an environment failure. Re-run through noble:

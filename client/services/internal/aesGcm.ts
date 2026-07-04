@@ -14,7 +14,7 @@
  * reachable).
  */
 
-import { gcm } from '@noble/ciphers/aes';
+import { gcm } from '@noble/ciphers/aes.js';
 
 const TAG_LEN = 16;
 
@@ -46,8 +46,8 @@ const concat = (...parts: Uint8Array[]): Uint8Array => {
 export function gcmEncrypt(key: Uint8Array, iv: Uint8Array, plaintext: Uint8Array): Uint8Array {
   if (quick) {
     const cipher = quick.createCipheriv('aes-256-gcm', key as never, iv as never);
-    const head = new Uint8Array(cipher.update(plaintext as never) as ArrayBuffer);
-    const tail = new Uint8Array(cipher.final() as ArrayBuffer);
+    const head = new Uint8Array(cipher.update(plaintext as never) as unknown as ArrayBuffer);
+    const tail = new Uint8Array(cipher.final() as unknown as ArrayBuffer);
     const tag = new Uint8Array(cipher.getAuthTag());
     return concat(head, tail, tag);
   }
@@ -62,8 +62,8 @@ export function gcmDecrypt(key: Uint8Array, iv: Uint8Array, ctAndTag: Uint8Array
     const tag = ctAndTag.subarray(ctAndTag.length - TAG_LEN);
     const decipher = quick.createDecipheriv('aes-256-gcm', key as never, iv as never);
     decipher.setAuthTag(tag as never);
-    const head = new Uint8Array(decipher.update(ct as never) as ArrayBuffer);
-    const tail = new Uint8Array(decipher.final() as ArrayBuffer); // throws on bad tag
+    const head = new Uint8Array(decipher.update(ct as never) as unknown as ArrayBuffer);
+    const tail = new Uint8Array(decipher.final() as unknown as ArrayBuffer); // throws on bad tag
     return concat(head, tail);
   }
   return gcm(key, iv).decrypt(ctAndTag);

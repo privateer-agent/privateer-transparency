@@ -90,7 +90,7 @@ async function encryptValue(plaintext: string): Promise<WrappedValue> {
 
 async function decryptValue(wrapped: WrappedValue): Promise<string> {
   const key = await getOrCreateWrapKey();
-  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: wrapped.iv }, key, wrapped.ct);
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: wrapped.iv as BufferSource }, key, wrapped.ct as BufferSource);
   return dec.decode(pt);
 }
 
