@@ -257,6 +257,21 @@ const userSchema = new mongoose.Schema(
     isEmailVerified: { type: Boolean, default: false },
     emailVerificationToken: String,
     emailVerificationExpires: Date,
+    // --- Aggregate analytics operational fields (see analyticsService) ---
+    // Deliberately minimal: single overwritten scalars, never event trails.
+    // Disclosed verbatim in the privacy policy — keep it that way.
+    firstMessageAt: { type: Date, default: null },
+    firstMediaGenAt: { type: Date, default: null },
+    firstCargoAt: { type: Date, default: null },
+    lastActiveAt: { type: Date, default: null },
+    d1ReturnCounted: { type: Boolean, default: false },
+    d7ReturnCounted: { type: Boolean, default: false },
+    // Current-ISO-week message counter, hard-capped at the activation
+    // threshold (3) so per-user volume beyond it is never stored.
+    weeklyMsg: {
+      week: { type: String, default: null },
+      count: { type: Number, default: 0 }
+    },
     // Preferred language for emails sent outside a request (e.g. the
     // hard-delete reminder cron), where there's no Accept-Language header to
     // read. Captured from the request language at registration. In-request

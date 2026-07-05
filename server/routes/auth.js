@@ -31,6 +31,7 @@ const UserSession = require('../models/userSessionModel');
 const RefreshToken = require('../models/refreshTokenModel');
 const EmailService = require('../services/emailService');
 const tokenService = require('../services/tokenService');
+const analyticsService = require('../services/analyticsService');
 const redis = require('../services/redisClient');
 const relayHub = require('../services/relayHub');
 const { authenticate } = require('../middleware/auth');
@@ -215,6 +216,10 @@ router.post('/register', registerRateLimiter, async (req, res) => {
     } finally {
       session.endSession();
     }
+
+    analyticsService.track('signup', {
+      method: req.body.fromGuest === true ? 'guest_convert' : 'email'
+    });
 
     try {
       await EmailService.sendVerificationEmail(user, req.language);
@@ -896,6 +901,7 @@ router.post('/wallet/verify', walletVerifyLimiter, async (req, res) => {
         isEmailVerified: false,
         accountStatus: 'active'
       });
+      analyticsService.track('signup', { method: 'wallet' });
     } else if (user.accountStatus === 'grace_period') {
       return res.status(403).json({
         message: 'This account is scheduled for deletion. Recover it?',

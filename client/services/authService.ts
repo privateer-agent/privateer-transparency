@@ -105,6 +105,9 @@ class AuthService {
     wrappedMasterKey: string;
     kdfSalt: string;
     kdfParams: KdfParams;
+    // Aggregate analytics only: this device used guest mode before signing
+    // up, so the server counts the signup as a guest conversion.
+    fromGuest?: boolean;
   }): Promise<{ message: string; requiresVerification: boolean; email: string }> {
     const response = await fetch(`${API_BASE_URL}/auth/register`, {
       method: 'POST',
@@ -131,12 +134,23 @@ class AuthService {
     const kek = await deriveKekFromPassword(password, kdfSalt, kdfParams);
     const wrappedMasterKey = wrapMasterKey(masterKey, kek);
 
+    // Guest-conversion signal (analytics only). Dynamic import to avoid a
+    // static cycle with the chat/graph service graph; never blocks signup.
+    let fromGuest = false;
+    try {
+      const { hasGuestChatsToImport } = await import('./guestConversionService');
+      fromGuest = await hasGuestChatsToImport();
+    } catch {
+      // Signal is best-effort only.
+    }
+
     const result = await this.register({
       email,
       password,
       wrappedMasterKey,
       kdfSalt: toBase64(kdfSalt),
       kdfParams,
+      fromGuest,
     });
 
     return { requiresVerification: result.requiresVerification, email: result.email };
