@@ -406,6 +406,18 @@ router.post('/session/spawn', sessionSpawnLimiter, async (req, res) => {
       parent.authMethod,
       { client: 'cli', deviceLabel: label, parentFamilyId }
     );
+
+    // Sliding renewal: the parent token is validated here but never rotated, so
+    // its expiry would otherwise be frozen at login time and an actively-used
+    // machine login would still die REFRESH_TTL_DAYS after /login. Push it a
+    // full TTL window out from now instead; idle machines still age out.
+    // Best-effort — the spawn already succeeded on a token valid right now.
+    try {
+      await tokenService.slideRefreshTokenExpiry(parent);
+    } catch (renewErr) {
+      logger.warn('Session spawn: sliding renewal failed (non-fatal):', renewErr);
+    }
+
     res.json({ accessToken, refreshToken: childRefresh });
   } catch (error) {
     Sentry.captureException(error, { tags: { op: 'auth_session_spawn' } });
