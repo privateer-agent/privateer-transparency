@@ -625,12 +625,17 @@ const IMAGE_MODEL_CACHE_MS = 5 * 60 * 1000;
 
 async function isImageInputModel(modelId) {
   if (!modelId || typeof modelId !== 'string') return false;
-  // NEAR vision models (Qwen-VL, Gemma, Kimi…) aren't in OpenRouter's catalog, so
-  // the lookup below would miss them and silently substitute an OpenRouter vision
-  // model — breaking the confidential guarantee. Honor the NEAR catalog instead.
+  // NEAR/Tinfoil vision models (Qwen-VL, Gemma, Kimi…) aren't in OpenRouter's
+  // catalog, so the lookup below would miss them and silently substitute an
+  // OpenRouter vision model — breaking the confidential guarantee. Honor the
+  // provider's own catalog instead.
   if (modelId.startsWith('near/')) {
     const { isNearImageInputModel } = require('../data/nearModels');
     return isNearImageInputModel(modelId);
+  }
+  if (modelId.startsWith('tinfoil/')) {
+    const { isTinfoilImageInputModel } = require('../data/tinfoilModels');
+    return isTinfoilImageInputModel(modelId);
   }
   try {
     const now = Date.now();
@@ -730,11 +735,16 @@ function mimeToAudioFormat(mimeType) {
  * @returns {{ text, inputTokens, outputTokens, costUsd, providerCostUsd }}
  */
 async function generateText(parts, options = {}) {
-  // NEAR AI (TEE) models are OpenAI-compatible but routed to a different host
-  // and key, with no ZDR two-key logic. Lazy require avoids a load-time cycle.
+  // NEAR AI (TEE) and Tinfoil (secure enclave) models are OpenAI-compatible but
+  // routed to different hosts and keys, with no ZDR two-key logic. Lazy
+  // requires avoid a load-time cycle.
   const nearAiService = require('./nearAiService');
   if (nearAiService.isNearModel(options.modelId)) {
     return nearAiService.generateText(parts, options);
+  }
+  const tinfoilService = require('./tinfoilService');
+  if (tinfoilService.isTinfoilModel(options.modelId)) {
+    return tinfoilService.generateText(parts, options);
   }
 
   const modelId = await resolveModelId(options.modelId);
@@ -1171,11 +1181,16 @@ async function listEnabledModels() {
  * Returns { inputTokens, outputTokens, costUsd, providerCostUsd } after the stream completes.
  */
 async function generateTextStream(messages, modelId, options = {}, onChunk) {
-  // NEAR AI (TEE) models route to the confidential-compute host. Lazy require
-  // avoids a load-time cycle with nearAiService (which reuses helpers here).
+  // NEAR AI (TEE) and Tinfoil (secure enclave) models route to their
+  // confidential-compute hosts. Lazy requires avoid a load-time cycle with the
+  // provider services (which reuse helpers here).
   const nearAiService = require('./nearAiService');
   if (nearAiService.isNearModel(modelId)) {
     return nearAiService.generateTextStream(messages, modelId, options, onChunk);
+  }
+  const tinfoilService = require('./tinfoilService');
+  if (tinfoilService.isTinfoilModel(modelId)) {
+    return tinfoilService.generateTextStream(messages, modelId, options, onChunk);
   }
 
   const effectiveModelId = await resolveModelId(modelId);
@@ -1330,6 +1345,10 @@ async function proxyChatCompletion(openaiBody, { requireZdr = true } = {}) {
   const nearAiService = require('./nearAiService');
   if (nearAiService.isNearModel(openaiBody?.model)) {
     return nearAiService.proxyChatCompletion(openaiBody);
+  }
+  const tinfoilService = require('./tinfoilService');
+  if (tinfoilService.isTinfoilModel(openaiBody?.model)) {
+    return tinfoilService.proxyChatCompletion(openaiBody);
   }
 
   const effectiveModelId = await resolveModelId(openaiBody?.model);

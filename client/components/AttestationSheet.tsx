@@ -12,10 +12,12 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../contexts/ThemeContext';
-import { getNearAttestation, type OpenRouterModel, type NearAttestation } from '../services/modelService';
+import { getTeeAttestation, type OpenRouterModel, type TeeAttestation } from '../services/modelService';
 
-// Public docs explaining how to independently verify a NEAR attestation report.
+// Public docs explaining how to independently verify an attestation report,
+// per confidential-compute provider (routed by model-id prefix).
 const NEAR_VERIFY_DOCS = 'https://docs.near.ai/cloud/private-inference/';
+const TINFOIL_VERIFY_DOCS = 'https://docs.tinfoil.sh/verification/verification-in-tinfoil';
 
 interface Props {
   visible: boolean;
@@ -24,17 +26,19 @@ interface Props {
 }
 
 /**
- * Explains NEAR AI confidential compute in plain language and, on demand,
- * fetches & displays the live signed TEE attestation report (Intel TDX quote +
- * NVIDIA GPU evidence + signature). v1 surfaces the report for inspection;
- * full on-device cryptographic verification is a follow-up.
+ * Explains confidential compute in plain language and, on demand, fetches &
+ * displays the live signed TEE attestation report — NEAR (Intel TDX quote +
+ * NVIDIA GPU evidence + signature) or Tinfoil (AMD SEV-SNP guest report),
+ * routed by the model-id prefix. Evidence rows render only when that evidence
+ * type applies to the provider's stack. v1 surfaces the report for
+ * inspection; full on-device cryptographic verification is a follow-up.
  */
 const AttestationSheet: React.FC<Props> = ({ visible, model, onClose }) => {
   const { theme } = useTheme();
   const { t } = useTranslation();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [attestation, setAttestation] = useState<NearAttestation | null>(null);
+  const [attestation, setAttestation] = useState<TeeAttestation | null>(null);
 
   // Reset transient state whenever the sheet is opened for a (new) model.
   useEffect(() => {
@@ -49,7 +53,7 @@ const AttestationSheet: React.FC<Props> = ({ visible, model, onClose }) => {
     setLoading(true);
     setError(null);
     try {
-      const result = await getNearAttestation(model.id);
+      const result = await getTeeAttestation(model.id);
       setAttestation(result);
     } catch (e: any) {
       setError(e?.message || t('attestation.error'));
@@ -108,12 +112,21 @@ const AttestationSheet: React.FC<Props> = ({ visible, model, onClose }) => {
             {attestation && (
               <View style={[s.reportBox, { backgroundColor: theme.tertiaryBackground, borderColor: theme.border }]}>
                 <Text style={[s.reportTitle, { color: theme.text }]}>{t('attestation.reportTitle')}</Text>
-                <Check ok={attestation.hasTdxQuote} label={t('attestation.tdxQuote')} />
-                <Check ok={attestation.hasGpuEvidence} label={t('attestation.gpuEvidence')} />
+                {typeof attestation.hasTdxQuote === 'boolean' && (
+                  <Check ok={attestation.hasTdxQuote} label={t('attestation.tdxQuote')} />
+                )}
+                {typeof attestation.hasGpuEvidence === 'boolean' && (
+                  <Check ok={attestation.hasGpuEvidence} label={t('attestation.gpuEvidence')} />
+                )}
+                {typeof attestation.hasSevSnp === 'boolean' && (
+                  <Check ok={attestation.hasSevSnp} label={t('attestation.sevSnp')} />
+                )}
                 <Check ok={attestation.hasSignature} label={t('attestation.signature')} />
-                <Text style={[s.meta, { color: theme.tertiaryText }]} numberOfLines={1}>
-                  {t('attestation.nonce')}: {attestation.nonce}
-                </Text>
+                {!!attestation.nonce && (
+                  <Text style={[s.meta, { color: theme.tertiaryText }]} numberOfLines={1}>
+                    {t('attestation.nonce')}: {attestation.nonce}
+                  </Text>
+                )}
                 <Text style={[s.meta, { color: theme.tertiaryText }]} numberOfLines={1}>
                   {t('attestation.verifiedAt')}: {new Date(attestation.verifiedAt).toLocaleString()}
                 </Text>
@@ -137,7 +150,11 @@ const AttestationSheet: React.FC<Props> = ({ visible, model, onClose }) => {
             </TouchableOpacity>
           )}
 
-          <TouchableOpacity onPress={() => Linking.openURL(NEAR_VERIFY_DOCS)}>
+          <TouchableOpacity
+            onPress={() =>
+              Linking.openURL(model?.id.startsWith('tinfoil/') ? TINFOIL_VERIFY_DOCS : NEAR_VERIFY_DOCS)
+            }
+          >
             <Text style={[s.link, { color: theme.primary }]}>{t('attestation.learnMore')}</Text>
           </TouchableOpacity>
         </TouchableOpacity>
