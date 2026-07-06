@@ -227,6 +227,13 @@ const chatNodeSchema = new mongoose.Schema(
       promptVisible: {
         type: Boolean,
         default: true
+      },
+      // Composer mode pill the node was created with (Create Image / Create
+      // Video / Deep Research / Multi-Node). '' → plain prompt, no pill.
+      modePill: {
+        type: String,
+        enum: ['', 'image', 'video', 'research', 'multi'],
+        default: ''
       }
     },
     // Token usage tracking
@@ -401,7 +408,8 @@ chatNodeSchema.statics.createGraphNode = async function(data) {
     imageAttachments = null,
     videoAttachments = null,
     fileAttachments = null,
-    modelId = null
+    modelId = null,
+    modePill = null
   } = data;
 
   const colorByType = {
@@ -433,7 +441,10 @@ chatNodeSchema.statics.createGraphNode = async function(data) {
       // identically on revisit. Falls back to the legacy compact default when
       // a caller doesn't send a size.
       width: size?.width ?? 220,
-      height: size?.height ?? 120
+      height: size?.height ?? 120,
+      // Which composer pill created this node — kept through the pending →
+      // finished swap so the card can keep showing it after reloads.
+      modePill: typeof modePill === 'string' ? modePill : ''
     }
   });
   
