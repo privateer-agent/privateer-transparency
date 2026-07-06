@@ -50,13 +50,25 @@ while IFS= read -r rel; do
 done < "$ROOT/scripts/manifest.txt"
 echo "  done"
 
-# 3a. Redact the proprietary cost/pricing block in inferenceService.js.
+# 3a. Redact the proprietary cost/pricing blocks (inference + per-provider
+# services). Each upstream file keeps its billing code inside a contiguous
+# '// ── Cost calculation' section so one region swap covers it.
 echo "== redacting proprietary regions =="
 python3 "$ROOT/scripts/redact_region.py" \
   "$ROOT/server/services/inferenceService.js" \
   "$ROOT/scripts/redactions/inferenceService.cost.js" \
   '// ── Cost calculation' \
   '// ── Part type helpers'
+python3 "$ROOT/scripts/redact_region.py" \
+  "$ROOT/server/services/nearAiService.js" \
+  "$ROOT/scripts/redactions/nearAiService.cost.js" \
+  '// ── Cost calculation' \
+  '// ── Provider error mapping'
+python3 "$ROOT/scripts/redact_region.py" \
+  "$ROOT/server/services/tinfoilService.js" \
+  "$ROOT/scripts/redactions/tinfoilService.cost.js" \
+  '// ── Cost calculation' \
+  '// ── Provider error mapping'
 
 # 3b. Scrub the internal codename from the published docs (brand: internal-only).
 for d in docs/E2EE_ARCHITECTURE.md docs/CONTENT_ENCRYPTION.md; do

@@ -21,20 +21,20 @@
  */
 
 /**
- * NEAR AI Cloud inference — OpenAI-compatible text + streaming.
+ * Tinfoil inference — OpenAI-compatible text, streaming, STT and TTS.
  *
- * NEAR AI Cloud (https://cloud-api.near.ai/v1) hosts a subset of models inside a
- * hardware Trusted Execution Environment (Intel TDX + NVIDIA confidential GPU).
- * Its API is OpenAI-compatible, so this mirrors the OpenRouter chat path in
- * inferenceService.js but drops everything OpenRouter-specific: the ZDR two-key
- * dance, `provider` routing, web/PDF plugins, and prompt-cache hints (which the
- * open TEE models don't accept). Confidential compute is the privacy guarantee
- * here, so there is no per-request ZDR negotiation — every NEAR call uses the
- * single server-side NEAR key.
+ * Tinfoil (https://inference.tinfoil.sh/v1) serves every model inside a
+ * hardware secure enclave (AMD SEV-SNP CPU + NVIDIA confidential GPU) with a
+ * publicly fetchable attestation document. Its API is OpenAI-compatible, so
+ * this mirrors nearAiService.js (the other confidential-compute provider) and
+ * drops everything OpenRouter-specific: the ZDR two-key dance, `provider`
+ * routing, web/PDF plugins, and prompt-cache hints. Confidential compute is
+ * the privacy guarantee, so there is no per-request ZDR negotiation — every
+ * Tinfoil call uses the single server-side Tinfoil key.
  *
  * inferenceService.generateText / generateTextStream delegate here when the
- * model id is `near/`-prefixed, so chatController is untouched. Returned shapes
- * match the OpenRouter path so billing/usage recording is identical.
+ * model id is `tinfoil/`-prefixed, so chatController is untouched. Returned
+ * shapes match the OpenRouter path so billing/usage recording is identical.
  *
  * Shared formatting helpers (NO_TABLES directive, table→bullet post-processor,
  * history windowing) are reused from inferenceService via a lazy require to
@@ -42,32 +42,32 @@
  */
 
 const Sentry = require('@sentry/node');
-const { getNearPricing, NEAR_PREFIX } = require('../data/nearModels');
+const { getTinfoilPricing, TINFOIL_PREFIX } = require('../data/tinfoilModels');
 
-const NEAR_BASE = () => process.env.NEAR_AI_BASE_URL || 'https://cloud-api.near.ai/v1';
-const NEAR_TIMEOUT_MS = Number(process.env.NEAR_TEXT_TIMEOUT_MS) || 240_000;
-const NEAR_MEDIA_TIMEOUT_MS = Number(process.env.NEAR_MEDIA_TIMEOUT_MS) || 120_000;
+const TINFOIL_BASE = () => process.env.TINFOIL_BASE_URL || 'https://inference.tinfoil.sh/v1';
+const TINFOIL_TIMEOUT_MS = Number(process.env.TINFOIL_TEXT_TIMEOUT_MS) || 240_000;
+const TINFOIL_MEDIA_TIMEOUT_MS = Number(process.env.TINFOIL_MEDIA_TIMEOUT_MS) || 120_000;
 
-function isNearModel(modelId) {
-  return typeof modelId === 'string' && modelId.startsWith(NEAR_PREFIX);
+function isTinfoilModel(modelId) {
+  return typeof modelId === 'string' && modelId.startsWith(TINFOIL_PREFIX);
 }
 
 function toUpstreamId(modelId) {
-  return isNearModel(modelId) ? modelId.slice(NEAR_PREFIX.length) : modelId;
+  return isTinfoilModel(modelId) ? modelId.slice(TINFOIL_PREFIX.length) : modelId;
 }
 
-function nearHeaders() {
-  const key = process.env.NEAR_AI_API_KEY;
+function tinfoilHeaders() {
+  const key = process.env.TINFOIL_API_KEY;
   if (!key) {
     throw Object.assign(
-      new Error('NEAR AI is not configured on this server.'),
-      { statusCode: 503, code: 'NEAR_KEY_UNAVAILABLE' }
+      new Error('Tinfoil is not configured on this server.'),
+      { statusCode: 503, code: 'TINFOIL_KEY_UNAVAILABLE' }
     );
   }
   return { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` };
 }
 
-// Lazy to avoid the inferenceService <-> nearAiService load-time cycle.
+// Lazy to avoid the inferenceService <-> tinfoilService load-time cycle.
 function shared() {
   return require('./inferenceService');
 }
@@ -79,14 +79,15 @@ function shared() {
 // The cost/pricing layer (markup-factor application and fallback token rates)
 // is part of Privateer's CLOSED codebase and is NOT published here. Per our
 // open-source policy we open the "plaintext trust boundary" only; billing
-// operates purely on token *counts* and model IDs — it never sees, stores, or
-// transmits user content — so it adds no auditability to the privacy claim.
+// operates purely on token *counts*, per-request catalog prices, and model
+// IDs — it never sees, stores, or transmits user content — so it adds no
+// auditability to the privacy claim.
 //
 // The function below is stubbed to preserve call-site readability. In the
-// shipped server it resolves NEAR's catalog pricing and applies our markup;
+// shipped server it resolves Tinfoil's catalog pricing and applies our markup;
 // here it returns zeros. See docs/E2EE_ARCHITECTURE.md for what IS in scope.
 
-async function calcNearCost(/* modelId, inputTokens, outputTokens */) {
+async function calcTinfoilCost(/* modelId, inputTokens, outputTokens */) {
   return { costUsd: 0, providerCostUsd: 0 }; // omitted: see banner above
 }
 
@@ -99,8 +100,9 @@ function asProviderError(message, modelId, extra = {}) {
 }
 
 // Assemble OpenAI-style messages from the inferenceService `parts` + options.
-// NEAR TEE models are text-first; we still handle inline images for any
-// vision-capable TEE model, but skip pdf/audio/video (not offered).
+// Tinfoil enclave models are text-first; we still handle inline images for the
+// vision-capable models (Kimi, Gemma), but skip pdf/audio/video (not offered
+// on chat/completions).
 function buildMessages(parts, options) {
   const { withNoTables } = shared();
   const normalizedParts = Array.isArray(parts) ? parts : [parts];
@@ -145,9 +147,9 @@ function buildMessages(parts, options) {
   return messages;
 }
 
-async function nearChatRequest(body, modelId, { stream = false, signal } = {}) {
+async function tinfoilChatRequest(body, modelId, { signal } = {}) {
   const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), NEAR_TIMEOUT_MS);
+  const timer = setTimeout(() => abort.abort(), TINFOIL_TIMEOUT_MS);
   // Honour a caller-supplied cancel signal in addition to our timeout.
   if (signal) {
     if (signal.aborted) abort.abort();
@@ -155,15 +157,15 @@ async function nearChatRequest(body, modelId, { stream = false, signal } = {}) {
   }
   let res;
   try {
-    res = await fetch(`${NEAR_BASE()}/chat/completions`, {
+    res = await fetch(`${TINFOIL_BASE()}/chat/completions`, {
       method: 'POST',
-      headers: nearHeaders(),
+      headers: tinfoilHeaders(),
       body: JSON.stringify(body),
       signal: abort.signal,
     });
   } catch (fetchErr) {
     if (fetchErr?.name === 'AbortError' && !signal?.aborted) {
-      throw asProviderError(`NEAR AI request timed out after ${NEAR_TIMEOUT_MS}ms for ${modelId}`, modelId, { timedOut: true });
+      throw asProviderError(`Tinfoil request timed out after ${TINFOIL_TIMEOUT_MS}ms for ${modelId}`, modelId, { timedOut: true });
     }
     throw fetchErr;
   } finally {
@@ -175,7 +177,7 @@ async function nearChatRequest(body, modelId, { stream = false, signal } = {}) {
     if (res.status === 404 || res.status === 503 || res.status >= 500) {
       throw asProviderError(`The selected model (${modelId}) is currently unavailable. Please choose a different model in Settings.`, modelId, { statusCode: res.status });
     }
-    const err = new Error(`NEAR AI error ${res.status}: ${errText}`);
+    const err = new Error(`Tinfoil error ${res.status}: ${errText}`);
     if (res.status === 429) err.statusCode = 429;
     throw err;
   }
@@ -202,17 +204,17 @@ async function generateText(parts, options = {}) {
   };
 
   try {
-    const res = await nearChatRequest(body, modelId);
+    const res = await tinfoilChatRequest(body, modelId);
     const data = await res.json();
     const rawText = data.choices?.[0]?.message?.content || '';
     const text = convertTablesToBullets(rawText);
     const inputTokens = data.usage?.prompt_tokens || 0;
     const outputTokens = data.usage?.completion_tokens || 0;
-    const { costUsd, providerCostUsd } = await calcNearCost(modelId, inputTokens, outputTokens);
+    const { costUsd, providerCostUsd } = await calcTinfoilCost(modelId, inputTokens, outputTokens);
     return { text, inputTokens, outputTokens, costUsd, providerCostUsd, sources: [] };
   } catch (err) {
     if (!err.__sentryReported) {
-      Sentry.captureException(err, { tags: { op: 'near_chat' }, extra: { modelId } });
+      Sentry.captureException(err, { tags: { op: 'tinfoil_chat' }, extra: { modelId } });
       err.__sentryReported = true;
     }
     throw err;
@@ -244,14 +246,14 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
     model: upstream,
     messages: windowed,
     stream: true,
-    // vLLM/OpenAI-compatible servers only emit token usage mid-stream when this
-    // is set; without it inputTokens/outputTokens stay 0 and the turn isn't billed.
+    // OpenAI-compatible servers only emit token usage mid-stream when this is
+    // set; without it inputTokens/outputTokens stay 0 and the turn isn't billed.
     stream_options: { include_usage: true },
     temperature: options.temperature ?? 0.8,
     max_tokens: options.maxTokens ?? 8192,
   };
 
-  const res = await nearChatRequest(body, modelId, { stream: true, signal: options.signal });
+  const res = await tinfoilChatRequest(body, modelId, { signal: options.signal });
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -294,42 +296,43 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
   }
   tableConverter.end();
 
-  const { costUsd, providerCostUsd } = await calcNearCost(modelId, inputTokens, outputTokens);
+  const { costUsd, providerCostUsd } = await calcTinfoilCost(modelId, inputTokens, outputTokens);
   return { inputTokens, outputTokens, costUsd, providerCostUsd, sources: [] };
 }
 
 /**
  * Faithful OpenAI-compatible passthrough for the agent CLI billed endpoint.
- * Unlike generateText/generateTextStream (which massage messages for the mobile
- * app — NO_TABLES, table→bullet, history windowing), this forwards the client's
- * OpenAI body untouched so agent **tool_calls** pass through both ways. Mirrors
- * inferenceService.proxyChatCompletion's contract but targets the NEAR TEE host:
- * there is no ZDR two-key dance or provider routing here — confidential compute
- * (the TEE) is the privacy guarantee, and every NEAR call uses the single server
- * key. Returns the raw upstream Response for the caller to pipe; billing uses
- * calcNearCost. Non-OK responses are returned (not thrown) so the route can
- * forward NEAR's OpenAI-shaped error body verbatim.
+ * Unlike generateText/generateTextStream (which massage messages for the
+ * mobile app — NO_TABLES, table→bullet, history windowing), this forwards the
+ * client's OpenAI body untouched so agent **tool_calls** pass through both
+ * ways. Mirrors nearAiService.proxyChatCompletion: no ZDR two-key dance or
+ * provider routing — the secure enclave is the privacy guarantee, and every
+ * Tinfoil call uses the single server key. Returns the raw upstream Response
+ * for the caller to pipe; billing uses calcTinfoilCost. Non-OK responses are
+ * returned (not thrown) so the route can forward the OpenAI-shaped error body
+ * verbatim.
  *
  * @returns {Promise<{ response: Response, modelId: string }>} modelId stays
- *   `near/`-prefixed so the caller bills via the NEAR pricing path.
+ *   `tinfoil/`-prefixed so the caller bills via the Tinfoil pricing path.
  */
 async function proxyChatCompletion(openaiBody) {
   const modelId = openaiBody?.model;
-  const headers = nearHeaders(); // throws NEAR_KEY_UNAVAILABLE (503) if unset
+  const headers = tinfoilHeaders(); // throws TINFOIL_KEY_UNAVAILABLE (503) if unset
   const body = { ...openaiBody, model: toUpstreamId(modelId) };
   if (body.stream) {
-    // vLLM only emits the usage chunk when this is set — without it the usage
-    // stays 0 and the turn under-bills.
+    // OpenAI-compatible servers only emit the usage chunk when this is set —
+    // without it the usage stays 0 and the turn under-bills.
     body.stream_options = { ...(body.stream_options || {}), include_usage: true };
   }
 
-  // Cover time-to-headers with the NEAR timeout; the body stream is unbounded
-  // (the route owns inactivity handling), so we clear the timer once headers land.
+  // Cover time-to-headers with the Tinfoil timeout; the body stream is
+  // unbounded (the route owns inactivity handling), so we clear the timer once
+  // headers land.
   const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), NEAR_TIMEOUT_MS);
+  const timer = setTimeout(() => abort.abort(), TINFOIL_TIMEOUT_MS);
   let response;
   try {
-    response = await fetch(`${NEAR_BASE()}/chat/completions`, {
+    response = await fetch(`${TINFOIL_BASE()}/chat/completions`, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
@@ -337,7 +340,7 @@ async function proxyChatCompletion(openaiBody) {
     });
   } catch (fetchErr) {
     if (fetchErr?.name === 'AbortError') {
-      throw asProviderError(`NEAR AI request timed out after ${NEAR_TIMEOUT_MS}ms for ${modelId}`, modelId, { timedOut: true, statusCode: 504 });
+      throw asProviderError(`Tinfoil request timed out after ${TINFOIL_TIMEOUT_MS}ms for ${modelId}`, modelId, { timedOut: true, statusCode: 504 });
     }
     throw fetchErr;
   } finally {
@@ -347,35 +350,15 @@ async function proxyChatCompletion(openaiBody) {
   return { response, modelId };
 }
 
-// ── Confidential image generation (FLUX) ─────────────────────────────────────
-//
-// NEAR's image models (e.g. FLUX.2) are raw OpenAI-compatible vLLM endpoints, so
-// they use the dedicated POST /v1/images/generations route (NOT chat/completions
-// with modalities, which is OpenRouter's convention). Returns the same shape as
-// inferenceService.generateImage — { images: [{buffer, mimeType}], responseText,
-// inputTokens } — so chatController's persistence/billing path is untouched.
-
-// Map our aspect-ratio + size selection to the pixel `size` ("WxH") the OpenAI
-// images API expects. Long edge tracks the size tier; both edges snapped to a
-// multiple of 32 (FLUX latent stride).
-function ratioToPixelSize(aspectRatio, imageSize) {
-  const base = imageSize === '4K' ? 4096 : imageSize === '2K' ? 2048 : imageSize === '0.5K' ? 512 : 1024;
-  let [w, h] = String(aspectRatio || '1:1').split(':').map(Number);
-  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) { w = 1; h = 1; }
-  const long = Math.max(w, h);
-  const snap = (px) => Math.max(256, Math.round((base * px / long) / 32) * 32);
-  return `${snap(w)}x${snap(h)}`;
-}
-
-async function nearMediaRequest(path, init, modelId) {
+async function tinfoilMediaRequest(path, init, modelId) {
   const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), NEAR_MEDIA_TIMEOUT_MS);
+  const timer = setTimeout(() => abort.abort(), TINFOIL_MEDIA_TIMEOUT_MS);
   let res;
   try {
-    res = await fetch(`${NEAR_BASE()}${path}`, { ...init, signal: abort.signal });
+    res = await fetch(`${TINFOIL_BASE()}${path}`, { ...init, signal: abort.signal });
   } catch (fetchErr) {
     if (fetchErr?.name === 'AbortError') {
-      throw asProviderError(`NEAR AI request timed out after ${NEAR_MEDIA_TIMEOUT_MS}ms for ${modelId}`, modelId, { timedOut: true });
+      throw asProviderError(`Tinfoil request timed out after ${TINFOIL_MEDIA_TIMEOUT_MS}ms for ${modelId}`, modelId, { timedOut: true });
     }
     throw fetchErr;
   } finally {
@@ -386,75 +369,20 @@ async function nearMediaRequest(path, init, modelId) {
     if (res.status === 404 || res.status === 503 || res.status >= 500) {
       throw asProviderError(`The selected model (${modelId}) is currently unavailable. Please choose a different model in Settings.`, modelId, { statusCode: res.status });
     }
-    const err = new Error(`NEAR AI error ${res.status}: ${errText}`);
+    const err = new Error(`Tinfoil error ${res.status}: ${errText}`);
     if (res.status === 429) err.statusCode = 429;
     throw err;
   }
   return res;
 }
 
-async function generateImage(parts, options = {}) {
-  const modelId = options.modelId;
-  const upstream = toUpstreamId(modelId);
-  const normalizedParts = Array.isArray(parts) ? parts : [parts];
-
-  // FLUX via the images endpoint is text→image: collapse the parts into a single
-  // prompt string. (Reference-image edits use a different multipart endpoint we
-  // don't surface yet; the controller's fallback covers that case.)
-  const prompt = normalizedParts
-    .map((p) => (typeof p === 'string' ? p : (p?.text || p?.textBlock || '')))
-    .filter(Boolean)
-    .join('\n')
-    .trim();
-
-  const body = {
-    model: upstream,
-    prompt,
-    n: 1,
-    size: ratioToPixelSize(options.aspectRatio, options.imageSize),
-    response_format: 'b64_json',
-  };
-
-  let data;
-  try {
-    const res = await nearMediaRequest('/images/generations', {
-      method: 'POST',
-      headers: nearHeaders(),
-      body: JSON.stringify(body),
-    }, modelId);
-    data = await res.json();
-  } catch (err) {
-    if (!err.__sentryReported) {
-      Sentry.captureException(err, { tags: { op: 'near_image' }, extra: { modelId } });
-      err.__sentryReported = true;
-    }
-    throw err;
-  }
-
-  const images = [];
-  for (const item of (Array.isArray(data?.data) ? data.data : [])) {
-    if (item?.b64_json) {
-      images.push({ buffer: Buffer.from(item.b64_json, 'base64'), mimeType: 'image/png' });
-    } else if (typeof item?.url === 'string') {
-      try {
-        const r = await fetch(item.url);
-        if (r.ok) {
-          images.push({ buffer: Buffer.from(await r.arrayBuffer()), mimeType: r.headers.get('content-type') || 'image/png' });
-        }
-      } catch { /* skip unfetchable url */ }
-    }
-  }
-
-  return { images, responseText: '', inputTokens: data?.usage?.prompt_tokens || 0 };
-}
-
-// ── Confidential transcription (Whisper) ─────────────────────────────────────
+// ── Confidential transcription (Whisper / Voxtral) ───────────────────────────
 //
-// NEAR's Whisper is an OpenAI-compatible vLLM ASR endpoint: multipart/form-data
-// POST to /v1/audio/transcriptions with a `file` part (NOT OpenRouter's JSON
-// `input_audio` body). Returns { text, providerCostUsd } so the audio route bills
-// identically; provider cost is estimated from token pricing since the ASR
-// response carries no cost/generation-id.
+// Tinfoil STT is an OpenAI-compatible ASR endpoint: multipart/form-data POST
+// to /v1/audio/transcriptions with a `file` part (NOT OpenRouter's JSON
+// `input_audio` body). Returns { text, providerCostUsd } so the audio route
+// bills identically; provider cost comes from the catalog's per-request price
+// (Whisper) or a token estimate (Voxtral).
 async function transcribe({ audioBase64, format, language, modelId }) {
   const upstream = toUpstreamId(modelId);
   const bytes = Buffer.from(audioBase64, 'base64');
@@ -466,8 +394,8 @@ async function transcribe({ audioBase64, format, language, modelId }) {
   form.append('temperature', '0');
   if (language) form.append('language', language);
 
-  const { Authorization } = nearHeaders(); // throws NEAR_KEY_UNAVAILABLE if unset
-  const res = await nearMediaRequest('/audio/transcriptions', {
+  const { Authorization } = tinfoilHeaders(); // throws TINFOIL_KEY_UNAVAILABLE if unset
+  const res = await tinfoilMediaRequest('/audio/transcriptions', {
     method: 'POST',
     headers: { Authorization }, // let fetch set the multipart Content-Type + boundary
     body: form,
@@ -475,13 +403,41 @@ async function transcribe({ audioBase64, format, language, modelId }) {
   const data = await res.json();
   const text = typeof data?.text === 'string' ? data.text : '';
 
-  // No cost/generation-id on the response → estimate from completion pricing.
-  const pricing = await getNearPricing(modelId).catch(() => null);
-  const estTokens = Math.ceil(text.length / 4);
-  const providerCostUsd = pricing?.completionPerToken != null
-    ? estTokens * pricing.completionPerToken
-    : 0;
+  // No cost/generation-id on the response → per-request price when the catalog
+  // has one, else estimate from completion pricing.
+  const pricing = await getTinfoilPricing(modelId).catch(() => null);
+  let providerCostUsd = pricing?.perRequest || 0;
+  if (!providerCostUsd && pricing?.completionPerToken != null) {
+    const estTokens = Math.ceil(text.length / 4);
+    providerCostUsd = estTokens * pricing.completionPerToken;
+  }
   return { text, providerCostUsd };
 }
 
-module.exports = { isNearModel, toUpstreamId, generateText, generateTextStream, proxyChatCompletion, calcNearCost, generateImage, transcribe };
+// ── Confidential speech synthesis (Qwen3 TTS / Voxtral TTS) ──────────────────
+//
+// OpenAI-compatible POST /v1/audio/speech. Returns the raw upstream Response
+// so the audio route can reuse its shared content-type/PCM handling, plus the
+// per-request provider cost for billing (the response carries no cost or
+// generation-id).
+async function speechRequest({ text, voice, responseFormat, modelId }) {
+  const upstream = toUpstreamId(modelId);
+  const body = {
+    model: upstream,
+    input: text,
+    response_format: responseFormat || 'mp3',
+    // Tinfoil's voice param is optional (model default when omitted); voice
+    // identifiers are model-specific, so only forward an explicit choice.
+    ...(voice ? { voice } : {}),
+  };
+  const res = await tinfoilMediaRequest('/audio/speech', {
+    method: 'POST',
+    headers: tinfoilHeaders(),
+    body: JSON.stringify(body),
+  }, modelId);
+
+  const pricing = await getTinfoilPricing(modelId).catch(() => null);
+  return { response: res, providerCostUsd: pricing?.perRequest || 0 };
+}
+
+module.exports = { isTinfoilModel, toUpstreamId, generateText, generateTextStream, proxyChatCompletion, calcTinfoilCost, transcribe, speechRequest };
