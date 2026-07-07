@@ -69,6 +69,16 @@ python3 "$ROOT/scripts/redact_region.py" \
   "$ROOT/scripts/redactions/tinfoilService.cost.js" \
   '// ── Cost calculation' \
   '// ── Provider error mapping'
+python3 "$ROOT/scripts/redact_region.py" \
+  "$ROOT/server/services/audioService.js" \
+  "$ROOT/scripts/redactions/audioService.cost.js" \
+  '// ── Cost calculation' \
+  '// ── Audio containers'
+python3 "$ROOT/scripts/redact_region.py" \
+  "$ROOT/server/services/openaiMediaHandler.js" \
+  "$ROOT/scripts/redactions/openaiMediaHandler.cost.js" \
+  '// ── Cost calculation' \
+  '// ── Media helpers'
 
 # 3b. Scrub the internal codename from the published docs (brand: internal-only).
 for d in docs/E2EE_ARCHITECTURE.md docs/CONTENT_ENCRYPTION.md; do

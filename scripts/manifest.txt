@@ -16,7 +16,9 @@ docs/CONTENT_ENCRYPTION.md
 docs/E2EE_ARCHITECTURE.md
 server/controllers/auth.js
 server/data/tinfoilModels.js
+server/middleware/apiKeyAuth.js
 server/middleware/auth.js
+server/models/apiKeyModel.js
 server/models/cargoModel.js
 server/models/chatEdgeModel.js
 server/models/chatGraphModel.js
@@ -28,6 +30,7 @@ server/models/projectModel.js
 server/models/shareSnapshotModel.js
 server/models/userMemoryModel.js
 server/models/userModel.js
+server/routes/apiKeys.js
 server/routes/auth.js
 server/routes/cargo.js
 server/routes/chat.js
@@ -35,7 +38,11 @@ server/routes/graph.js
 server/routes/images.js
 server/routes/projects.js
 server/routes/share.js
+server/routes/v1.js
+server/services/audioService.js
 server/services/inferenceService.js
 server/services/nearAiService.js
+server/services/openaiMediaHandler.js
+server/services/openaiProxyHandler.js
 server/services/tinfoilService.js
 server/utils/shareCargoValidation.js
