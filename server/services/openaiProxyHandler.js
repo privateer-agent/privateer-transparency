@@ -70,8 +70,12 @@ async function billCompletion(userId, modelId, usage, ctx = {}) {
     const { costUsd, providerCostUsd } = await inferenceService.calcInferenceCost(
       modelId, inputTokens, outputTokens
     );
-    // CLI/API dev rate (AGENT_CLI_MARKUP_FACTOR) or the app rate when unset.
-    const billedUsd = billingService.agentCliBilledCost({ costUsd, providerCostUsd });
+    // Developer API (sk-priv-…) bills at its own flat rate (API_MARKUP_FACTOR);
+    // the internal Agent CLI keeps its cost-plus rate (AGENT_CLI_MARKUP_FACTOR),
+    // falling back to the app rate when that's unset.
+    const billedUsd = kind === 'api'
+      ? billingService.apiBilledCost({ costUsd, providerCostUsd })
+      : billingService.agentCliBilledCost({ costUsd, providerCostUsd });
     await billingService.chargeUsd(userId, billedUsd, {
       model: modelId,
       tokensPrompt: inputTokens,

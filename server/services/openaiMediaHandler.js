@@ -114,7 +114,8 @@ async function handleImageGeneration(req, res) {
     // but we may generate up to n images (billed per image). Pre-check the full
     // n-image cost so a near-empty account can't over-generate before running dry.
     const estimate = await inferenceService.calcImageGenCost(modelId, n);
-    const bal = await billingService.checkBalance(userId, estimate.costUsd);
+    const estimateBilled = billingService.apiBilledCost({ providerCostUsd: estimate.providerCostUsd, costUsd: estimate.costUsd });
+    const bal = await billingService.checkBalance(userId, estimateBilled);
     if (bal.status === 'blocked') {
       return res.status(402).json({ error: { message: 'Insufficient balance for this image request.', type: 'invalid_request_error', code: 'INSUFFICIENT_FUNDS' } });
     }
@@ -130,8 +131,10 @@ async function handleImageGeneration(req, res) {
       }
 
       // Bill each produced image immediately so partial output is never free.
+      // Flat API rate (not the app's image markup).
       const { providerCostUsd, costUsd } = await inferenceService.calcImageGenCost(modelId, 1);
-      await billingService.chargeUsd(userId, costUsd, {
+      const billedUsd = billingService.apiBilledCost({ providerCostUsd, costUsd });
+      await billingService.chargeUsd(userId, billedUsd, {
         model: modelId, tokensPrompt: 0, tokensCompletion: 0, providerCostUsd, kind: 'imageGen',
       });
 
@@ -177,7 +180,7 @@ async function handleVideoSubmit(req, res) {
 
     // Hold the estimated cost now; settle against the provider's actual usage on
     // completion. If the caller can't cover the estimate, fail before we track.
-    const estimate = reservationService.estimateVideoCostUsd({ modelId, durationSec, resolution, generateAudio });
+    const estimate = reservationService.estimateVideoCostUsd({ modelId, durationSec, resolution, generateAudio, markup: billingService.apiMarkupFactor() });
     try {
       await reservationService.reserveUsd(userId, estimate.chargeUsd, {
         kind: 'videoGen', refKey, meta: { modelId, source: 'api' }, estimatorVersion: estimate.estimatorVersion,

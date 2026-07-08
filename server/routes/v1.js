@@ -50,6 +50,7 @@ const { requireDailyCap, requireConcurrencySlot, requireFeature } = require('../
 const { handleChatCompletion } = require('../services/openaiProxyHandler');
 const { handleImageGeneration, handleVideoSubmit, handleVideoStatus } = require('../services/openaiMediaHandler');
 const audioService = require('../services/audioService');
+const billingService = require('../services/billingService');
 const { listEnabledModels } = require('../services/inferenceService');
 
 // Developer /v1 turns get their own concurrency pool ('apikey'), separate from
@@ -132,6 +133,7 @@ router.post(
       const requireZdr = await audioService.resolveRequireZdr(req.userId, req.body?.requireZdr);
       const { text } = await audioService.transcribe({
         userId: req.userId, audioBase64, format, language: req.body?.language, modelId: req.body?.model, requireZdr,
+        billingMarkup: billingService.apiMarkupFactor(),
       });
       return res.json({ text });
     } catch (err) {
@@ -160,6 +162,7 @@ router.post(
     const requireZdr = await audioService.resolveRequireZdr(req.userId, body.requireZdr);
     const { buffer, mimeType } = await audioService.synthesizeSpeech({
       userId: req.userId, text, voice: body.voice, format, modelId: body.model, requireZdr,
+      billingMarkup: billingService.apiMarkupFactor(),
     });
     res.setHeader('Content-Type', mimeType || 'audio/mpeg');
     res.setHeader('Content-Length', buffer.length);
