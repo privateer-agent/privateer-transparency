@@ -276,7 +276,14 @@ const userSchema = new mongoose.Schema(
     // hard-delete reminder cron), where there's no Accept-Language header to
     // read. Captured from the request language at registration. In-request
     // emails still prefer req.language; this is the fallback for cron jobs.
-    emailLocale: { type: String, default: null }
+    emailLocale: { type: String, default: null },
+    // X25519 public key (base64, 32 bytes) for the cloud outbox. Derived
+    // deterministically from the account master key on a key-holding client and
+    // published here so terminals (which hold NO key material) can seal results
+    // TO it without ever being able to read them. Write-once/immutable after the
+    // first set — see POST /api/outbox/pubkey — so a compromised terminal can't
+    // swap in a key it controls. The matching private key never leaves clients.
+    outboxPublicKey: { type: String, default: null }
   },
   { timestamps: true }
 );

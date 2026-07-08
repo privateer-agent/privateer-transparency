@@ -16,7 +16,10 @@ import {
   unwrapMasterKey,
   DEFAULT_KDF_PARAMS,
   KdfParams,
+  subscribeMasterKeyState,
 } from './cryptoService';
+import { syncOutboxPublicKey, resetOutboxKeyState } from './outboxKeyService';
+import { clearOutboxResults } from './outboxService';
 import { Sentry } from './sentryService';
 
 const API_BASE_URL = getServerUrl();
@@ -63,6 +66,23 @@ class AuthService {
   private reauthReject: ((err: Error) => void) | null = null;
   private reauthCallbacks: Array<() => void> = [];
 
+  constructor() {
+    // Publish the account outbox public key once BOTH the master key and a
+    // session token exist. Their load order varies (password login sets the key
+    // first, wallet/warm-start set the token first), so we trigger from both the
+    // key-load event here and the token-store path (storeAuthData / initialize).
+    // trySyncOutboxKey guards on both and syncOutboxPublicKey dedups per session.
+    subscribeMasterKeyState((loaded) => {
+      if (loaded) this.trySyncOutboxKey();
+    });
+  }
+
+  // Fire-and-forget publish; no-ops until both key and token are present.
+  private trySyncOutboxKey(): void {
+    if (!this.accessToken) return;
+    void syncOutboxPublicKey(this.makeAuthenticatedRequest.bind(this));
+  }
+
   // ---------------------------------------------------------------------------
   // Initialization
   // ---------------------------------------------------------------------------
@@ -79,6 +99,9 @@ class AuthService {
         this.accessToken = storedAccess;
         this.refreshToken = storedRefresh;
         this.user = JSON.parse(storedUser);
+        // Warm start restores the token here (not via storeAuthData); publish
+        // if the cached master key is already loaded, else the key-load event will.
+        this.trySyncOutboxKey();
         return true;
       }
       return false;
@@ -346,6 +369,10 @@ class AuthService {
     this.accessToken = null;
     this.refreshToken = null;
     this.user = null;
+    resetOutboxKeyState();
+    // Wipe caught-up outbox results — they're decrypted plaintext tied to the
+    // account and must not survive sign-out on a shared device.
+    void clearOutboxResults();
   }
 
   // ---------------------------------------------------------------------------
@@ -606,6 +633,7 @@ class AuthService {
     this.accessToken = accessToken;
     this.refreshToken = refreshToken;
     if (user) this.user = user;
+    this.trySyncOutboxKey();
   }
 
   private async handleTokenExpiration(): Promise<void> {
@@ -619,6 +647,8 @@ class AuthService {
       this.accessToken = null;
       this.refreshToken = null;
       this.user = null;
+      resetOutboxKeyState();
+      void clearOutboxResults();
       this.tokenExpirationCallbacks.forEach(cb => {
         try { cb(); } catch (_) {}
       });

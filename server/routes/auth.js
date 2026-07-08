@@ -55,6 +55,7 @@ function sanitizeUser(user) {
     profileImage: user.profileImage,
     solanaPublicKey: user.solanaPublicKey || null,
     kekSource: user.kekSource || null,
+    outboxPublicKey: user.outboxPublicKey || null,
   };
 }
 
