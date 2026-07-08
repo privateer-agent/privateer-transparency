@@ -25,6 +25,7 @@ server/models/chatGraphModel.js
 server/models/chatModel.js
 server/models/chatNodeModel.js
 server/models/messageModel.js
+server/models/outboxItemModel.js
 server/models/projectFileModel.js
 server/models/projectModel.js
 server/models/shareSnapshotModel.js
@@ -36,6 +37,7 @@ server/routes/cargo.js
 server/routes/chat.js
 server/routes/graph.js
 server/routes/images.js
+server/routes/outbox.js
 server/routes/projects.js
 server/routes/share.js
 server/routes/v1.js
