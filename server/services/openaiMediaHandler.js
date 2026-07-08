@@ -35,7 +35,7 @@ const inferenceService = require('./inferenceService');
 const billingService = require('./billingService');
 const reservationService = require('./reservationService');
 const { uploadToS3, generateSignedUrl } = require('./cloud-services');
-const { resolveImageGenModelId, resolveRequireZdr } = require('../controllers/chatController');
+const { resolveImageGenModelId, resolveRequireZdr, isImageFallbackEligibleError, IMAGE_GEN_FALLBACK_MODEL } = require('../controllers/chatController');
 const ApiMediaJob = require('../models/apiMediaJobModel');
 const ApiMediaArtifact = require('../models/apiMediaArtifactModel');
 
@@ -103,7 +103,7 @@ async function handleImageGeneration(req, res) {
   const responseFormat = body.response_format === 'url' ? 'url' : 'b64_json';
 
   try {
-    const modelId = await resolveImageGenModelId(userId, body.model);
+    let modelId = await resolveImageGenModelId(userId, body.model);
     const requireZdr = await resolveRequireZdr(userId, body.requireZdr);
 
     const options = { modelId, requireZdr };
@@ -122,7 +122,24 @@ async function handleImageGeneration(req, res) {
 
     const data = [];
     for (let i = 0; i < n; i++) {
-      const result = await inferenceService.generateImage(prompt, options);
+      let result;
+      try {
+        result = await inferenceService.generateImage(prompt, options);
+      } catch (genErr) {
+        // The account's chosen/default image model may be unroutable — e.g. an
+        // OpenAI image model OpenRouter can't serve for image output, which
+        // surfaces as PROVIDER_UNAVAILABLE / a "modalities" 404. Fall back once
+        // to the known-good default image model, mirroring the app's chat image
+        // path (chatController), so a stock `images.generate` doesn't hard-fail.
+        if (isImageFallbackEligibleError(genErr) && modelId !== IMAGE_GEN_FALLBACK_MODEL) {
+          logger.debug(`[v1 images] ${modelId} failed (${genErr.code || genErr.message?.slice(0, 80)}) — falling back to ${IMAGE_GEN_FALLBACK_MODEL}`);
+          modelId = IMAGE_GEN_FALLBACK_MODEL;
+          options.modelId = modelId;
+          result = await inferenceService.generateImage(prompt, options);
+        } else {
+          throw genErr;
+        }
+      }
       const img = result?.images?.[0];
       if (!img?.buffer) {
         const e = new Error('image generation returned no image');

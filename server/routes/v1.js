@@ -175,9 +175,12 @@ router.post(
 function sendMediaError(res, err, op) {
   const status = err.statusCode || (err.code === 'INSUFFICIENT_FUNDS' ? 402 : err.code === 'ZDR_KEY_UNAVAILABLE' ? 503 : 500);
   const code = err.code || 'INFERENCE_ERROR';
-  if (status >= 500) logger.error(`[v1 ${op}]`, err.message);
+  if (status >= 500) logger.error(`[v1 ${op}]`, err.message, err.upstreamStatus || '', err.upstreamDetail || '');
   if (res.headersSent) return;
-  return res.status(status).json({ error: { message: err.message, type: 'invalid_request_error', code } });
+  // Fold the upstream detail into the client-facing message so a 502 is
+  // actionable (e.g. which audio format / voice the backend rejected).
+  const message = err.upstreamDetail ? `${err.message} (upstream ${err.upstreamStatus || ''}: ${err.upstreamDetail})` : err.message;
+  return res.status(status).json({ error: { message, type: 'invalid_request_error', code } });
 }
 
 module.exports = router;

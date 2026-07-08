@@ -46,6 +46,25 @@ const DEFAULT_STT_MODEL = process.env.DEFAULT_STT_MODEL || 'openai/whisper-1';
 const DEFAULT_TTS_MODEL = process.env.DEFAULT_TTS_MODEL || 'google/gemini-3.1-flash-tts-preview';
 const DEFAULT_TTS_VOICE = process.env.DEFAULT_TTS_VOICE || 'Zephyr';
 
+// OpenAI-compatible clients always send an OpenAI voice name (`alloy`, `nova`,
+// …), but the default TTS backend is Gemini, whose voices are named differently
+// (`Zephyr`, `Puck`, …) — passing `alloy` to it 502s. Map the OpenAI voices to
+// the nearest Gemini voice so a stock OpenAI SDK call just works. Unknown /
+// already-Gemini voice names pass through untouched; empty → default voice.
+const OPENAI_TO_GEMINI_VOICE = {
+  alloy: 'Zephyr', echo: 'Charon', fable: 'Puck', onyx: 'Orus',
+  nova: 'Aoede', shimmer: 'Leda', ash: 'Enceladus', ballad: 'Algieba',
+  coral: 'Kore', sage: 'Iapetus', verse: 'Fenrir',
+};
+
+// Resolve the wire voice for a given model. OpenAI TTS models keep OpenAI voice
+// names; every other backend (Gemini default, etc.) gets the mapped/default name.
+function resolveVoice(voice, model) {
+  if (typeof model === 'string' && model.startsWith('openai/')) return voice || 'alloy';
+  if (!voice || typeof voice !== 'string') return DEFAULT_TTS_VOICE;
+  return OPENAI_TO_GEMINI_VOICE[voice.toLowerCase()] || voice;
+}
+
 // Audio carries user content, so it obeys ZDR like chat. Request wins; else pref.
 async function resolveRequireZdr(userId, requested) {
   if (typeof requested === 'boolean') return requested;
@@ -128,7 +147,11 @@ async function transcribe({ userId, audioBase64, format, language, modelId, requ
   if (!r.ok) {
     const errText = await r.text().catch(() => '');
     logger.error('[audioService.transcribe] OpenRouter error', r.status, errText);
-    throw Object.assign(new Error('transcription failed'), { statusCode: 502, code: 'STT_FAILED' });
+    // Surface a short upstream detail so an opaque 502 is diagnosable by callers
+    // (bad audio format vs. model/endpoint unavailable) instead of a bare string.
+    throw Object.assign(new Error('transcription failed'), {
+      statusCode: 502, code: 'STT_FAILED', upstreamStatus: r.status, upstreamDetail: errText.slice(0, 300),
+    });
   }
   const data = await r.json();
   const text = typeof data?.text === 'string' ? data.text : '';
@@ -150,24 +173,29 @@ async function synthesizeSpeech({ userId, text, voice, format, modelId, requireZ
   }
   const model = (typeof modelId === 'string' && modelId.includes('/')) ? modelId : DEFAULT_TTS_MODEL;
   const responseFormat = format === 'pcm' ? 'pcm' : 'mp3';
+  const wireVoice = resolveVoice(voice, model);
 
   let r;
   let tinfoilCostUsd = null;
   if (tinfoilService.isTinfoilModel(model)) {
-    const out = await tinfoilService.speechRequest({ text: text.slice(0, 8000), voice, responseFormat, modelId: model });
+    const out = await tinfoilService.speechRequest({ text: text.slice(0, 8000), voice: wireVoice, responseFormat, modelId: model });
     r = out.response;
     tinfoilCostUsd = out.providerCostUsd;
   } else {
     r = await fetch(`${OPENROUTER_BASE}/audio/speech`, {
       method: 'POST',
       headers: { ...inferenceService.orHeaders(requireZdr), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, input: text.slice(0, 8000), voice: voice || DEFAULT_TTS_VOICE, response_format: responseFormat }),
+      body: JSON.stringify({ model, input: text.slice(0, 8000), voice: wireVoice, response_format: responseFormat }),
     });
   }
   if (!r.ok) {
     const errText = await r.text().catch(() => '');
     logger.error('[audioService.speech] OpenRouter error', r.status, errText);
-    throw Object.assign(new Error('speech synthesis failed'), { statusCode: 502, code: 'TTS_FAILED' });
+    // Surface a short upstream detail so an opaque 502 is diagnosable by callers
+    // (which model/voice/format the backend rejected) instead of a bare string.
+    throw Object.assign(new Error('speech synthesis failed'), {
+      statusCode: 502, code: 'TTS_FAILED', upstreamStatus: r.status, upstreamDetail: errText.slice(0, 300),
+    });
   }
 
   const generationId = r.headers.get('x-generation-id');
