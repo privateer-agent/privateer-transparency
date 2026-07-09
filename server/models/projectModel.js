@@ -79,6 +79,16 @@ const projectSchema = new mongoose.Schema(
       type: Boolean,
       default: false
     },
+    // "ZDR routes only" — when true, every chat that belongs to this project is
+    // pinned to Zero Data Retention routing (provider.zdr + data_collection:
+    // 'deny') at inference time, overriding the account-level requireZdr opt-out.
+    // A per-project privacy floor: a user can keep ZDR off globally but mark a
+    // sensitive project ZDR-only. Enforced server-side (resolveRequireZdr) so a
+    // tampered client can't downgrade it. No user content — a plain boolean.
+    zdrOnly: {
+      type: Boolean,
+      default: false
+    },
     metadata: {
       type: Map,
       of: mongoose.Schema.Types.Mixed,
@@ -95,7 +105,7 @@ projectSchema.index({ userId: 1, isActive: 1 });
 
 // Create a new project
 projectSchema.statics.createProject = async function(userId, data) {
-  const { encryptedName, encryptedInstructions, iconType, iconValue, iconColor } = data;
+  const { encryptedName, encryptedInstructions, iconType, iconValue, iconColor, zdrOnly } = data;
   return this.create({
     userId,
     encryptedName,
@@ -103,6 +113,7 @@ projectSchema.statics.createProject = async function(userId, data) {
     iconType: iconType || null,
     iconValue: iconValue || null,
     iconColor: iconColor || null,
+    zdrOnly: !!zdrOnly,
     lastActivity: new Date()
   });
 };
@@ -112,7 +123,7 @@ projectSchema.statics.getUserProjects = async function(userId) {
   if (!userId) return [];
   return this.find({ userId, isActive: true })
     .sort({ lastActivity: -1 })
-    .select('encryptedName encryptedInstructions iconType iconValue iconColor pinned totalChats lastActivity createdAt')
+    .select('encryptedName encryptedInstructions iconType iconValue iconColor pinned zdrOnly totalChats lastActivity createdAt')
     .lean();
 };
 
