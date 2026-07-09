@@ -44,6 +44,15 @@ const cargoSchema = new mongoose.Schema(
       enum: ['cloud', 'local'],
       default: 'cloud'
     },
+    // Project the artifact belongs to (null = unfiled). Plaintext by design —
+    // mirrors Chat/ChatGraph.projectId so the server can filter per-project
+    // lists; the project's own name/instructions stay encrypted.
+    projectId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Project',
+      default: null,
+      index: true
+    },
     // E2EE: encrypted runnable HTML document. { iv, ct } JSON string → HTML.
     encryptedContent: {
       type: String,
@@ -66,5 +75,6 @@ const cargoSchema = new mongoose.Schema(
 );
 
 cargoSchema.index({ userId: 1, createdAt: -1 });
+cargoSchema.index({ userId: 1, projectId: 1, createdAt: -1 });
 
 module.exports = mongoose.model('Cargo', cargoSchema);
