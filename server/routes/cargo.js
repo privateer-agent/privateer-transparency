@@ -29,7 +29,10 @@ const {
   listCargo,
   getCargo,
   updateCargo,
-  deleteCargo
+  deleteCargo,
+  createCargoVersion,
+  listCargoVersions,
+  getCargoVersion
 } = require('../controllers/cargoController');
 
 // All Cargo routes require auth and are scoped to the caller's userId.
@@ -44,5 +47,13 @@ router.get('/', listCargo);
 router.get('/:cargoId', getCargo);
 router.patch('/:cargoId', requireStorage(), updateCargo);
 router.delete('/:cargoId', deleteCargo);
+
+// Version history (checkpoints). Snapshots are full encrypted copies, retained
+// as a per-artifact ring buffer (cargoController.MAX_VERSIONS). Restore is
+// client-orchestrated (snapshot-current → PATCH the artifact), so no restore
+// route is needed here.
+router.post('/:cargoId/versions', requireStorage(), createCargoVersion);
+router.get('/:cargoId/versions', listCargoVersions);
+router.get('/:cargoId/versions/:versionId', getCargoVersion);
 
 module.exports = router;
