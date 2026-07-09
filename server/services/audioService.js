@@ -121,7 +121,7 @@ function pcmToWav(pcm, sampleRate, channels, bitsPerSample) {
  * Transcribe audio → { text, model }. Bills 'stt'. Throws {statusCode,code} on
  * bad input / provider failure / ZDR-key / insufficient funds.
  */
-async function transcribe({ userId, audioBase64, format, language, modelId, requireZdr = true, billingMarkup }) {
+async function transcribe({ userId, audioBase64, format, language, modelId, requireZdr = true, billingMarkup, origin = 'app' }) {
   if (!audioBase64 || typeof audioBase64 !== 'string') {
     throw Object.assign(new Error('audio is required'), { statusCode: 400, code: 'AUDIO_REQUIRED' });
   }
@@ -129,12 +129,12 @@ async function transcribe({ userId, audioBase64, format, language, modelId, requ
 
   if (nearAiService.isNearModel(model)) {
     const { text, providerCostUsd } = await nearAiService.transcribe({ audioBase64, format, language, modelId: model });
-    await chargeAudio(userId, providerCostUsd, { model, kind: 'stt', markup: billingMarkup });
+    await chargeAudio(userId, providerCostUsd, { model, kind: 'stt', markup: billingMarkup, origin });
     return { text, model };
   }
   if (tinfoilService.isTinfoilModel(model)) {
     const { text, providerCostUsd } = await tinfoilService.transcribe({ audioBase64, format, language, modelId: model });
-    await chargeAudio(userId, providerCostUsd, { model, kind: 'stt', markup: billingMarkup });
+    await chargeAudio(userId, providerCostUsd, { model, kind: 'stt', markup: billingMarkup, origin });
     return { text, model };
   }
 
@@ -159,7 +159,7 @@ async function transcribe({ userId, audioBase64, format, language, modelId, requ
   if (!Number.isFinite(costUsd) || costUsd <= 0) {
     costUsd = await fetchGenerationCost(r.headers.get('x-generation-id'), requireZdr);
   }
-  await chargeAudio(userId, costUsd, { model, kind: 'stt', markup: billingMarkup });
+  await chargeAudio(userId, costUsd, { model, kind: 'stt', markup: billingMarkup, origin });
   return { text, model };
 }
 
@@ -167,7 +167,7 @@ async function transcribe({ userId, audioBase64, format, language, modelId, requ
  * Synthesize speech → { buffer, mimeType, model }. Bills 'tts' in the
  * background. Throws {statusCode,code} on bad input / provider failure.
  */
-async function synthesizeSpeech({ userId, text, voice, format, modelId, requireZdr = true, billingMarkup }) {
+async function synthesizeSpeech({ userId, text, voice, format, modelId, requireZdr = true, billingMarkup, origin = 'app' }) {
   if (!text || typeof text !== 'string' || !text.trim()) {
     throw Object.assign(new Error('text is required'), { statusCode: 400, code: 'TEXT_REQUIRED' });
   }
@@ -215,10 +215,10 @@ async function synthesizeSpeech({ userId, text, voice, format, modelId, requireZ
   }
 
   if (tinfoilCostUsd !== null) {
-    chargeAudio(userId, tinfoilCostUsd, { model, kind: 'tts', markup: billingMarkup }).catch(() => {});
+    chargeAudio(userId, tinfoilCostUsd, { model, kind: 'tts', markup: billingMarkup, origin }).catch(() => {});
   } else {
     fetchGenerationCost(generationId, requireZdr)
-      .then(cost => chargeAudio(userId, cost, { model, kind: 'tts', markup: billingMarkup }))
+      .then(cost => chargeAudio(userId, cost, { model, kind: 'tts', markup: billingMarkup, origin }))
       .catch(() => {});
   }
   return { buffer, mimeType, model };

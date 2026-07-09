@@ -152,7 +152,7 @@ async function handleImageGeneration(req, res) {
       const { providerCostUsd, costUsd } = await inferenceService.calcImageGenCost(modelId, 1);
       const billedUsd = billingService.apiBilledCost({ providerCostUsd, costUsd });
       await billingService.chargeUsd(userId, billedUsd, {
-        model: modelId, tokensPrompt: 0, tokensCompletion: 0, providerCostUsd, kind: 'imageGen',
+        model: modelId, tokensPrompt: 0, tokensCompletion: 0, providerCostUsd, kind: 'imageGen', origin: 'api',
       });
 
       if (responseFormat === 'url') {
@@ -259,10 +259,10 @@ async function handleVideoStatus(req, res) {
         const providerCostUsd = Number(poll?.usage?.cost ?? poll?.usage?.total_cost) || 0.5;
         const chargeUsd = videoChargeUsd(providerCostUsd);
         try {
-          await reservationService.settleReservation(job.reservationRefKey, chargeUsd, { providerCostUsd, model: job.model || 'video-generation', kind: 'videoGen' });
+          await reservationService.settleReservation(job.reservationRefKey, chargeUsd, { providerCostUsd, model: job.model || 'video-generation', kind: 'videoGen', origin: 'api' });
         } catch (e) {
           if (e?.code === 'RESERVATION_NOT_FOUND') {
-            await billingService.chargeUsd(userId, chargeUsd, { model: job.model || 'video-generation', providerCostUsd, kind: 'videoGen' }).catch(() => {});
+            await billingService.chargeUsd(userId, chargeUsd, { model: job.model || 'video-generation', providerCostUsd, kind: 'videoGen', origin: 'api' }).catch(() => {});
           } else {
             logger.warn('[v1 video] settle failed', e.message);
           }

@@ -76,12 +76,16 @@ async function billCompletion(userId, modelId, usage, ctx = {}) {
     const billedUsd = kind === 'api'
       ? billingService.apiBilledCost({ costUsd, providerCostUsd })
       : billingService.agentCliBilledCost({ costUsd, providerCostUsd });
+    // Attribute the spend to its surface for the usage summary: developer API
+    // → 'api', internal Agent CLI → 'cli'.
+    const origin = kind === 'api' ? 'api' : 'cli';
     await billingService.chargeUsd(userId, billedUsd, {
       model: modelId,
       tokensPrompt: inputTokens,
       tokensCompletion: outputTokens,
       providerCostUsd,
       kind,
+      origin,
     });
   } catch (err) {
     // Charge failed AFTER the response was served → the user got free inference.
