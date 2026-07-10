@@ -539,9 +539,13 @@ async function openRouterChat(messages, modelId, options = {}) {
 
     const errText = await res.text();
 
-    if (res.status === 429 && attempt < MAX_RETRIES) {
+    // Retry transient upstream failures: 429 (rate limit) and any 5xx incl. 503
+    // (provider overloaded or briefly down — common for busy image backends).
+    // 404 is permanent ("no endpoints found" / unknown model) and never retried.
+    const isTransient = res.status === 429 || res.status >= 500;
+    if (isTransient && attempt < MAX_RETRIES) {
       const delay = BASE_DELAY_MS * Math.pow(2, attempt);
-      logger.warn(`[openrouter] 429 rate limit for ${modelId}, retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+      logger.warn(`[openrouter] ${res.status} for ${modelId}, retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES}): ${errText.slice(0, 200)}`);
       await new Promise(resolve => setTimeout(resolve, delay));
       continue;
     }
@@ -551,6 +555,10 @@ async function openRouterChat(messages, modelId, options = {}) {
     if (res.status === 404 || res.status === 503 || res.status >= 500) {
       err.code = 'PROVIDER_UNAVAILABLE';
       err.modelId = modelId;
+      err.statusCode = err.statusCode || res.status;
+      // Preserve a snippet of the upstream body so the failure is diagnosable
+      // in logs (which model/provider said what) without dumping user content.
+      err.upstreamBody = errText.slice(0, 500);
     }
     throw err;
   }
@@ -990,7 +998,16 @@ async function generateImage(parts, options = {}) {
       ...buildOpenRouterAspectFields(modelId, options.aspectRatio, imageSize, options.transparentBackground),
     });
   } catch (err) {
-    logger.warn('[generateImage] OpenRouter call failed:', { modelId, ms: Date.now() - _t0, code: err?.code, timedOut: !!err?.timedOut });
+    logger.warn('[generateImage] OpenRouter call failed:', {
+      modelId,
+      ms: Date.now() - _t0,
+      code: err?.code,
+      statusCode: err?.statusCode,
+      timedOut: !!err?.timedOut,
+      // The upstream reason — a 404 "no endpoints" (bad/unavailable model) reads
+      // very differently from a 503 "provider overloaded"; log it to tell them apart.
+      detail: err?.upstreamBody || err?.message?.slice(0, 300),
+    });
     throw err;
   }
   logger.debug('[generateImage] OpenRouter returned:', { modelId, ms: Date.now() - _t0 });
