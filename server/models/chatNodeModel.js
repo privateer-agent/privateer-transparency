@@ -228,6 +228,14 @@ const chatNodeSchema = new mongoose.Schema(
         type: Boolean,
         default: true
       },
+      // Body-text size multiplier chosen by resizing the card. A wider/taller
+      // card scales its content up so a resized node reads as full rather than
+      // sparse. Persisted (not derivable from width/height alone) so the scale
+      // survives reloads. 1 = default content size.
+      fontScale: {
+        type: Number,
+        default: 1
+      },
       // Composer mode pill the node was created with (Create Image / Create
       // Video / Deep Research / Multi-Node). '' → plain prompt, no pill.
       modePill: {
@@ -293,6 +301,7 @@ chatNodeSchema.virtual('graphNodeData').get(function() {
       width: this.visualMetadata.width,
       height: this.visualMetadata.height
     },
+    fontScale: this.visualMetadata.fontScale,
     color: this.visualMetadata.color,
     edgeCount: this.connectedEdgeIds ? this.connectedEdgeIds.length : 0,
     lastActivity: this.lastActivity,

@@ -38,7 +38,7 @@
 
 const ModelRateConfig = require('../models/modelRateConfigModel');
 const billingService = require('./billingService');
-const { getRatioParamMode, supportsTransparency, getMaxImageSize } = require('../data/imageModelCapabilities');
+const { getRatioParamMode, supportsTransparency, getMaxImageSize, getSupportedAspectRatios } = require('../data/imageModelCapabilities');
 const { isZdrModel } = require('../data/zdrProviders');
 const { safeFetch } = require('../utils/safeFetch');
 const Sentry = require('@sentry/node');
@@ -918,7 +918,18 @@ function buildOpenRouterAspectFields(modelId, aspectRatio, imageSize, transparen
   }
 
   const image_config = {};
-  if (aspectRatio) image_config.aspect_ratio = aspectRatio;
+  // Never forward an aspect_ratio the model doesn't advertise — the provider
+  // rejects the entire request (400 invalid_value) rather than clamping, so a
+  // stray/misparsed ratio would sink an otherwise-valid generation. Unknown
+  // models (null list) can't be validated, so pass through as before.
+  if (aspectRatio) {
+    const allowed = getSupportedAspectRatios(modelId);
+    if (!allowed || allowed.includes(aspectRatio)) {
+      image_config.aspect_ratio = aspectRatio;
+    } else {
+      logger.warn(`[imageGen] dropping unsupported aspect_ratio "${aspectRatio}" for ${modelId}`);
+    }
+  }
   if (imageSize)   image_config.image_size   = imageSize;
   // Transparent background only for models that honor it. Force PNG (alpha-capable)
   // so the transparency survives the provider's encode step.
