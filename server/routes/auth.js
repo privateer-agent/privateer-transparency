@@ -41,6 +41,10 @@ const { loginRateLimiter, registerRateLimiter, nonceLimiter, walletVerifyLimiter
 // spawn. Bounds credential amplification: even with a leaked credential set, a
 // refresh token can't be turned into an unbounded fleet of billable sessions.
 const MAX_CHILD_SESSIONS_PER_FAMILY = Number(process.env.MAX_CHILD_SESSIONS_PER_FAMILY) || 16;
+// How long a terminal child may be offline before GET /auth/sessions prunes it.
+// Must sit comfortably above the relay's 60s presence TTL + 3s auto-reconnect so
+// a transient disconnect (lid close, wifi blip) is never mistaken for a close.
+const TERMINAL_PRUNE_GRACE_MS = Number(process.env.TERMINAL_PRUNE_GRACE_MS) || 3 * 60 * 1000;
 const { validateEmail, validatePassword } = require('../services/validation');
 const Sentry = require('@sentry/node');
 
@@ -526,7 +530,41 @@ router.get('/sessions', authenticate, async (req, res) => {
     const ids = Array.from(byDevice.keys());
     // Which of these devices currently has a live agent on the relay (so the
     // app can show "online" + enable remote-access). Ephemeral, Redis-backed.
-    const online = await relayHub.onlineMap(ids);
+    // last-seen is the durable companion: it lets us prune terminal children
+    // that closed a while ago without racing the relay's 3s auto-reconnect.
+    const [online, lastSeen] = await Promise.all([
+      relayHub.onlineMap(ids),
+      relayHub.lastSeenMap(ids),
+    ]);
+
+    // Auto-prune dead terminal children. A per-terminal child that used
+    // remote-access (has a last-seen), is offline now, and hasn't been seen for
+    // longer than the grace window is a closed terminal — delete its lineage so
+    // the list reflects reality. Constraints that keep this safe:
+    //   • children only (never a device/parent) and never the caller's own session
+    //   • DELETE via tokenService.deleteSessionFamily, never revoke — a revoked
+    //     token replayed by a still-alive agent would trip reuse-detection and
+    //     revoke the WHOLE account; a deleted one just makes it re-spawn a child.
+    //   • requires a last-seen: a child that never came online (remote-access off)
+    //     has no liveness signal and is left alone (it ages out via token TTL).
+    //   • grace ≫ the 60s presence TTL + 3s reconnect, so blips never prune.
+    const nowMs = Date.now();
+    const prune = Array.from(byDevice.values()).filter((s) =>
+      s.isChild &&
+      s.client === 'cli' &&
+      s.id !== currentKey &&
+      !online[s.id] &&
+      lastSeen[s.id] != null &&
+      nowMs - lastSeen[s.id] > TERMINAL_PRUNE_GRACE_MS,
+    );
+    for (const s of prune) {
+      byDevice.delete(s.id);
+      // Best-effort; the list already reflects the prune, and a stale row just
+      // reappears on the next poll if the delete somehow failed.
+      tokenService.deleteSessionFamily(req.user._id, s.id)
+        .then(() => relayHub.clearLastSeen(s.id))
+        .catch((err) => logger.warn('Terminal auto-prune failed (non-fatal):', err?.message || err));
+    }
 
     const sessions = Array.from(byDevice.values()).map((s) => ({
       ...s,
