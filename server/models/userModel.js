@@ -283,7 +283,14 @@ const userSchema = new mongoose.Schema(
     // TO it without ever being able to read them. Write-once/immutable after the
     // first set — see POST /api/outbox/pubkey — so a compromised terminal can't
     // swap in a key it controls. The matching private key never leaves clients.
-    outboxPublicKey: { type: String, default: null }
+    outboxPublicKey: { type: String, default: null },
+    // Base64 Ed25519 signature over outboxPublicKey, made with the account signing key
+    // (see client/services/accountSign.ts signOutboxKey). Stored opaquely — the server
+    // never verifies it — and handed to terminals so they can reject a server that tries
+    // to substitute a different outbox key (only the master-key holder can produce this
+    // signature). Write-once alongside the key; backfillable once if an older client
+    // published the key before signatures existed.
+    outboxPublicKeySig: { type: String, default: null }
   },
   { timestamps: true }
 );

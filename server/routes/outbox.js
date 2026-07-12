@@ -82,33 +82,60 @@ function decodeBase64(value, expectedBytes = null) {
 // ---------------------------------------------------------------------------
 
 router.get('/pubkey', authenticate, async (req, res) => {
-  res.json({ outboxPublicKey: req.user.outboxPublicKey || null });
+  res.json({
+    outboxPublicKey: req.user.outboxPublicKey || null,
+    // Account signature over the key; terminals verify it against the account signing
+    // key they pinned at link before sealing, so a server can't substitute the key.
+    outboxPublicKeySig: req.user.outboxPublicKeySig || null,
+  });
 });
 
 router.post('/pubkey', authenticate, async (req, res) => {
   try {
-    const { outboxPublicKey } = req.body || {};
+    const { outboxPublicKey, outboxPublicKeySig } = req.body || {};
     if (!decodeBase64(outboxPublicKey, 32)) {
       return res.status(400).json({ message: 'outboxPublicKey must be base64 of 32 bytes', code: 'BAD_OUTBOX_KEY' });
     }
+    // Optional for back-compat with an older client, but if present it must be a
+    // well-formed 64-byte Ed25519 signature. The server never verifies it (it can't —
+    // it holds no account key); a wrong signature only makes honest terminals fail
+    // closed, which is safe. Stored opaquely.
+    if (outboxPublicKeySig !== undefined && outboxPublicKeySig !== null && !decodeBase64(outboxPublicKeySig, 64)) {
+      return res.status(400).json({ message: 'outboxPublicKeySig must be base64 of 64 bytes', code: 'BAD_OUTBOX_KEY_SIG' });
+    }
+    const sig = outboxPublicKeySig || null;
 
     // Write-once. Only set when currently unset — a compromised terminal must
-    // never be able to overwrite the account's outbox key with its own.
+    // never be able to overwrite the account's outbox key with its own. The key and
+    // its signature are written together atomically.
     const updated = await User.findOneAndUpdate(
       { _id: req.user._id, $or: [{ outboxPublicKey: { $in: [null, ''] } }, { outboxPublicKey: { $exists: false } }] },
-      { $set: { outboxPublicKey } },
+      { $set: { outboxPublicKey, outboxPublicKeySig: sig } },
       { new: true }
-    ).select('outboxPublicKey');
+    ).select('outboxPublicKey outboxPublicKeySig');
 
     if (updated) {
-      return res.json({ outboxPublicKey: updated.outboxPublicKey, created: true });
+      return res.json({ outboxPublicKey: updated.outboxPublicKey, outboxPublicKeySig: updated.outboxPublicKeySig, created: true });
     }
 
-    // Already set. Idempotent if it matches; a conflict otherwise (someone else
+    // Already set. Idempotent if the key matches; a conflict otherwise (someone else
     // — possibly a hostile terminal — got there first; the client surfaces this).
-    const current = await User.findById(req.user._id).select('outboxPublicKey');
+    const current = await User.findById(req.user._id).select('outboxPublicKey outboxPublicKeySig');
     if (current && current.outboxPublicKey === outboxPublicKey) {
-      return res.json({ outboxPublicKey: current.outboxPublicKey, created: false });
+      // Backfill the signature once, for an account whose key was published before
+      // signing existed. Guarded on the sig still being absent so it's write-once too
+      // (a hostile terminal can't overwrite a good signature with a bad one).
+      if (sig && !current.outboxPublicKeySig) {
+        const filled = await User.findOneAndUpdate(
+          { _id: req.user._id, outboxPublicKey, $or: [{ outboxPublicKeySig: { $in: [null, ''] } }, { outboxPublicKeySig: { $exists: false } }] },
+          { $set: { outboxPublicKeySig: sig } },
+          { new: true }
+        ).select('outboxPublicKey outboxPublicKeySig');
+        if (filled) {
+          return res.json({ outboxPublicKey: filled.outboxPublicKey, outboxPublicKeySig: filled.outboxPublicKeySig, created: false });
+        }
+      }
+      return res.json({ outboxPublicKey: current.outboxPublicKey, outboxPublicKeySig: current.outboxPublicKeySig || null, created: false });
     }
     return res.status(409).json({
       message: 'A different outbox public key is already published for this account',
