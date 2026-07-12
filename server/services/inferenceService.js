@@ -760,7 +760,12 @@ async function generateText(parts, options = {}) {
   const normalizedParts = Array.isArray(parts) ? parts : [parts];
 
   let messages = [];
-  messages.push({ role: 'system', content: withNoTables(options.systemPrompt) });
+  // HTML-answer mode wants real <table> elements, so it opts out of the
+  // NO_TABLES directive (the system prompt already carries the HTML directive).
+  messages.push({
+    role: 'system',
+    content: options.richHtml ? (options.systemPrompt || '') : withNoTables(options.systemPrompt),
+  });
 
   // Role-tagged history between system and the current user turn. Sending the
   // transcript as proper messages (rather than flattened into the user blob)
@@ -1225,6 +1230,8 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
 
   const messagesWithDirective = (() => {
     const arr = Array.isArray(messages) ? [...messages] : [messages];
+    // HTML-answer mode wants real <table> elements — skip the NO_TABLES directive.
+    if (options.richHtml) return arr;
     if (arr[0]?.role === 'system') {
       arr[0] = { ...arr[0], content: withNoTables(arr[0].content) };
     } else {
