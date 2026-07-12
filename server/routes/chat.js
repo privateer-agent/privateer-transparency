@@ -26,6 +26,11 @@ const router = express.Router();
 const {
   sendMessage,
   streamMessage,
+  startDeepResearch,
+  streamDeepResearch,
+  getDeepResearch,
+  cancelDeepResearch,
+  ackDeepResearch,
   planNodes,
   getTokenStatus,
   uploadImage,
@@ -59,6 +64,18 @@ router.post('/message', limitTextInput, requireDailyCap('message'), checkCreditB
 
 // Stream message — same gating as /message; delivers tokens via SSE.
 router.post('/stream', limitTextInput, requireDailyCap('message'), checkCreditBalance(0.05), requireConcurrencySlot(), streamMessage);
+
+// Deep Research — detached background job. `start` validates + kicks off a run
+// and returns a jobId immediately; progress is consumed over the reconnectable
+// SSE stream. Cancellation + client-ack (delete) are idempotent. Daily cap and
+// per-user concurrency are enforced inside the controller/job store (the run
+// holds a DR-specific slot for its whole lifetime, unlike requireConcurrencySlot
+// which releases at request end). Same $0.05 balance floor as chat.
+router.post('/deep-research', limitTextInput, checkCreditBalance(0.05), startDeepResearch);
+router.get('/deep-research/:jobId/stream', streamDeepResearch);
+router.get('/deep-research/:jobId', getDeepResearch);
+router.post('/deep-research/:jobId/cancel', cancelDeepResearch);
+router.delete('/deep-research/:jobId', ackDeepResearch);
 
 // Plan multi-node fan-out (graph). Cheap planner call (no concurrency slot,
 // minimal balance floor); the actual node generations each go through /stream.

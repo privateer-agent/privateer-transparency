@@ -121,6 +121,34 @@ Plaintext fields on the server schemas (`content`, `aiResponse`, `title`,
 The server never writes the AI response to the database in plaintext. The
 plaintext exists in memory on the server only for the duration of the request.
 
+### Deep Research background jobs
+
+Deep Research is a multi-minute, detached server-side job (so a run survives the
+app being backgrounded). Its transient plaintext state — the search queries,
+fetched page text, the partial answer, and the step trail — lives in **Redis
+with a short TTL** (`DEEP_RESEARCH_JOB_TTL_MS`, ~20 min) and is streamed to the
+client over Redis pub/sub, mirroring the ephemeral-transport posture of
+`relayHub.js` (`/remote-access`). This is a **bounded, quantitative extension of
+the AI-inference exposure above**, not a new class of risk: the plaintext window
+grows from a single request to a few minutes, held in Privateer-operated Redis
+(the same trust boundary as inference-time process memory). Guarantees:
+
+- **Never written to Mongo.** No deep-research plaintext is persisted durably
+  server-side. The durable trail + answer are encrypted client-side after the
+  run completes (`encryptedResearchTrail`, `encryptedContent`), exactly like the
+  rest of the content path.
+- **Auto-expiring.** The Redis snapshot self-deletes via TTL even if the client
+  never returns; it is also deleted on client ack once the encrypted result is
+  persisted.
+- **Fetched page text is untrusted** and wrapped in explicit "treat as data, not
+  instructions" markers before synthesis (prompt-injection mitigation), and is
+  never fed back into the planner/reflector as instructions.
+- Queries and page text are **never logged**.
+
+Key files: `server/services/deepResearchService.js` (the loop + detached
+runner), `server/services/deepResearchJobStore.js` (Redis snapshot + pub/sub +
+per-user concurrency + stale-job watchdog).
+
 ## Auth endpoints
 
 - `POST /auth/register` — email/password signup. Body includes the
