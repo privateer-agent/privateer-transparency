@@ -20,6 +20,7 @@ import {
 } from './cryptoService';
 import { syncOutboxPublicKey, resetOutboxKeyState } from './outboxKeyService';
 import { clearOutboxResults } from './outboxService';
+import { clearTrustedTerminalKeys } from './terminalTrustService';
 import { Sentry } from './sentryService';
 
 const API_BASE_URL = getServerUrl();
@@ -373,6 +374,9 @@ class AuthService {
     // Wipe caught-up outbox results — they're decrypted plaintext tied to the
     // account and must not survive sign-out on a shared device.
     void clearOutboxResults();
+    // Drop pinned terminal keys — they belong to this account's terminals; a
+    // different account signing in on this device must not inherit their trust.
+    void clearTrustedTerminalKeys();
   }
 
   // ---------------------------------------------------------------------------
