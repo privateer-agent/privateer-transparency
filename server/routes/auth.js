@@ -34,6 +34,7 @@ const tokenService = require('../services/tokenService');
 const analyticsService = require('../services/analyticsService');
 const redis = require('../services/redisClient');
 const relayHub = require('../services/relayHub');
+const { signalRevokedTerminals, signalAllTerminals } = require('../services/sessionRevocation');
 const { authenticate } = require('../middleware/auth');
 const { loginRateLimiter, registerRateLimiter, nonceLimiter, walletVerifyLimiter, resendVerificationLimiter, resetLimit, deviceApproveLimiter, sessionSpawnLimiter } = require('../middleware/rateLimiter');
 
@@ -467,6 +468,12 @@ router.delete('/session/current', authenticate, async (req, res) => {
 router.post('/logout', authenticate, async (req, res) => {
   try {
     await tokenService.revokeAllUserSessions(req.user._id);
+    // Logout revokes every session for the account (all devices + terminals), so
+    // sign out any live terminals promptly too instead of leaving them to die on
+    // the ≤25s heartbeat. Best-effort (see DELETE /sessions/:id).
+    void signalAllTerminals(req.user._id).catch((err) => {
+      logger.warn('Relay session_revoked broadcast (logout) failed:', err?.message || err);
+    });
     res.json({ message: req.t('success.signedOut') });
   } catch (error) {
     Sentry.captureException(error, { tags: { op: 'auth_logout' } });
@@ -601,6 +608,16 @@ router.delete('/sessions/:id', authenticate, async (req, res) => {
         return res.status(404).json({ message: 'Session not found' });
       }
     }
+
+    // Promptly sign out any live terminals on this lineage. The relay heartbeat
+    // already terminates a revoked socket within ≤25s (relaySessionLive), but
+    // that's a silent transport drop; pushing a `session_revoked` frame lets the
+    // agent tear down cleanly right now — clear its local credentials, drop
+    // remote access, and tell the user — instead of lingering with a dead token.
+    // Best-effort only: never let a relay hiccup fail the revoke the DB already did.
+    void signalRevokedTerminals(req.user._id, id).catch((err) => {
+      logger.warn('Relay session_revoked push failed:', err?.message || err);
+    });
 
     res.json({ message: 'Session revoked' });
   } catch (error) {
@@ -779,6 +796,11 @@ router.post('/change-password', authenticate, async (req, res) => {
     await user.save();
 
     await tokenService.revokeAllUserSessions(user._id);
+    // Password change revoked every session (a re-wrap under the new KEK); sign out
+    // all live terminals promptly too. Best-effort (see DELETE handler).
+    void signalAllTerminals(user._id).catch((err) => {
+      logger.warn('Relay session_revoked broadcast (password) failed:', err?.message || err);
+    });
 
     res.json({ message: 'Password changed. Please sign in again.' });
   } catch (error) {
@@ -809,6 +831,11 @@ router.post('/account/delete-request', authenticate, async (req, res) => {
     await user.save();
 
     await tokenService.revokeAllUserSessions(user._id);
+    // Every session is gone — promptly sign out all live terminals too, rather
+    // than let them dead-end on their next call. Best-effort (see DELETE handler).
+    void signalAllTerminals(user._id).catch((err) => {
+      logger.warn('Relay session_revoked broadcast (delete) failed:', err?.message || err);
+    });
 
     if (user.email) {
       try {

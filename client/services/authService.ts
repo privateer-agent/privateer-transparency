@@ -20,6 +20,7 @@ import {
 } from './cryptoService';
 import { syncOutboxPublicKey, resetOutboxKeyState } from './outboxKeyService';
 import { clearOutboxResults } from './outboxService';
+import { clearAccountModelsCache } from './accountModelsService';
 import { clearTrustedTerminalKeys } from './terminalTrustService';
 import { Sentry } from './sentryService';
 
@@ -371,6 +372,9 @@ class AuthService {
     this.refreshToken = null;
     this.user = null;
     resetOutboxKeyState();
+    // Drop the account model catalog cache so a different account signing in on this
+    // device doesn't briefly see the previous account's model list.
+    clearAccountModelsCache();
     // Wipe caught-up outbox results — they're decrypted plaintext tied to the
     // account and must not survive sign-out on a shared device.
     void clearOutboxResults();

@@ -46,5 +46,6 @@ server/services/inferenceService.js
 server/services/nearAiService.js
 server/services/openaiMediaHandler.js
 server/services/openaiProxyHandler.js
+server/services/sessionRevocation.js
 server/services/tinfoilService.js
 server/utils/shareCargoValidation.js
