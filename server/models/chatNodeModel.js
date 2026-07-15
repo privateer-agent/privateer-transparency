@@ -242,6 +242,13 @@ const chatNodeSchema = new mongoose.Schema(
         type: String,
         enum: ['', 'image', 'video', 'research', 'multi'],
         default: ''
+      },
+      // How the client renders the AI response: '' / 'markdown' (default) or
+      // 'html' (a model-authored rich-HTML fragment). Non-content metadata.
+      renderMode: {
+        type: String,
+        enum: ['', 'markdown', 'html'],
+        default: ''
       }
     },
     // Token usage tracking
@@ -418,7 +425,8 @@ chatNodeSchema.statics.createGraphNode = async function(data) {
     videoAttachments = null,
     fileAttachments = null,
     modelId = null,
-    modePill = null
+    modePill = null,
+    renderMode = null
   } = data;
 
   const colorByType = {
@@ -453,7 +461,8 @@ chatNodeSchema.statics.createGraphNode = async function(data) {
       height: size?.height ?? 120,
       // Which composer pill created this node — kept through the pending →
       // finished swap so the card can keep showing it after reloads.
-      modePill: typeof modePill === 'string' ? modePill : ''
+      modePill: typeof modePill === 'string' ? modePill : '',
+      renderMode: renderMode === 'html' || renderMode === 'markdown' ? renderMode : ''
     }
   });
   
