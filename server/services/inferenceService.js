@@ -1195,17 +1195,48 @@ async function pollVideoGeneration(jobId, { useZdrKey = false } = {}) {
 /**
  * GET /models — list enabled models from rate config table.
  */
+// Honest privacy tier per model — surfaced as `privacy.tier` so the CLI/app model
+// pickers can shield each row. Mirrors the inference routing (§4 auto-route by model
+// ID) so the label can never overclaim relative to how the request is actually served:
+//   • near/… , tinfoil/…  → confidential-compute enclaves. We assert only the CLAIM
+//     here ('tee-unverified'); the client still runs remote attestation and upgrades
+//     the shield to 'tee-verified' (green) itself — the server can't verify the
+//     client's live TLS-key binding, so it must not assert a verified TEE.
+//   • OpenRouter model with a ZDR endpoint → the account channel serves it on the
+//     ZDR-enforced key (proxyChatCompletion defaults requireZdr=true), an observable
+//     enforcement, so 'zdr-enforced'.
+//   • everything else → 'standard' (no special guarantee).
+// Tier strings match pi-privacy's PrivacyTier ladder (posture/tiers.ts).
+async function privacyTierFor(modelId) {
+  try {
+    const nearAiService = require('./nearAiService');
+    if (nearAiService.isNearModel(modelId)) return 'tee-unverified';
+    const tinfoilService = require('./tinfoilService');
+    if (tinfoilService.isTinfoilModel(modelId)) return 'tee-unverified';
+    if (await isZdrModel(modelId)) return 'zdr-enforced';
+  } catch (_) {
+    // Fail safe: an unknown routing state must never inflate the claim.
+  }
+  return 'standard';
+}
+
+async function withPrivacy(configs) {
+  return Promise.all(
+    configs.map(async (c) => ({ ...c, privacy: { tier: await privacyTierFor(c.modelId) } }))
+  );
+}
+
 async function listEnabledModels() {
   const configs = await ModelRateConfig.find({ enabled: true }).lean();
-  if (configs.length > 0) return configs;
+  if (configs.length > 0) return withPrivacy(configs);
 
-  return [{
+  return withPrivacy([{
     modelId: process.env.DEFAULT_MODEL_ID || 'deepseek/deepseek-v4-flash',
     ratePerInputToken: 0,
     ratePerOutputToken: 0,
     markupFactor: 1,
     enabled: true
-  }];
+  }]);
 }
 
 /**
