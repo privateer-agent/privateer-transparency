@@ -1698,4 +1698,6 @@ async function extractMemoryCandidates({ userMessage, aiResponse, existingMemori
 
 module.exports = { generateText, generateTextStream, proxyChatCompletion, calcOpenRouterCost, calcInferenceCost, calcImageGenCost, generateImage, submitVideoGeneration, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, formatImageGenErrorForUser, formatVideoGenErrorForUser, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
   // Shared formatting helpers reused by nearAiService (OpenAI-compatible NEAR path).
-  NO_TABLES_DIRECTIVE, withNoTables, convertTablesToBullets, createStreamingTableConverter };
+  NO_TABLES_DIRECTIVE, withNoTables, convertTablesToBullets, createStreamingTableConverter,
+  // og:image enrichment for source cards — also applied to the Brave web-search path.
+  enrichWithImages };
