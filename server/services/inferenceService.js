@@ -61,6 +61,17 @@ function withNoTables(systemPrompt) {
   return `${systemPrompt}\n\n${NO_TABLES_DIRECTIVE}`;
 }
 
+// Continuation nudge for a length-truncated reply (generateTextStream auto-
+// continue). The partial output is re-sent as the assistant turn; this asks the
+// model to resume verbatim so the concatenated stream is one seamless document.
+const CONTINUE_DIRECTIVE = [
+  'Your previous message was cut off because it hit the length limit.',
+  'Continue it from EXACTLY where it stopped — pick up at the next character.',
+  'Do NOT repeat anything you already wrote, do NOT restart, and do NOT add any',
+  'preamble, apology, or explanation. Output only the raw continuation so the two',
+  'parts join seamlessly (if you were mid-code-block, keep emitting its contents).',
+].join(' ');
+
 // ── Table → bulleted-list post-processor ─────────────────────────────────────
 // Even with the directive above, models occasionally still emit pipe tables.
 // We deterministically convert them so the user never sees one.
@@ -1274,63 +1285,31 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
   const windowed = windowHistory(messagesWithDirective, { maxTokens: options.historyTokenBudget ?? 12000 });
   applyPromptCacheHints(windowed, effectiveModelId);
 
-  const body = {
+  const baseBody = {
     model: effectiveModelId,
     messages: windowed,
     stream: true,
     temperature: options.temperature ?? 0.8,
     max_tokens: options.maxTokens ?? 8192,
   };
-  if (options.plugins) body.plugins = options.plugins;
+  if (options.plugins) baseBody.plugins = options.plugins;
 
   if (options.webPlugin) {
     const webEntry = { id: 'web', ...(typeof options.webPlugin === 'object' ? options.webPlugin : {}) };
-    body.plugins = [...(body.plugins || []), webEntry];
+    baseBody.plugins = [...(baseBody.plugins || []), webEntry];
   }
 
   // Caller-supplied provider routing (e.g. force Google Vertex for base64
   // video input). Merged before applyProviderRouting so env `sort` still layers on.
-  if (options.provider) body.provider = { ...(body.provider || {}), ...options.provider };
+  if (options.provider) baseBody.provider = { ...(baseBody.provider || {}), ...options.provider };
 
+  // Routing depends only on the model + account, so resolve it once and reuse it
+  // across any continuation requests (below).
   const useZdrKey = await resolveUseZdrKey({ requireZdr: options.requireZdr, modelId: effectiveModelId });
-  await applyZdrRouting(body, effectiveModelId, { useZdrKey });
-  applyProviderRouting(body);
+  await applyZdrRouting(baseBody, effectiveModelId, { useZdrKey });
+  applyProviderRouting(baseBody);
 
-  // options.signal lets a caller cancel the upstream request mid-stream (used by
-  // the speculative-streaming path in chatController: when the intent classifier
-  // diverts a guessed-chat turn to image/video/compose, the in-flight speculative
-  // generation is aborted so we stop paying for tokens we'll discard).
-  const res = await fetch(`${OPENROUTER_BASE}/chat/completions`, orFetchInit({
-    method: 'POST',
-    headers: orHeaders(useZdrKey),
-    body: JSON.stringify(body),
-    ...(options.signal ? { signal: options.signal } : {}),
-  }));
-
-  if (!res.ok) {
-    const errText = await res.text();
-    // A selected model whose providers have all gone away returns
-    // 404 "No endpoints found for <model>". Surface it as a typed,
-    // user-actionable error (chatController has a PROVIDER_UNAVAILABLE
-    // branch that forwards code + modelId to the client) rather than a
-    // raw stream-error string that dead-ends the turn.
-    // Two distinct 404s should both surface as PROVIDER_UNAVAILABLE: a model
-    // whose providers have all gone away ("No endpoints found for <model>"), and
-    // a model whose only endpoints are barred by the account's data policy /
-    // guardrails ("No endpoints available matching your guardrail restrictions
-    // and data policy" — e.g. `:free` endpoints when prompt-logging is disabled).
-    if (res.status === 404 && /no endpoints (found|available)|guardrail|data policy/i.test(errText)) {
-      throw Object.assign(
-        new Error(`The selected model (${effectiveModelId}) is currently unavailable. Please choose a different model in Settings.`),
-        { statusCode: 404, code: 'PROVIDER_UNAVAILABLE', modelId: effectiveModelId }
-      );
-    }
-    throw new Error(`OpenRouter stream error ${res.status}: ${errText}`);
-  }
-
-  const reader = res.body.getReader();
   const decoder = new TextDecoder();
-  let buffer = '';
   let inputTokens = 0;
   let outputTokens = 0;
   const annotationsById = new Map();
@@ -1344,50 +1323,134 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
   };
 
   const tableConverter = createStreamingTableConverter(onChunk);
+  // Raw (pre-table-conversion) text accumulated so a truncated reply can be fed
+  // back verbatim as the assistant turn for continuation.
+  let fullText = '';
 
-  outer: while (true) {
-    // Caller aborted (speculative divert): stop reading and return what we have.
-    // The caller discards the result, so partial token counts here are harmless.
-    if (options.signal?.aborted) break;
-    let read;
-    try {
-      read = await reader.read();
-    } catch (readErr) {
-      // An abort rejects the in-flight read() with an AbortError — expected when
-      // options.signal fired. Anything else is a real stream failure: rethrow.
+  // Stream one upstream request to completion, pushing deltas through the shared
+  // table converter and accumulating token/annotation state. Returns the upstream
+  // finish_reason ('stop' | 'length' | null) so the caller can decide whether to
+  // continue a length-truncated reply.
+  const streamOnce = async (reqMessages) => {
+    const body = { ...baseBody, messages: reqMessages };
+    // options.signal lets a caller cancel the upstream request mid-stream (used by
+    // the speculative-streaming path in chatController: when the intent classifier
+    // diverts a guessed-chat turn to image/video/compose, the in-flight speculative
+    // generation is aborted so we stop paying for tokens we'll discard).
+    const res = await fetch(`${OPENROUTER_BASE}/chat/completions`, orFetchInit({
+      method: 'POST',
+      headers: orHeaders(useZdrKey),
+      body: JSON.stringify(body),
+      ...(options.signal ? { signal: options.signal } : {}),
+    }));
+
+    if (!res.ok) {
+      const errText = await res.text();
+      // A selected model whose providers have all gone away returns
+      // 404 "No endpoints found for <model>". Surface it as a typed,
+      // user-actionable error (chatController has a PROVIDER_UNAVAILABLE
+      // branch that forwards code + modelId to the client) rather than a
+      // raw stream-error string that dead-ends the turn.
+      // Two distinct 404s should both surface as PROVIDER_UNAVAILABLE: a model
+      // whose providers have all gone away ("No endpoints found for <model>"), and
+      // a model whose only endpoints are barred by the account's data policy /
+      // guardrails ("No endpoints available matching your guardrail restrictions
+      // and data policy" — e.g. `:free` endpoints when prompt-logging is disabled).
+      if (res.status === 404 && /no endpoints (found|available)|guardrail|data policy/i.test(errText)) {
+        throw Object.assign(
+          new Error(`The selected model (${effectiveModelId}) is currently unavailable. Please choose a different model in Settings.`),
+          { statusCode: 404, code: 'PROVIDER_UNAVAILABLE', modelId: effectiveModelId }
+        );
+      }
+      throw new Error(`OpenRouter stream error ${res.status}: ${errText}`);
+    }
+
+    const reader = res.body.getReader();
+    let buffer = '';
+    let finishReason = null;
+    // Per-request usage. OpenRouter reports a single cumulative usage object (some
+    // providers repeat it), so take the latest within this request, then fold it
+    // into the cross-request totals once the request completes.
+    let reqInput = 0;
+    let reqOutput = 0;
+
+    outer: while (true) {
+      // Caller aborted (speculative divert): stop reading and return what we have.
+      // The caller discards the result, so partial token counts here are harmless.
       if (options.signal?.aborted) break;
-      throw readErr;
-    }
-    const { done, value } = read;
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-
-    const lines = buffer.split('\n');
-    buffer = lines.pop() ?? '';
-
-    for (const line of lines) {
-      if (!line.startsWith('data: ')) continue;
-      const raw = line.slice(6).trim();
-      if (raw === '[DONE]') break outer;
+      let read;
       try {
-        const parsed = JSON.parse(raw);
-        const choice = parsed.choices?.[0];
-        const delta = choice?.delta?.content;
-        if (delta) tableConverter.push(delta);
-        collectAnnotations(choice?.delta?.annotations);
-        collectAnnotations(choice?.message?.annotations);
-        if (parsed.usage) {
-          inputTokens = parsed.usage.prompt_tokens || inputTokens;
-          outputTokens = parsed.usage.completion_tokens || outputTokens;
-        }
-      } catch { /* skip malformed chunk */ }
+        read = await reader.read();
+      } catch (readErr) {
+        // An abort rejects the in-flight read() with an AbortError — expected when
+        // options.signal fired. Anything else is a real stream failure: rethrow.
+        if (options.signal?.aborted) break;
+        throw readErr;
+      }
+      const { done, value } = read;
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const raw = line.slice(6).trim();
+        if (raw === '[DONE]') break outer;
+        try {
+          const parsed = JSON.parse(raw);
+          const choice = parsed.choices?.[0];
+          const delta = choice?.delta?.content;
+          if (delta) { fullText += delta; tableConverter.push(delta); }
+          if (choice?.finish_reason) finishReason = choice.finish_reason;
+          collectAnnotations(choice?.delta?.annotations);
+          collectAnnotations(choice?.message?.annotations);
+          if (parsed.usage) {
+            reqInput = parsed.usage.prompt_tokens || reqInput;
+            reqOutput = parsed.usage.completion_tokens || reqOutput;
+          }
+        } catch { /* skip malformed chunk */ }
+      }
     }
+    // Fold this request's usage into the totals — a continuation re-sends the
+    // partial as context (its own prompt tokens) and emits fresh completion
+    // tokens, so both must be billed across all requests.
+    inputTokens += reqInput;
+    outputTokens += reqOutput;
+    return finishReason;
+  };
+
+  let finishReason = await streamOnce(windowed);
+
+  // Auto-continue a length-truncated reply. Opt-in via options.maxContinuations
+  // (default 0 → unchanged behavior): a large artifact (Build/Cargo mode) can
+  // exceed max_tokens, and the model stops mid-document with finish_reason
+  // 'length'. Feed the partial back as the assistant turn and ask it to continue
+  // verbatim, streaming the tail through the same onChunk so the client sees one
+  // continuous reply. Bounded so a model that never emits 'stop' can't loop.
+  let continuations = options.maxContinuations ?? 0;
+  while (
+    finishReason === 'length' &&
+    continuations > 0 &&
+    !options.signal?.aborted
+  ) {
+    continuations--;
+    const contMessages = [
+      ...windowed,
+      { role: 'assistant', content: fullText },
+      { role: 'user', content: CONTINUE_DIRECTIVE },
+    ];
+    finishReason = await streamOnce(contMessages);
   }
+
   tableConverter.end();
 
   const { costUsd, providerCostUsd } = await calcOpenRouterCost(effectiveModelId, null, inputTokens, outputTokens);
   const sources = await enrichWithImages(extractWebCitations(Array.from(annotationsById.values())));
-  return { inputTokens, outputTokens, costUsd, providerCostUsd, sources };
+  // `truncated` stays true only when the reply was still length-capped after the
+  // continuation budget ran out — callers can surface a soft warning.
+  return { inputTokens, outputTokens, costUsd, providerCostUsd, sources, finishReason, truncated: finishReason === 'length' };
 }
 
 /**

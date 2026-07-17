@@ -31,6 +31,11 @@ const {
   getDeepResearch,
   cancelDeepResearch,
   ackDeepResearch,
+  startBuild,
+  streamBuild,
+  getBuild,
+  cancelBuild,
+  ackBuild,
   planNodes,
   getTokenStatus,
   uploadImage,
@@ -76,6 +81,16 @@ router.get('/deep-research/:jobId/stream', streamDeepResearch);
 router.get('/deep-research/:jobId', getDeepResearch);
 router.post('/deep-research/:jobId/cancel', cancelDeepResearch);
 router.delete('/deep-research/:jobId', ackDeepResearch);
+
+// Build/Cargo — detached background job, same shape as Deep Research: a large
+// artifact can take minutes and must survive a dropped socket / app
+// backgrounding. Daily cap + per-user concurrency are enforced inside the
+// controller/job store (the run holds a build slot for its whole lifetime).
+router.post('/build', limitTextInput, checkCreditBalance(0.05), startBuild);
+router.get('/build/:jobId/stream', streamBuild);
+router.get('/build/:jobId', getBuild);
+router.post('/build/:jobId/cancel', cancelBuild);
+router.delete('/build/:jobId', ackBuild);
 
 // Plan multi-node fan-out (graph). Cheap planner call (no concurrency slot,
 // minimal balance floor); the actual node generations each go through /stream.
