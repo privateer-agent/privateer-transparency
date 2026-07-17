@@ -1237,10 +1237,133 @@ async function withPrivacy(configs) {
   );
 }
 
-async function listEnabledModels() {
-  const configs = await ModelRateConfig.find({ enabled: true }).lean();
-  if (configs.length > 0) return withPrivacy(configs);
+// Chat-model matcher for the subscription catalog — mirrors the `chat` branch of
+// the /api/models/openrouter route's matchesAction (server.js): text→text only,
+// excluding image/video output and embed/moderation/audio-only noise. Keep in sync
+// with that route so the CLI list stays a subset of the app's browsable list.
+function isChatModel(m) {
+  const inMods  = m.architecture?.input_modalities  || [];
+  const outMods = m.architecture?.output_modalities || [];
+  const modalityStr = (m.architecture?.modality || '').toLowerCase();
+  const id = (m.id || '').toLowerCase();
+  const outputIncludes = (t) => outMods.includes(t) || modalityStr.includes(`->${t}`) || modalityStr.includes(`-> ${t}`);
+  const inputIncludes  = (t) => inMods.includes(t) || modalityStr.startsWith(t) || modalityStr.includes(`+${t}`) || modalityStr.includes(`${t}+`);
+  if (id.includes('embed') || id.includes('moderation') || id.includes('whisper') || id.includes('tts')) return false;
+  return inputIncludes('text') && outputIncludes('text') && !outputIncludes('image') && !outputIncludes('video');
+}
 
+// USD-per-million-token (the TEE catalogs' unit) → USD-per-token (ModelRateConfig's).
+const perMTokenToRate = (v) => (typeof v === 'number' && isFinite(v) ? v / 1_000_000 : 0);
+
+// Build the account channel's SERVABLE model catalog: OpenRouter chat models that
+// have a ZDR endpoint (the account forces data_collection:deny on text inference —
+// resolveUseZdrKey — so a non-ZDR model would 404) plus the TEE providers (NEAR,
+// Tinfoil; Phala only when SEALED_MODELS_ENABLED, which gates the still-dev Sealed
+// routing path). This is the ZDR-safe subset of the app's /api/models/openrouter
+// list — we never advertise a model the subscription can't actually serve. Every
+// source is best-effort: an upstream outage drops that source, never the whole list.
+async function listSubscriptionCatalog() {
+  const out = new Map(); // modelId → entry
+
+  // 1) OpenRouter, restricted to ZDR-covered chat models.
+  try {
+    const { fetchCatalog } = require('../data/openrouterCatalog');
+    const { loadZdrModelIds } = require('../data/zdrProviders');
+    const { hasZdrCoverage } = require('../data/guestAllowedModels');
+    const [data, zdrIds] = await Promise.all([
+      fetchCatalog(`${OPENROUTER_BASE}/models`, OPENROUTER_HEADERS()),
+      loadZdrModelIds(),
+    ]);
+    for (const m of (data.data || [])) {
+      if (!m.pricing || !isChatModel(m) || !hasZdrCoverage(zdrIds, m.id)) continue;
+      const prompt = parseFloat(m.pricing.prompt);
+      const completion = parseFloat(m.pricing.completion);
+      out.set(m.id, {
+        modelId: m.id,
+        displayName: m.name || m.id,
+        provider: (m.id || '').split('/')[0] || 'unknown',
+        ratePerInputToken: isFinite(prompt) ? prompt : 0,
+        ratePerOutputToken: isFinite(completion) ? completion : 0,
+        enabled: true,
+        privacy: { tier: 'zdr-enforced' },
+      });
+    }
+  } catch (err) {
+    logger.warn('[listSubscriptionCatalog] OpenRouter merge failed:', err.message);
+  }
+
+  // 2) TEE providers — confidential compute is strictly stronger than ZDR, so they
+  // are always servable. They arrive pre-shaped like the client model (id, name,
+  // pricing.promptPerMToken, provider). Phala stays behind SEALED_MODELS_ENABLED.
+  const teeSources = [
+    { name: 'NEAR',    on: true,                                        load: () => require('../data/nearModels').loadNearModels('chat') },
+    { name: 'Tinfoil', on: true,                                        load: () => require('../data/tinfoilModels').loadTinfoilModels('chat') },
+    { name: 'Phala',   on: process.env.SEALED_MODELS_ENABLED === '1',   load: () => require('../data/phalaModels').loadPhalaModels('chat') },
+  ];
+  for (const src of teeSources) {
+    if (!src.on) continue;
+    try {
+      for (const m of (await src.load()) || []) {
+        out.set(m.id, {
+          modelId: m.id,
+          displayName: m.name || m.id,
+          provider: m.provider || (m.id || '').split('/')[0] || 'unknown',
+          ratePerInputToken: perMTokenToRate(m.pricing?.promptPerMToken),
+          ratePerOutputToken: perMTokenToRate(m.pricing?.completionPerMToken),
+          enabled: true,
+          privacy: { tier: 'tee-unverified' },
+        });
+      }
+    } catch (err) {
+      logger.warn(`[listSubscriptionCatalog] ${src.name} merge failed:`, err.message);
+    }
+  }
+
+  return out;
+}
+
+/**
+ * GET /api/models — the account channel's servable model catalog.
+ *
+ * Returns the ZDR-safe union of the OpenRouter (ZDR-covered) and TEE catalogs, with
+ * ModelRateConfig rows applied as authoritative overrides: a config row's rates and
+ * displayName win, and an `enabled:false` row removes a model (admin kill-switch).
+ * An enabled config row NOT present in the live catalog is still surfaced (manual
+ * admin additions). Falls back to the default model if every source is empty.
+ */
+async function listEnabledModels() {
+  const catalog = await listSubscriptionCatalog();
+
+  const configs = await ModelRateConfig.find({}).lean().catch(() => []);
+  for (const c of configs) {
+    if (!c.modelId) continue;
+    if (c.enabled === false) { catalog.delete(c.modelId); continue; }
+    const existing = catalog.get(c.modelId);
+    if (existing) {
+      // Admin/manual rates + label are authoritative over catalog-derived values.
+      if (c.ratePerInputToken != null) existing.ratePerInputToken = c.ratePerInputToken;
+      if (c.ratePerOutputToken != null) existing.ratePerOutputToken = c.ratePerOutputToken;
+      if (c.displayName) existing.displayName = c.displayName;
+      if (c.provider) existing.provider = c.provider;
+    } else {
+      // Manual model not in the live catalog — surface it with its honest tier.
+      catalog.set(c.modelId, {
+        modelId: c.modelId,
+        displayName: c.displayName || c.modelId,
+        provider: c.provider || (c.modelId || '').split('/')[0] || 'unknown',
+        ratePerInputToken: c.ratePerInputToken ?? 0,
+        ratePerOutputToken: c.ratePerOutputToken ?? 0,
+        enabled: true,
+        privacy: { tier: await privacyTierFor(c.modelId) },
+      });
+    }
+  }
+
+  const models = [...catalog.values()].sort((a, b) => a.modelId.localeCompare(b.modelId));
+  if (models.length > 0) return models;
+
+  // Nothing reachable (cold-start upstream outage + empty DB) — keep the account
+  // usable with the default model rather than returning an empty picker.
   return withPrivacy([{
     modelId: process.env.DEFAULT_MODEL_ID || 'deepseek/deepseek-v4-flash',
     ratePerInputToken: 0,
@@ -1790,7 +1913,7 @@ async function extractMemoryCandidates({ userMessage, aiResponse, existingMemori
   }
 }
 
-module.exports = { generateText, generateTextStream, proxyChatCompletion, calcOpenRouterCost, calcInferenceCost, calcImageGenCost, generateImage, submitVideoGeneration, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, formatImageGenErrorForUser, formatVideoGenErrorForUser, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
+module.exports = { generateText, generateTextStream, proxyChatCompletion, calcOpenRouterCost, calcInferenceCost, calcImageGenCost, generateImage, submitVideoGeneration, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, listSubscriptionCatalog, formatImageGenErrorForUser, formatVideoGenErrorForUser, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
   // Shared formatting helpers reused by nearAiService (OpenAI-compatible NEAR path).
   NO_TABLES_DIRECTIVE, withNoTables, convertTablesToBullets, createStreamingTableConverter,
   // og:image enrichment for source cards — also applied to the Brave web-search path.
