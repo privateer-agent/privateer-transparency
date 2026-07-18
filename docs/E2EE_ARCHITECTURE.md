@@ -8,7 +8,8 @@
 
 Privateer is end-to-end encrypted: the server stores ciphertext only, and the
 encryption key never leaves the user's device. Even a full server compromise
-yields no readable user content.
+yields no readable user content. (One gated, opt-in exception is forthcoming —
+see **Harbor** below; it is not live today, so this statement holds as written.)
 
 What this protects against:
 - Server compromise (DB dump, S3 access, server-side code execution).
@@ -21,6 +22,36 @@ What this does **not** protect against:
   the inference provider (OpenRouter) for model execution. We use Zero Data
   Retention providers where available.
 - Loss of the user's password or wallet — there is no recovery path.
+- **Harbor hosted agents (opt-in, Navigator+) — see the carve-out below.** When a
+  user opts a coding agent into Harbor, its plaintext is processed inside an
+  attested enclave on our infrastructure, not on the user's device.
+
+### Harbor (hosted agents) — a gated carve-out, opt-in, not yet live
+
+The guarantees above describe the shipped app and the **on-device** CLI/desktop,
+where user content is only ever ciphertext on our servers. **Harbor** (hosted
+agents, Navigator+ — `docs/HARBOR_HOSTED_RUNTIME.md`) is a forthcoming opt-in
+where the same `privateer-agent` runs on **Privateer infrastructure** instead of
+the user's own machine. There, and only there:
+
+- Plaintext is processed **inside a hardware TEE** (an AMD SEV-SNP confidential VM)
+  whose code measurement + identity key the app **attests** before driving it
+  (client verifier: `client/services/harborAttestation.ts`, fail-closed). The cloud
+  operator (us) **cannot read into the attested enclave** — but, unlike everywhere
+  else in the app, content *is processed* in our cloud, **by design**.
+- Between-tenant isolation on a shared host is **software-enforced** (Linux
+  namespaces / rootless containers), **not** per-user hardware. The enclave
+  protects users from *us*; a container escape would be cross-tenant exposure.
+  This stays on the risk register.
+- Frame honestly (matches the honesty stance in `CLAUDE.md §5`): claim only
+  "we can't read *into* the attested enclave," **never** "we can't *process* it."
+
+**Status (2026-07): waitlist / stub — no agent runs on our infrastructure yet**,
+so the absolute "ciphertext only / full-server-compromise-reveals-nothing"
+statement at the top of this section still holds today. Before the hosted runtime
+ships, this carve-out, `CLAUDE.md §5`, and the App-Review copy flip **together**
+at go-live — the Step 5 honesty gate. The prepared, not-yet-applied reconciliation
+package is `docs/HARBOR_TRANSPARENCY_AND_APPREVIEW_DRAFT.md`.
 
 ## Identity model
 
