@@ -240,6 +240,23 @@ const openrouterDispatcher = new UndiciAgent({
 });
 const orFetchInit = (init = {}) => ({ ...init, dispatcher: openrouterDispatcher });
 
+// Separate dispatcher for STREAMING generation. undici's default headers/body
+// timeouts (~300s) are inactivity windows: `headersTimeout` bounds time-to-first
+// response header, `bodyTimeout` bounds the gap between body reads. A slow model
+// or a long reasoning pause before the first token is a legitimately long gap —
+// under the defaults it throws mid-stream and dead-ends a long build. These are
+// intentionally generous (a real hang is bounded elsewhere: the job's cancel
+// flag + heartbeat watchdog), so total generation length is unbounded as long as
+// tokens keep flowing. Short JSON calls keep the tighter default dispatcher.
+const openrouterStreamDispatcher = new UndiciAgent({
+  keepAliveTimeout: 30_000,
+  keepAliveMaxTimeout: 60_000,
+  connections: 50,
+  headersTimeout: Number(process.env.OR_STREAM_HEADERS_TIMEOUT_MS) || 120_000,
+  bodyTimeout: Number(process.env.OR_STREAM_BODY_TIMEOUT_MS) || 600_000,
+});
+const orStreamFetchInit = (init = {}) => ({ ...init, dispatcher: openrouterStreamDispatcher });
+
 // Normalise OpenRouter `url_citation` annotations into the same {title, url,
 // description} shape Brave results use, so the client renders both identically.
 function extractWebCitations(annotations) {
@@ -1447,8 +1464,16 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
 
   const tableConverter = createStreamingTableConverter(onChunk);
   // Raw (pre-table-conversion) text accumulated so a truncated reply can be fed
-  // back verbatim as the assistant turn for continuation.
-  let fullText = '';
+  // back verbatim as the assistant turn for continuation. Seeded with
+  // `options.resumeFrom` when a caller is RESUMING a partial artifact across
+  // process restarts (durable-queue retry): the model is primed with what was
+  // already generated and streams only the remaining tail — so onChunk fires for
+  // the tail only, the caller appends it to its own partial, and a further
+  // in-request continuation still carries the full text forward.
+  const resumeSeed = typeof options.resumeFrom === 'string' && options.resumeFrom.length > 0
+    ? options.resumeFrom
+    : '';
+  let fullText = resumeSeed;
 
   // Stream one upstream request to completion, pushing deltas through the shared
   // table converter and accumulating token/annotation state. Returns the upstream
@@ -1460,7 +1485,7 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
     // the speculative-streaming path in chatController: when the intent classifier
     // diverts a guessed-chat turn to image/video/compose, the in-flight speculative
     // generation is aborted so we stop paying for tokens we'll discard).
-    const res = await fetch(`${OPENROUTER_BASE}/chat/completions`, orFetchInit({
+    const res = await fetch(`${OPENROUTER_BASE}/chat/completions`, orStreamFetchInit({
       method: 'POST',
       headers: orHeaders(useZdrKey),
       body: JSON.stringify(body),
@@ -1544,7 +1569,12 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
     return finishReason;
   };
 
-  let finishReason = await streamOnce(windowed);
+  // On resume, prime the first request as a continuation of the partial so the
+  // model emits only the tail (mirrors the length-continuation shape below).
+  const firstMessages = resumeSeed
+    ? [...windowed, { role: 'assistant', content: resumeSeed }, { role: 'user', content: CONTINUE_DIRECTIVE }]
+    : windowed;
+  let finishReason = await streamOnce(firstMessages);
 
   // Auto-continue a length-truncated reply. Opt-in via options.maxContinuations
   // (default 0 → unchanged behavior): a large artifact (Build/Cargo mode) can
