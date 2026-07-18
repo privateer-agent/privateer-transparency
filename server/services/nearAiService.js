@@ -145,6 +145,44 @@ function buildMessages(parts, options) {
   return messages;
 }
 
+// NEAR's OpenAI-compatible endpoint accepts a message `content` that is either a
+// string or an array of `text` / `image_url` parts — nothing else. A richer part
+// (`file` PDF, `input_audio`, `video_url`, meant for OpenRouter) makes vLLM
+// reject the WHOLE request with 400 "did not match any variant of untagged enum
+// MessageContent", which would hard-fail a default (NEAR) model. Upstream now
+// extracts PDFs to text and routes audio/video elsewhere, so these parts should
+// never reach here — but this is the last-line guard that guarantees a stray one
+// can't, ever. Unsupported parts collapse to a short text note; a lone text part
+// collapses back to a plain string.
+function sanitizeNearContent(content) {
+  if (!Array.isArray(content)) return content;
+  const out = [];
+  for (const part of content) {
+    if (typeof part === 'string') { if (part) out.push({ type: 'text', text: part }); continue; }
+    if (!part || typeof part !== 'object') continue;
+    if (part.type === 'text' || part.type === 'image_url') { out.push(part); continue; }
+    const note =
+      part.type === 'file'
+        ? `[attachment ${part.file?.filename ? `"${part.file.filename}" ` : ''}omitted — not supported by this model]`
+        : part.type === 'input_audio'
+          ? '[audio attachment omitted — not supported by this model]'
+          : part.type === 'video_url'
+            ? '[video attachment omitted — not supported by this model]'
+            : '';
+    if (note) out.push({ type: 'text', text: note });
+  }
+  if (out.length === 0) return ' ';
+  if (out.length === 1 && out[0].type === 'text') return out[0].text || ' ';
+  return out;
+}
+
+function sanitizeNearMessages(messages) {
+  const arr = Array.isArray(messages) ? messages : [messages];
+  return arr.map((m) =>
+    m && typeof m === 'object' && 'content' in m ? { ...m, content: sanitizeNearContent(m.content) } : m
+  );
+}
+
 async function nearChatRequest(body, modelId, { stream = false, signal } = {}) {
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), NEAR_TIMEOUT_MS);
@@ -193,6 +231,7 @@ async function generateText(parts, options = {}) {
 
   let messages = buildMessages(parts, options);
   messages = windowHistory(messages, { maxTokens: options.historyTokenBudget ?? 12000 });
+  messages = sanitizeNearMessages(messages);
 
   const body = {
     model: upstream,
@@ -238,7 +277,9 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
     return arr;
   })();
 
-  const windowed = windowHistory(messagesWithDirective, { maxTokens: options.historyTokenBudget ?? 12000 });
+  const windowed = sanitizeNearMessages(
+    windowHistory(messagesWithDirective, { maxTokens: options.historyTokenBudget ?? 12000 })
+  );
 
   const body = {
     model: upstream,
