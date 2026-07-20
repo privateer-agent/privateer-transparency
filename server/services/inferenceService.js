@@ -1499,18 +1499,30 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
       // user-actionable error (chatController has a PROVIDER_UNAVAILABLE
       // branch that forwards code + modelId to the client) rather than a
       // raw stream-error string that dead-ends the turn.
-      // Two distinct 404s should both surface as PROVIDER_UNAVAILABLE: a model
-      // whose providers have all gone away ("No endpoints found for <model>"), and
-      // a model whose only endpoints are barred by the account's data policy /
-      // guardrails ("No endpoints available matching your guardrail restrictions
-      // and data policy" — e.g. `:free` endpoints when prompt-logging is disabled).
-      if (res.status === 404 && /no endpoints (found|available)|guardrail|data policy/i.test(errText)) {
+      // Every 404 from /chat/completions is a model-routing failure, so treat
+      // the whole status as PROVIDER_UNAVAILABLE rather than matching on the
+      // error prose. OpenRouter has at least three wordings for it — "No
+      // endpoints found for <model>", "No endpoints available matching your
+      // guardrail restrictions and data policy" (`:free` endpoints under a
+      // prompt-logging-denied key), and "This model is unavailable for free.
+      // The paid version is available now - use this slug instead: <slug>"
+      // (a free variant retired to paid). Matching on prose meant that third
+      // wording threw an untyped `OpenRouter stream error 404` with no
+      // `statusCode`, which dead-ended the guest fallback chain on its first
+      // candidate instead of advancing to the next model.
+      if (res.status === 404) {
         throw Object.assign(
           new Error(`The selected model (${effectiveModelId}) is currently unavailable. Please choose a different model in Settings.`),
           { statusCode: 404, code: 'PROVIDER_UNAVAILABLE', modelId: effectiveModelId }
         );
       }
-      throw new Error(`OpenRouter stream error ${res.status}: ${errText}`);
+      // Carry the status on every upstream failure, not just the typed 404 —
+      // callers (guest fallback chain, chatController) classify retryability
+      // from `statusCode` and shouldn't have to regex the message.
+      throw Object.assign(
+        new Error(`OpenRouter stream error ${res.status}: ${errText}`),
+        { statusCode: res.status },
+      );
     }
 
     const reader = res.body.getReader();
