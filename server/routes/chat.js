@@ -37,6 +37,7 @@ const {
   cancelBuild,
   ackBuild,
   planNodes,
+  compactContext,
   getTokenStatus,
   uploadImage,
   uploadFile,
@@ -95,6 +96,12 @@ router.delete('/build/:jobId', ackBuild);
 // Plan multi-node fan-out (graph). Cheap planner call (no concurrency slot,
 // minimal balance floor); the actual node generations each go through /stream.
 router.post('/plan', limitTextInput, checkCreditBalance(0), planNodes);
+
+// Compact a chat/project into background context for a different conversation
+// (context pills). Same cheap-utility gating as /plan: no daily message cap and
+// no concurrency slot, since this fires on a drag rather than on a send — it
+// must not consume the user's message quota.
+router.post('/compact', limitTextInput, checkCreditBalance(0), compactContext);
 
 // Generate or edit image based on intent
 router.post('/generate-or-edit-image', limitTextInput, requireCloudBackend(), requireDailyCap('imageGen'), checkCreditBalance(0), requireConcurrencySlot(), async (req, res) => {

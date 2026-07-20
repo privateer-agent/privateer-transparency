@@ -28,6 +28,7 @@ import {
   completeLoadDerivedKey,
 } from './walletAuthShared';
 import { connectBrowserWallet } from './browserWalletProvider.web';
+import { canLinkWalletViaBrowser, linkWalletViaBrowser } from './desktopWalletLink';
 
 // Re-export the platform-agnostic surface so existing imports from
 // '../services/walletAuthService' keep working unchanged on web.
@@ -43,6 +44,20 @@ export type { WalletUser, WalletAuthResult } from './walletAuthShared';
  */
 export async function solanaLogin(): Promise<WalletAuthResult> {
   const { nonce, nonceId } = await fetchNonce();
+
+  // Electron desktop: no extension is injected here, so the signing happens in
+  // the user's real browser and only the signatures come back. Everything after
+  // that — verify, enroll/unwrap, session — still runs on this side.
+  if (canLinkWalletViaBrowser()) {
+    const linked = await linkWalletViaBrowser('login', nonce);
+    return completeWalletLogin({
+      pubkeyHex: linked.pubkeyHex,
+      authSignature: linked.authSignature!,
+      authMessage: linked.authMessage!,
+      vaultSignature: linked.vaultSignature,
+      nonceId,
+    });
+  }
 
   const wallet = await connectBrowserWallet();
   const { pubkeyHex, authMessage, vaultMessage } = buildWalletMessages(wallet.pubkeyBytes, nonce);
@@ -60,6 +75,15 @@ export async function solanaLogin(): Promise<WalletAuthResult> {
  */
 export async function loadDerivedKey(): Promise<void> {
   const vault = await fetchWalletVault();
+
+  // Desktop: same browser hand-off as sign-in, but only the vault signature is
+  // needed — there's no nonce-bound auth message to re-sign for an already
+  // authenticated user.
+  if (canLinkWalletViaBrowser()) {
+    const linked = await linkWalletViaBrowser('unlock', '');
+    await completeLoadDerivedKey(vault, linked.vaultSignature);
+    return;
+  }
 
   const wallet = await connectBrowserWallet();
   const { vaultMessage } = buildWalletMessages(wallet.pubkeyBytes, '');

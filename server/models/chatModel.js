@@ -58,6 +58,12 @@ const chatSchema = new mongoose.Schema(
       encryptedContent: { type: String, default: null },
       // E2EE: encrypted web search sources. Decrypts to JSON array of { title, url, description }
       encryptedSources: { type: String, default: null },
+      // E2EE: encrypted context references — chats/projects the user attached to
+      // this message via the composer. Decrypts to JSON array of
+      // { kind: 'chat'|'project', id, title, isLocal? }. The title is user
+      // content, which is why the whole array is encrypted rather than stored
+      // as a plain subdocument.
+      encryptedContextRefs: { type: String, default: null },
       // E2EE: encrypted Deep Research step trail (JSON array of {stage,label,query?,sources?,gap?,at}).
       encryptedResearchTrail: { type: String, default: null },
       // E2EE: encrypted live weather snapshot (open-meteo) attached to assistant responses.
