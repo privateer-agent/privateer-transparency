@@ -158,6 +158,9 @@ const chatSchema = new mongoose.Schema(
         // Legacy plaintext fields (pre-E2EE file uploads) — read-only fallback.
         filename: { type: String },
         mimeType: { type: String },
+        // Soft-delete tombstone, matching image/video attachments. Set when the
+        // file is deleted from the Library; GET /api/library/files skips these.
+        deleted: { type: Boolean, default: false },
       }],
       // AI-generated video attachments — mirrors messageModel videoAttachments
       videoAttachments: [{
@@ -225,6 +228,12 @@ const chatSchema = new mongoose.Schema(
 chatSchema.index({ userId: 1, lastActivity: -1 });
 chatSchema.index({ userId: 1, createdAt: -1 });
 chatSchema.index({ userId: 1, isActive: 1 });
+// Storage-handle lookups — see the matching indexes on messageModel. Attachment
+// ids in the Library API are positional (`chatId_msgIdx_attIdx`), so the S3 key
+// / storage ref is the only stable way to address one.
+chatSchema.index({ userId: 1, 'messages.imageAttachments.s3Key': 1 });
+chatSchema.index({ userId: 1, 'messages.fileAttachments.storageRef': 1 });
+chatSchema.index({ userId: 1, 'messages.videoAttachments.storageRef': 1 });
 
 // E2EE fence: any new or modified save nulls out the legacy plaintext
 // `title` field and the plaintext `messages[].content`. The encrypted

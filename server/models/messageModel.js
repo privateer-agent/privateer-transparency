@@ -250,6 +250,12 @@ messageSchema.index({ isDeleted: 1, createdAt: -1 });
 messageSchema.index({ graphId: 1, createdAt: 1 }); // For conversation history
 messageSchema.index({ messageType: 1, createdAt: -1 }); // For filtering by message type
 messageSchema.index({ 'imageAttachments.type': 1, createdAt: -1 }); // For image queries
+// Storage-handle lookups. Library deletes and folder hydration both resolve an
+// attachment by its S3 key / storage ref rather than by _id — the ids the
+// Library API hands out for embedded attachments are positional and shift when
+// an earlier sibling is soft-deleted.
+messageSchema.index({ userId: 1, 'imageAttachments.s3Key': 1 });
+messageSchema.index({ userId: 1, 'videoAttachments.storageRef': 1 });
 
 // Virtual for message display data
 messageSchema.virtual('displayData').get(function() {

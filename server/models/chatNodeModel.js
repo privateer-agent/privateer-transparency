@@ -279,6 +279,9 @@ const chatNodeSchema = new mongoose.Schema(
 chatNodeSchema.index({ graphId: 1 });
 chatNodeSchema.index({ userId: 1, lastActivity: -1 });
 chatNodeSchema.index({ isActive: 1, lastActivity: -1 });
+// Storage-handle lookups — see the matching indexes on messageModel.
+chatNodeSchema.index({ userId: 1, 'imageAttachments.s3Key': 1 });
+chatNodeSchema.index({ userId: 1, 'videoAttachments.storageRef': 1 });
 
 // Virtual for connection creation summary
 chatNodeSchema.virtual('connectionOrigin').get(function() {
