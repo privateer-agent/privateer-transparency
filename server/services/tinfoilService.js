@@ -43,6 +43,9 @@
 
 const Sentry = require('@sentry/node');
 const { getTinfoilPricing, TINFOIL_PREFIX } = require('../data/tinfoilModels');
+// Standalone module (requires nothing back into inferenceService), so unlike the
+// shared() helpers below it can be required eagerly without a load-time cycle.
+const { createPersonaGuard } = require('./personaGuard');
 
 const TINFOIL_BASE = () => process.env.TINFOIL_BASE_URL || 'https://inference.tinfoil.sh/v1';
 const TINFOIL_TIMEOUT_MS = Number(process.env.TINFOIL_TEXT_TIMEOUT_MS) || 240_000;
@@ -261,7 +264,9 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
   let inputTokens = 0;
   let outputTokens = 0;
 
-  const tableConverter = createStreamingTableConverter(onChunk);
+  // Persona guard sits last, closest to the wire (see inferenceService).
+  const personaGuard = createPersonaGuard(onChunk, options);
+  const tableConverter = createStreamingTableConverter((text) => personaGuard.push(text));
 
   outer: while (true) {
     if (options.signal?.aborted) break;
@@ -295,6 +300,7 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
     }
   }
   tableConverter.end();
+  personaGuard.end();
 
   const { costUsd, providerCostUsd } = await calcTinfoilCost(modelId, inputTokens, outputTokens);
   return { inputTokens, outputTokens, costUsd, providerCostUsd, sources: [] };

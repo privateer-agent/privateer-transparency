@@ -64,6 +64,15 @@ const messageSchema = new mongoose.Schema(
       type: String,
       default: null
     },
+    // E2EE: encrypted citation list (JSON array of {title,url,description}) for a
+    // web-search-grounded answer. The titles/snippets are third-party text but the
+    // list itself reveals what the user asked about, so it's encrypted client-side
+    // like the rest. Include in any projection that returns message content —
+    // without it the answer's [1] markers have nothing to resolve against.
+    encryptedSources: {
+      type: String,
+      default: null
+    },
     // E2EE: encrypted Deep Research step trail (JSON array of {stage,label,query?,sources?,gap?,at}).
     // Plaintext contains user queries and lines of inquiry, so it's encrypted client-side
     // alongside the message content. Include in any projection that returns message content.

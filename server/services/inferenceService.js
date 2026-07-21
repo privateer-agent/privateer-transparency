@@ -41,6 +41,7 @@ const billingService = require('./billingService');
 const { getRatioParamMode, supportsTransparency, getMaxImageSize, getSupportedAspectRatios } = require('../data/imageModelCapabilities');
 const { isZdrModel } = require('../data/zdrProviders');
 const { safeFetch } = require('../utils/safeFetch');
+const { createPersonaGuard } = require('./personaGuard');
 const Sentry = require('@sentry/node');
 const logger = require('../utils/logger');
 
@@ -1462,7 +1463,12 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
     }
   };
 
-  const tableConverter = createStreamingTableConverter(onChunk);
+  // Persona guard sits LAST, closest to the wire, so it sees the final text
+  // after table conversion. Opt out with `{ personaGuard: false }` where a
+  // first-person model name is legitimate content (translation, Build
+  // artifacts, drafted messages, internal structured calls).
+  const personaGuard = createPersonaGuard(onChunk, options);
+  const tableConverter = createStreamingTableConverter((text) => personaGuard.push(text));
   // Raw (pre-table-conversion) text accumulated so a truncated reply can be fed
   // back verbatim as the assistant turn for continuation. Seeded with
   // `options.resumeFrom` when a caller is RESUMING a partial artifact across
@@ -1610,6 +1616,7 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
   }
 
   tableConverter.end();
+  personaGuard.end();
 
   const { costUsd, providerCostUsd } = await calcOpenRouterCost(effectiveModelId, null, inputTokens, outputTokens);
   const sources = await enrichWithImages(extractWebCitations(Array.from(annotationsById.values())));
