@@ -23,6 +23,7 @@ import { clearOutboxResults } from './outboxService';
 import { clearAccountModelsCache } from './accountModelsService';
 import { clearTrustedTerminalKeys } from './terminalTrustService';
 import { Sentry } from './sentryService';
+import { sessionDeviceMeta } from '../utils/sessionDevice';
 
 const API_BASE_URL = getServerUrl();
 
@@ -189,7 +190,10 @@ class AuthService {
     const response = await fetch(`${API_BASE_URL}/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password }),
+      // Tag the session with the surface signing in, so the account's linked-
+      // device list names this row ("iPhone" / "Desktop app on macOS") instead
+      // of showing an anonymous "App". Display metadata only.
+      body: JSON.stringify({ email, password, ...sessionDeviceMeta() }),
     });
 
     const data = await response.json();

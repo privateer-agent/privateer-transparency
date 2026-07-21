@@ -33,6 +33,7 @@ import {
 } from './cryptoService';
 import authService, { VaultPayload } from './authService';
 import { Sentry } from './sentryService';
+import { sessionDeviceMeta } from '../utils/sessionDevice';
 
 const API_BASE = getServerUrl();
 
@@ -154,6 +155,8 @@ async function verifyWithServer(
       signature: toHex(signature),
       signedMessage: toHex(signedMessage),
       nonceId,
+      // Names this sign-in in the linked-device list (display metadata only).
+      ...sessionDeviceMeta(),
     }),
   });
   if (!res.ok) {

@@ -36,6 +36,7 @@ const redis = require('../services/redisClient');
 const relayHub = require('../services/relayHub');
 const { signalRevokedTerminals, signalAllTerminals } = require('../services/sessionRevocation');
 const { authenticate } = require('../middleware/auth');
+const { sessionDeviceMeta } = require('../utils/sessionDeviceMeta');
 const { loginRateLimiter, registerRateLimiter, nonceLimiter, walletVerifyLimiter, resendVerificationLimiter, resetLimit, deviceApproveLimiter, sessionSpawnLimiter } = require('../middleware/rateLimiter');
 
 // Max concurrent live child (per-terminal) sessions a single machine login may
@@ -298,7 +299,14 @@ router.post('/login', loginRateLimiter, async (req, res) => {
 
     await resetLimit(`login:${req.ip}:${email.toLowerCase()}`);
 
-    const { accessToken, refreshToken } = await tokenService.issueTokenPair(user._id, 'email');
+    // Tag the session with the surface that signed in (mobile / web / desktop)
+    // so the linked-device list can name it. Cosmetic only — see
+    // utils/sessionDeviceMeta.
+    const { accessToken, refreshToken } = await tokenService.issueTokenPair(
+      user._id,
+      'email',
+      sessionDeviceMeta(req),
+    );
 
     res.json({
       accessToken,
@@ -876,7 +884,11 @@ router.post('/account/cancel-deletion', async (req, res) => {
     user.hardDeleteAt = undefined;
     await user.save();
 
-    const { accessToken, refreshToken: newRefreshToken } = await tokenService.issueTokenPair(user._id, tokenDoc.authMethod);
+    const { accessToken, refreshToken: newRefreshToken } = await tokenService.issueTokenPair(
+      user._id,
+      tokenDoc.authMethod,
+      sessionDeviceMeta(req),
+    );
 
     res.json({ message: 'Account recovery successful', accessToken, refreshToken: newRefreshToken });
   } catch (error) {
@@ -993,7 +1005,11 @@ router.post('/wallet/verify', walletVerifyLimiter, async (req, res) => {
       { upsert: true }
     );
 
-    const { accessToken, refreshToken } = await tokenService.issueTokenPair(user._id, 'wallet');
+    const { accessToken, refreshToken } = await tokenService.issueTokenPair(
+      user._id,
+      'wallet',
+      sessionDeviceMeta(req),
+    );
 
     res.json({
       accessToken,
