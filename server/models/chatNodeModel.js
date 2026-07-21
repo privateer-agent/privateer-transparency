@@ -220,6 +220,14 @@ const chatNodeSchema = new mongoose.Schema(
         type: Number,
         default: 120
       },
+      // True once the user has dragged the card's corner grip. Node creation
+      // seeds a nominal width/height, so those numbers alone can't tell a real
+      // resize from a default — this flag is what tells the client the stored
+      // box is deliberate and the card should stop hugging its content.
+      userSized: {
+        type: Boolean,
+        default: false
+      },
       emoji: {
         type: String,
         default: ''
@@ -311,6 +319,7 @@ chatNodeSchema.virtual('graphNodeData').get(function() {
       width: this.visualMetadata.width,
       height: this.visualMetadata.height
     },
+    userSized: this.visualMetadata.userSized,
     fontScale: this.visualMetadata.fontScale,
     color: this.visualMetadata.color,
     edgeCount: this.connectedEdgeIds ? this.connectedEdgeIds.length : 0,
