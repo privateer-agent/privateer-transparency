@@ -595,13 +595,27 @@ async function openRouterChat(messages, modelId, options = {}) {
 
 // ── Validate model ───────────────────────────────────────────────────────────
 
+// Retired OpenRouter slugs → their GA replacement.
+//
+// A `-preview` alias stays listed in /models after the GA id ships, but its
+// endpoints get deranked to status -5 (dead). That is invisible to us on the
+// happy path *except* for ZDR: applyZdrRouting pins `provider.zdr: true` for
+// any ZDR-eligible model, which excludes the one still-healthy non-ZDR endpoint
+// (Google AI Studio) and leaves only the dead Vertex one — so the request 404s
+// with `Publisher model ... was not found or your project does not have access`.
+// Rewriting here (rather than only at the call sites) also heals the id already
+// persisted in UserStoragePrefs.preferredImageGenModelId.
+const RETIRED_MODEL_ALIASES = {
+  'google/gemini-3.1-flash-image-preview': 'google/gemini-3.1-flash-image',
+};
+
 /**
  * Resolves and validates the model ID. All inference flows through OpenRouter,
  * so the model must be in slash-prefixed form (e.g. "google/gemini-2.5-flash").
  */
 async function resolveModelId(requestedModelId) {
   const defaultId = process.env.DEFAULT_MODEL_ID || 'deepseek/deepseek-v4-flash';
-  const modelId = requestedModelId || defaultId;
+  const modelId = RETIRED_MODEL_ALIASES[requestedModelId] || requestedModelId || defaultId;
 
   if (typeof modelId !== 'string' || !modelId.includes('/')) {
     throw Object.assign(
@@ -1181,6 +1195,75 @@ async function submitVideoGeneration(prompt, options = {}) {
   };
 }
 
+// ── Video job key affinity ───────────────────────────────────────────────────
+// The two OpenRouter keys are separate ACCOUNTS, and a video job belongs to
+// whichever one submitted it. Poll and download must reach that same account or
+// the job reads as missing.
+//
+// The submit-time choice is not reliably reproducible later. getVideoStatus
+// re-derives it from `resolveUseZdrKey({ requireZdr, modelId })` where:
+//   • `modelId` is read off a client-written videoAttachment that may not exist
+//     yet on the first poll — and `isZdrModel(null)` is false, so the derivation
+//     silently collapses to the STANDARD key for a job submitted on the ZDR one;
+//   • `requireZdr` comes from the account pref, which the user can flip mid-job,
+//     and which the submit path may have overridden (explicit body flag, or a
+//     ZDR-only project's floor).
+// Any of those disagreeing turns a perfectly healthy job into a hard 404.
+//
+// Rather than requiring every future caller to reproduce the submit's decision,
+// make the read paths independent of it: try the caller's best guess, and on an
+// auth/not-found status retry on the other key. With exactly two keys the
+// fallback is exhaustive — if neither account has the job, it really is gone,
+// and we surface the original error unchanged. This cannot leak across users:
+// both keys are our own accounts and the job id is account-scoped, so the retry
+// only ever succeeds when that account genuinely owns the job. It also carries
+// no content — poll and download are reads of an already-submitted job.
+const VIDEO_KEY_RETRY_STATUSES = new Set([401, 403, 404]);
+
+/**
+ * Run an authenticated OpenRouter video request, transparently retrying on the
+ * other API key when the first reports the job as missing/unauthorized.
+ *
+ * @param {(useZdrKey: boolean) => Promise<Response>} run
+ * @param {boolean} useZdrKey  the caller's best guess at the submit-time key
+ * @param {string} label       for the disagreement log line
+ */
+async function fetchVideoWithEitherKey(run, useZdrKey, label) {
+  // orHeaders throws ZDR_KEY_UNAVAILABLE when the ZDR key isn't configured;
+  // treat that as "this key can't answer" and let the other one try.
+  const attempt = async (key) => {
+    try {
+      return await run(key);
+    } catch (err) {
+      if (err?.code === 'ZDR_KEY_UNAVAILABLE') return null;
+      throw err;
+    }
+  };
+
+  const res = await attempt(useZdrKey);
+  // Only a missing/unauthorized job is ambiguous. 402/429/5xx are real
+  // conditions on the right account — retrying them would just double the load.
+  if (res && (res.ok || !VIDEO_KEY_RETRY_STATUSES.has(res.status))) return res;
+
+  const altRes = await attempt(!useZdrKey);
+  if (altRes?.ok) {
+    logger.debug(
+      `[video] ${label}: the ${useZdrKey ? 'ZDR' : 'standard'} key returned ` +
+      `${res ? res.status : 'no-key'}; served by the ${useZdrKey ? 'standard' : 'ZDR'} key instead ` +
+      `— submit/poll key derivation disagreed for this job`
+    );
+    return altRes;
+  }
+  // Neither account has it. Prefer the original response so the caller's error
+  // message describes the key it actually expected the job to live on.
+  if (res) return res;
+  if (altRes) return altRes;
+  throw Object.assign(
+    new Error('Zero Data Retention is required for this request, but no ZDR OpenRouter key is configured.'),
+    { statusCode: 503, code: 'ZDR_KEY_UNAVAILABLE' }
+  );
+}
+
 /**
  * Download a generated video binary from an OpenRouter unsigned URL.
  * Despite the "unsigned" name, the URL still requires the OpenRouter
@@ -1190,7 +1273,11 @@ async function submitVideoGeneration(prompt, options = {}) {
  * @returns {{ buffer: Buffer, mimeType: string }}
  */
 async function downloadVideoBuffer(url, { useZdrKey = false } = {}) {
-  const res = await fetch(url, orFetchInit({ headers: orHeaders(useZdrKey) }));
+  const res = await fetchVideoWithEitherKey(
+    (key) => fetch(url, orFetchInit({ headers: orHeaders(key) })),
+    useZdrKey,
+    'download'
+  );
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
     throw new Error(`OpenRouter video download error ${res.status}: ${errText}`);
@@ -1209,9 +1296,11 @@ async function downloadVideoBuffer(url, { useZdrKey = false } = {}) {
  * @returns {{ status: string, unsigned_urls?: string[], usage?: object }}
  */
 async function pollVideoGeneration(jobId, { useZdrKey = false } = {}) {
-  const res = await fetch(`${OPENROUTER_BASE}/videos/${jobId}`, orFetchInit({
-    headers: orHeaders(useZdrKey)
-  }));
+  const res = await fetchVideoWithEitherKey(
+    (key) => fetch(`${OPENROUTER_BASE}/videos/${jobId}`, orFetchInit({ headers: orHeaders(key) })),
+    useZdrKey,
+    `poll ${jobId}`
+  );
 
   if (!res.ok) {
     const errText = await res.text();
@@ -1966,4 +2055,6 @@ module.exports = { generateText, generateTextStream, proxyChatCompletion, calcOp
   // Shared formatting helpers reused by nearAiService (OpenAI-compatible NEAR path).
   NO_TABLES_DIRECTIVE, withNoTables, convertTablesToBullets, createStreamingTableConverter,
   // og:image enrichment for source cards — also applied to the Brave web-search path.
-  enrichWithImages };
+  enrichWithImages,
+  // Exported for regression tests (retiredModelAlias / videoKeyAffinity).
+  RETIRED_MODEL_ALIASES, fetchVideoWithEitherKey };

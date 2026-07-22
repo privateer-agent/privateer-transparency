@@ -192,13 +192,42 @@ const userSchema = new mongoose.Schema(
       type: Boolean,
       default: false
     },
-    // Aggregate S3 bytes attributable to this user (ProjectFile + LibraryVideo
-    // + any other cloud-stored binaries). Maintained by cloud-services on
-    // upload/delete; backfilled by the migration.
+    // Aggregate cloud bytes attributable to this user: every S3 object under
+    // the `<userId>/` key prefix (images, videos, node/project files, thumbs)
+    // plus Cargo + CargoVersion ciphertext, which is Mongo-resident but still
+    // quota-bearing. Maintained by cloud-services on upload/delete and by
+    // cargoController on write; `scripts/reconcile_cloud_storage_bytes.js`
+    // recomputes it from S3 as ground truth when it drifts.
+    //
+    // Share assets (`shares/<token>/...`) are deliberately excluded — they are
+    // uploaded via presigned URL, never charged, and never refunded.
     cloudStorageBytes: {
       type: Number,
       default: 0,
       min: 0
+    },
+    // When the account was first observed holding more than its tier allows,
+    // or null while it fits. Derived state, not an event log: it is stamped by
+    // whichever storage check notices first and cleared as soon as usage drops
+    // back under the cap.
+    //
+    // Deliberately not driven off a Stripe downgrade webhook. A user can end up
+    // over their cap without any billing event at all — the pass-tier mechanic
+    // (entitlementService PASS_TIERS) promotes a free user holding $20 of top-up
+    // to Navigator's 2 GB, and spending that balance down silently drops them to
+    // Deckhand's 50 MB. Expiry and Apple/Play lapse are the same shape. Deriving
+    // the state from `usage > cap` catches every path with no event plumbing.
+    overQuotaSince: {
+      type: Date,
+      default: null
+    },
+    // When the over-quota notice was last emailed. Compared against
+    // `overQuotaSince` so one notice goes out per episode: going back under the
+    // cap clears the stamp above, and a later tier drop starts a fresh one.
+    // Null for wallet accounts, which have no email address to reach.
+    storageOverQuotaNotifiedAt: {
+      type: Date,
+      default: null
     },
     solanaPublicKey: {
       type: String,
@@ -299,6 +328,17 @@ const userSchema = new mongoose.Schema(
 // majority of users (no Play sub) aren't indexed and don't collide on null.
 userSchema.index({ 'subscription.play.purchaseToken': 1 }, { unique: true, sparse: true });
 userSchema.index({ 'subscription.apple.originalTransactionId': 1 }, { unique: true, sparse: true });
+
+// The nightly over-quota notice sweep queries `overQuotaSince: { $ne: null }`.
+// Partial rather than sparse: the field defaults to `null`, and a sparse index
+// only skips documents where the field is *absent* — an explicit null is still
+// indexed, so sparse would cover the whole collection and buy nothing. The
+// $type filter indexes only accounts actually over their cap, which is the
+// handful this sweep cares about.
+userSchema.index(
+  { overQuotaSince: 1 },
+  { partialFilterExpression: { overQuotaSince: { $type: 'date' } } }
+);
 
 userSchema.pre('save', async function(next) {
   if (this.password && (this.isModified('password') || this.isNew)) {

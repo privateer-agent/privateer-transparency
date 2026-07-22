@@ -26,7 +26,7 @@ const router = express.Router();
 const graphController = require('../controllers/graphController');
 const nodeFileController = require('../controllers/nodeFileController');
 const { authenticate } = require('../middleware/auth');
-const { requireCreate, requireCloudBackend } = require('../middleware/entitlement');
+const { requireCreate, requireCloudBackend, requireStorage } = require('../middleware/entitlement');
 
 router.use(authenticate);
 
@@ -74,10 +74,15 @@ router.delete('/:graphId/nodes/:nodeId', graphController.deleteNode);
 // ==================== NODE FILE ROUTES ====================
 
 // Stage an encrypted file in S3 (returns s3Key for embedding in fileAttachments)
-router.post('/:graphId/files', requireCloudBackend(), nodeFileController.uploadNodeFile);
+// requireStorage() bounds these against the tier cap from Content-Length, the
+// same way chat's upload-image/upload-file are bounded. Without it the Boards
+// media path incremented cloudStorageBytes but was never checked against it —
+// so the cap wasn't a cap, and nodeFileController's STORAGE_FULL handling was
+// unreachable.
+router.post('/:graphId/files', requireCloudBackend(), requireStorage(), nodeFileController.uploadNodeFile);
 
 // Stage an encrypted video in S3 (returns s3Key for embedding in videoAttachments)
-router.post('/:graphId/videos', requireCloudBackend(), nodeFileController.uploadNodeVideo);
+router.post('/:graphId/videos', requireCloudBackend(), requireStorage(), nodeFileController.uploadNodeVideo);
 
 // Download the encrypted blob for a file attached to a node
 router.get('/:graphId/nodes/:nodeId/files/:fileId/content', nodeFileController.getNodeFileContent);
@@ -88,6 +93,14 @@ router.delete('/:graphId/nodes/:nodeId/files/:fileId', nodeFileController.delete
 // ==================== GRAPH THUMBNAIL ROUTES ====================
 
 // Stage an encrypted canvas snapshot in S3 (cloud backend)
+//
+// Deliberately NOT gated on requireStorage(), unlike the file/video routes
+// above. This is a replace-in-place: the controller deletes the previous
+// snapshot before uploading the new one, so net growth is ~zero and total
+// growth is bounded at one small object per graph (and graphs are already
+// capped by maxGraphs). Gating it would mean a user sitting exactly at their
+// cap could never refresh a board thumbnail again — a permanently stale-looking
+// board list — while freeing no space, since the check runs before the delete.
 router.post('/:graphId/thumbnail', requireCloudBackend(), nodeFileController.uploadGraphThumbnail);
 
 // Record an on-device thumbnail pointer (local backend)
