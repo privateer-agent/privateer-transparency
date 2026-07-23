@@ -7,9 +7,8 @@ import {
   StyleSheet,
   Modal,
   ActivityIndicator,
-  ScrollView,
-  Linking,
-} from 'react-native';
+  ScrollView,} from 'react-native';
+import { openExternal } from '../utils/openExternal';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../contexts/ThemeContext';
 import { getTeeAttestation, type OpenRouterModel, type TeeAttestation } from '../services/modelService';
@@ -152,7 +151,7 @@ const AttestationSheet: React.FC<Props> = ({ visible, model, onClose }) => {
 
           <TouchableOpacity
             onPress={() =>
-              Linking.openURL(model?.id.startsWith('tinfoil/') ? TINFOIL_VERIFY_DOCS : NEAR_VERIFY_DOCS)
+              openExternal(model?.id.startsWith('tinfoil/') ? TINFOIL_VERIFY_DOCS : NEAR_VERIFY_DOCS)
             }
           >
             <Text style={[s.link, { color: theme.primary }]}>{t('attestation.learnMore')}</Text>

@@ -38,6 +38,8 @@ const {
   ackBuild,
   planNodes,
   compactContext,
+  getPendingReply,
+  ackPendingReply,
   getTokenStatus,
   uploadImage,
   uploadFile,
@@ -92,6 +94,14 @@ router.get('/build/:jobId/stream', streamBuild);
 router.get('/build/:jobId', getBuild);
 router.post('/build/:jobId/cancel', cancelBuild);
 router.delete('/build/:jobId', ackBuild);
+
+// Reply-hold pickup (opt-in "Finish replies in the cloud"). A reply the server
+// held in short-TTL Redis because the app disconnected mid-stream. GET fetches
+// it (tenant-scoped; 404 if expired); DELETE acks after the client has
+// encrypted + persisted it. Cheap — no daily cap, no concurrency slot, no
+// balance floor (the reply was already generated and billed).
+router.get('/pending/:pendingMessageId', getPendingReply);
+router.delete('/pending/:pendingMessageId', ackPendingReply);
 
 // Plan multi-node fan-out (graph). Cheap planner call (no concurrency slot,
 // minimal balance floor); the actual node generations each go through /stream.

@@ -25,6 +25,10 @@ What this does **not** protect against:
 - **Harbor hosted agents (opt-in, Navigator+) — see the carve-out below.** When a
   user opts a coding agent into Harbor, its plaintext is processed inside an
   attested enclave on our infrastructure, not on the user's device.
+- **"Finish replies in the cloud" (opt-in, off by default) — see the carve-out
+  below.** When a user enables it, a chat reply the client didn't finish receiving
+  (app killed mid-stream) is held briefly in plaintext in our Redis so it can be
+  recovered on reopen. This one ships **today**, unlike Harbor.
 
 ### Harbor (hosted agents) — a gated carve-out, opt-in, not yet live
 
@@ -52,6 +56,38 @@ statement at the top of this section still holds today. Before the hosted runtim
 ships, this carve-out, `CLAUDE.md §5`, and the App-Review copy flip **together**
 at go-live — the Step 5 honesty gate. The prepared, not-yet-applied reconciliation
 package is `docs/HARBOR_TRANSPARENCY_AND_APPREVIEW_DRAFT.md`.
+
+### "Finish replies in the cloud" — a gated carve-out, opt-in, live today
+
+The normal chat path is a **blind SSE proxy**: plaintext transits the server during
+inference but is never buffered or written to Mongo/S3 (see "Inference" below). One
+**opt-in, off-by-default** setting relaxes that — `holdReplyInCloud` (Security
+screen; `UserStoragePrefs.holdReplyInCloud` for cloud accounts, EncryptedStorage
+for local). Its purpose: today, if the app is backgrounded-then-killed mid-stream,
+the model call still runs to completion server-side (nothing aborts the upstream
+fetch) **and the user is billed** — but the reply is simply discarded, because only
+the client holds the key to encrypt+persist it. With the setting on, that reply is
+kept so it isn't lost. There, and only there:
+
+- The reply is stashed **only when the client actually disconnected** (`clientGone`)
+  and the user opted in — a reply delivered normally is never buffered.
+- It lives in **short-TTL Redis** (`pendingReply:<userId>:<pendingMessageId>`, TTL
+  default **1 hour**, `PENDING_REPLY_TTL_MS`) — **never Mongo, never S3**. It is
+  **deleted the moment the client retrieves it** (`DELETE /api/chat/pending/:id`);
+  TTL is the backstop. Implementation: `server/services/pendingReplyStore.js`,
+  `server/services/pendingReplyService` client half, recovery on relaunch.
+- This is a **brief plaintext hold in Privateer-operated Redis, by consent** — a
+  bounded extension of the already-accepted "plaintext transits during inference"
+  risk (from one request to ≤1h). It does **not** change the on-device model: the
+  durable copy is still the client-encrypted assistant turn.
+- Frame honestly (matches `CLAUDE.md §5`): the in-app copy says plainly that a reply
+  may rest on our servers in plaintext for up to an hour if the app is closed
+  mid-reply. Never describe this as E2EE. When the setting is **off** (default), the
+  absolute "ciphertext only" guarantee holds unchanged.
+
+Note: the composer-**draft** persistence that ships alongside this is **fully
+on-device** (EncryptedStorage only, `services/draftService.ts`) — no server, no
+carve-out.
 
 ## Identity model
 
@@ -150,7 +186,10 @@ Plaintext fields on the server schemas (`content`, `aiResponse`, `title`,
 5. Client encrypts the response and persists it via `POST /api/chat/...`.
 
 The server never writes the AI response to the database in plaintext. The
-plaintext exists in memory on the server only for the duration of the request.
+plaintext exists in memory on the server only for the duration of the request —
+**with one opt-in exception**: if the user enabled "Finish replies in the cloud"
+and the client disconnects mid-stream, the finished reply is stashed in short-TTL
+Redis (never Mongo) for pickup on reopen. See the carve-out in the threat model.
 
 ### Deep Research background jobs
 

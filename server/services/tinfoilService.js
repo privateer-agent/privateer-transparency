@@ -46,6 +46,7 @@ const { getTinfoilPricing, TINFOIL_PREFIX } = require('../data/tinfoilModels');
 // Standalone module (requires nothing back into inferenceService), so unlike the
 // shared() helpers below it can be required eagerly without a load-time cycle.
 const { createPersonaGuard } = require('./personaGuard');
+const providerHealth = require('./providerHealthService');
 
 const TINFOIL_BASE = () => process.env.TINFOIL_BASE_URL || 'https://inference.tinfoil.sh/v1';
 const TINFOIL_TIMEOUT_MS = Number(process.env.TINFOIL_TEXT_TIMEOUT_MS) || 240_000;
@@ -177,6 +178,7 @@ async function tinfoilChatRequest(body, modelId, { signal } = {}) {
 
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
+    providerHealth.recordFailure('tinfoil', { status: res.status, message: errText, kind: 'inference' });
     if (res.status === 404 || res.status === 503 || res.status >= 500) {
       throw asProviderError(`The selected model (${modelId}) is currently unavailable. Please choose a different model in Settings.`, modelId, { statusCode: res.status });
     }
@@ -184,6 +186,7 @@ async function tinfoilChatRequest(body, modelId, { signal } = {}) {
     if (res.status === 429) err.statusCode = 429;
     throw err;
   }
+  providerHealth.recordSuccess('tinfoil');
   return res;
 }
 
@@ -372,6 +375,9 @@ async function tinfoilMediaRequest(path, init, modelId) {
   }
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
+    providerHealth.recordFailure('tinfoil', {
+      status: res.status, message: errText, kind: String(path).includes('audio') ? 'stt' : 'imageGen'
+    });
     if (res.status === 404 || res.status === 503 || res.status >= 500) {
       throw asProviderError(`The selected model (${modelId}) is currently unavailable. Please choose a different model in Settings.`, modelId, { statusCode: res.status });
     }
@@ -379,6 +385,7 @@ async function tinfoilMediaRequest(path, init, modelId) {
     if (res.status === 429) err.statusCode = 429;
     throw err;
   }
+  providerHealth.recordSuccess('tinfoil');
   return res;
 }
 

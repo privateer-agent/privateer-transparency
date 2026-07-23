@@ -46,6 +46,7 @@ const { getNearPricing, NEAR_PREFIX } = require('../data/nearModels');
 // Standalone module (requires nothing back into inferenceService), so unlike the
 // shared() helpers below it can be required eagerly without a load-time cycle.
 const { createPersonaGuard } = require('./personaGuard');
+const providerHealth = require('./providerHealthService');
 
 const NEAR_BASE = () => process.env.NEAR_AI_BASE_URL || 'https://cloud-api.near.ai/v1';
 const NEAR_TIMEOUT_MS = Number(process.env.NEAR_TEXT_TIMEOUT_MS) || 240_000;
@@ -216,10 +217,12 @@ async function nearChatRequest(body, modelId, { stream = false, signal } = {}) {
     if (res.status === 404 || res.status === 503 || res.status >= 500) {
       throw asProviderError(`The selected model (${modelId}) is currently unavailable. Please choose a different model in Settings.`, modelId, { statusCode: res.status });
     }
+    providerHealth.recordFailure('near', { status: res.status, message: errText, kind: 'inference' });
     const err = new Error(`NEAR AI error ${res.status}: ${errText}`);
     if (res.status === 429) err.statusCode = 429;
     throw err;
   }
+  providerHealth.recordSuccess('near');
   return res;
 }
 
@@ -430,6 +433,9 @@ async function nearMediaRequest(path, init, modelId) {
   }
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
+    providerHealth.recordFailure('near', {
+      status: res.status, message: errText, kind: String(path).includes('audio') ? 'stt' : 'imageGen'
+    });
     if (res.status === 404 || res.status === 503 || res.status >= 500) {
       throw asProviderError(`The selected model (${modelId}) is currently unavailable. Please choose a different model in Settings.`, modelId, { statusCode: res.status });
     }
@@ -437,6 +443,7 @@ async function nearMediaRequest(path, init, modelId) {
     if (res.status === 429) err.statusCode = 429;
     throw err;
   }
+  providerHealth.recordSuccess('near');
   return res;
 }
 

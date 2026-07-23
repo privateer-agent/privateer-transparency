@@ -44,6 +44,7 @@ const { safeFetch } = require('../utils/safeFetch');
 const { createPersonaGuard } = require('./personaGuard');
 const Sentry = require('@sentry/node');
 const logger = require('../utils/logger');
+const providerHealth = require('./providerHealthService');
 
 // ── Output formatting directive ──────────────────────────────────────────────
 
@@ -564,7 +565,10 @@ async function openRouterChat(messages, modelId, options = {}) {
       clearTimeout(timer);
     }
 
-    if (res.ok) return res.json();
+    if (res.ok) {
+      providerHealth.recordSuccess(useZdrKey ? 'openrouter_zdr' : 'openrouter');
+      return res.json();
+    }
 
     const errText = await res.text();
 
@@ -579,6 +583,9 @@ async function openRouterChat(messages, modelId, options = {}) {
       continue;
     }
 
+    providerHealth.recordFailure(useZdrKey ? 'openrouter_zdr' : 'openrouter', {
+      status: res.status, message: errText, kind: options.modalities ? 'imageGen' : 'inference'
+    });
     const err = new Error(`OpenRouter error ${res.status}: ${errText}`);
     if (res.status === 429) err.statusCode = 429;
     if (res.status === 404 || res.status === 503 || res.status >= 500) {
@@ -1589,6 +1596,9 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
 
     if (!res.ok) {
       const errText = await res.text();
+      providerHealth.recordFailure(useZdrKey ? 'openrouter_zdr' : 'openrouter', {
+        status: res.status, message: errText, kind: 'inference'
+      });
       // A selected model whose providers have all gone away returns
       // 404 "No endpoints found for <model>". Surface it as a typed,
       // user-actionable error (chatController has a PROVIDER_UNAVAILABLE
@@ -1619,6 +1629,7 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
         { statusCode: res.status },
       );
     }
+    providerHealth.recordSuccess(useZdrKey ? 'openrouter_zdr' : 'openrouter');
 
     const reader = res.body.getReader();
     let buffer = '';
