@@ -186,14 +186,17 @@ class AuthService {
    * Sign in with email/password. Unwraps the master key locally and caches it
    * in EncryptedStorage so subsequent app opens skip the password prompt.
    */
-  async loginWithPassword(email: string, password: string): Promise<AuthResponse> {
+  async loginWithPassword(email: string, password: string, opts?: { recover?: boolean }): Promise<AuthResponse> {
     const response = await fetch(`${API_BASE_URL}/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       // Tag the session with the surface signing in, so the account's linked-
       // device list names this row ("iPhone" / "Desktop app on macOS") instead
       // of showing an anonymous "App". Display metadata only.
-      body: JSON.stringify({ email, password, ...sessionDeviceMeta() }),
+      // `recover: true` asks the server to lift a pending 30-day deletion on an
+      // otherwise valid password login (sent only after the user confirms the
+      // "account scheduled for deletion — recover?" prompt).
+      body: JSON.stringify({ email, password, ...(opts?.recover ? { recover: true } : {}), ...sessionDeviceMeta() }),
     });
 
     const data = await response.json();
@@ -459,6 +462,13 @@ class AuthService {
         if (response.status >= 500) {
           return { valid: !!this.accessToken, reason: 'server_error', user: this.user ?? undefined };
         }
+        // A non-401, non-5xx failure (e.g. 403 on a grace_period account) means
+        // this session is no longer usable. Tear down authService's own token
+        // state here — not just React state in the caller — so the two don't
+        // desync into a zombie session where useAuth() reports signed-out while
+        // makeAuthenticatedRequest still attaches the stale token and it
+        // survives relaunch.
+        await this.handleTokenExpiration();
         return { valid: false, reason: 'expired' };
       }
 

@@ -15,7 +15,7 @@ export {
 } from './walletAuthShared';
 export type { WalletUser, WalletAuthResult } from './walletAuthShared';
 
-export async function solanaLogin(): Promise<never> {
+export async function solanaLogin(_opts?: { recover?: boolean }): Promise<never> {
   throw new Error('Solana wallet login is not supported on iOS.');
 }
 

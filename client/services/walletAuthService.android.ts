@@ -54,7 +54,7 @@ const IDENTITY = {
  * Sign in via Solana wallet. After this resolves, the in-memory master key is
  * loaded and the user is authenticated.
  */
-export async function solanaLogin(): Promise<WalletAuthResult> {
+export async function solanaLogin(opts?: { recover?: boolean }): Promise<WalletAuthResult> {
   const { nonce, nonceId } = await fetchNonce();
 
   // One MWA session signs the auth message + the vault message, both from the
@@ -86,7 +86,7 @@ export async function solanaLogin(): Promise<WalletAuthResult> {
     };
   });
 
-  return completeWalletLogin({ pubkeyHex, authSignature, authMessage, vaultSignature, nonceId });
+  return completeWalletLogin({ pubkeyHex, authSignature, authMessage, vaultSignature, nonceId }, opts);
 }
 
 /**

@@ -88,7 +88,10 @@ async function lightAuthenticate(req, res, next) {
     if (revoked) return next();
 
     const user = await User.findById(decoded.sub);
-    if (user && user.accountStatus !== 'deleted') {
+    // Match authenticate()'s account-status gating: a deleted or pending-
+    // deletion account is not a live identity, so leave req.user unset and let
+    // the route proceed as anonymous rather than acting on a half-deleted user.
+    if (user && user.accountStatus !== 'deleted' && user.accountStatus !== 'grace_period') {
       req.user = user;
       req.jti = decoded.jti;
       req.authMethod = decoded.authMethod;

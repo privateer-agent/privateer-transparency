@@ -260,7 +260,7 @@ router.post('/register', registerRateLimiter, async (req, res) => {
 
 router.post('/login', loginRateLimiter, async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, recover } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ message: req.t('errors.emailPasswordRequired') });
@@ -285,10 +285,25 @@ router.post('/login', loginRateLimiter, async (req, res) => {
     }
 
     if (user.accountStatus === 'grace_period') {
-      return res.status(403).json({
-        message: req.t('errors.accountScheduledDeletion'),
-        code: 'ACCOUNT_PENDING_DELETION'
-      });
+      // Recovery path for the 30-day deletion grace period. delete-request
+      // revoked every session AND refresh token, so the standalone
+      // /account/cancel-deletion (which needs a still-valid refresh token) can
+      // never succeed from a client that already tore down its tokens. A fresh
+      // password login IS a full re-auth, so honor it as the recovery gesture:
+      // the client re-issues the login with `recover: true` after the user
+      // confirms the "account scheduled for deletion — recover?" prompt.
+      // Without the flag we still surface the prompt rather than silently
+      // reviving an account the user may have meant to leave deleting.
+      if (recover !== true) {
+        return res.status(403).json({
+          message: req.t('errors.accountScheduledDeletion'),
+          code: 'ACCOUNT_PENDING_DELETION'
+        });
+      }
+      user.accountStatus = 'active';
+      user.deletionRequestedAt = undefined;
+      user.hardDeleteAt = undefined;
+      await user.save();
     }
 
     await UserAuthMethod.findOneAndUpdate(
@@ -993,10 +1008,23 @@ router.post('/wallet/verify', walletVerifyLimiter, async (req, res) => {
       });
       analyticsService.track('signup', { method: 'wallet' });
     } else if (user.accountStatus === 'grace_period') {
-      return res.status(403).json({
-        message: 'This account is scheduled for deletion. Recover it?',
-        code: 'ACCOUNT_PENDING_DELETION'
-      });
+      // Recovery path for the 30-day deletion grace period (mirrors /auth/login):
+      // a fresh, valid wallet signature IS a full re-auth, so honor `recover:
+      // true` — sent by the client after the user confirms the "scheduled for
+      // deletion — recover?" prompt — as the recovery gesture. Without the flag
+      // we surface the prompt rather than silently reviving the account. This is
+      // the only workable recovery: delete-request revoked every session and
+      // refresh token, so the token-based /account/cancel-deletion can't run.
+      if (req.body.recover !== true) {
+        return res.status(403).json({
+          message: 'This account is scheduled for deletion. Recover it?',
+          code: 'ACCOUNT_PENDING_DELETION'
+        });
+      }
+      user.accountStatus = 'active';
+      user.deletionRequestedAt = undefined;
+      user.hardDeleteAt = undefined;
+      await user.save();
     }
 
     await UserAuthMethod.findOneAndUpdate(

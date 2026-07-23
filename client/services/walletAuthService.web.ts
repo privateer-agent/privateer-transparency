@@ -42,7 +42,7 @@ export type { WalletUser, WalletAuthResult } from './walletAuthShared';
  * Sign in via a browser Solana wallet. After this resolves, the in-memory
  * master key is loaded and the user is authenticated.
  */
-export async function solanaLogin(): Promise<WalletAuthResult> {
+export async function solanaLogin(opts?: { recover?: boolean }): Promise<WalletAuthResult> {
   const { nonce, nonceId } = await fetchNonce();
 
   // Electron desktop: no extension is injected here, so the signing happens in
@@ -56,7 +56,7 @@ export async function solanaLogin(): Promise<WalletAuthResult> {
       authMessage: linked.authMessage!,
       vaultSignature: linked.vaultSignature,
       nonceId,
-    });
+    }, opts);
   }
 
   const wallet = await connectBrowserWallet();
@@ -65,7 +65,7 @@ export async function solanaLogin(): Promise<WalletAuthResult> {
   const authSignature = await wallet.signMessage(authMessage);
   const vaultSignature = await wallet.signMessage(vaultMessage);
 
-  return completeWalletLogin({ pubkeyHex, authSignature, authMessage, vaultSignature, nonceId });
+  return completeWalletLogin({ pubkeyHex, authSignature, authMessage, vaultSignature, nonceId }, opts);
 }
 
 /**

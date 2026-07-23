@@ -146,6 +146,7 @@ async function verifyWithServer(
   signature: Uint8Array,
   signedMessage: Uint8Array,
   nonceId: string,
+  recover = false,
 ): Promise<WalletAuthResult & { vault: VaultPayload | null; needsMasterKeySetup: boolean }> {
   const res = await fetch(`${API_BASE}/auth/wallet/verify`, {
     method: 'POST',
@@ -155,13 +156,20 @@ async function verifyWithServer(
       signature: toHex(signature),
       signedMessage: toHex(signedMessage),
       nonceId,
+      // Lift a pending 30-day deletion on an otherwise valid wallet sign-in.
+      // Sent only after the user confirms the recovery prompt (see LoginScreen).
+      ...(recover ? { recover: true } : {}),
       // Names this sign-in in the linked-device list (display metadata only).
       ...sessionDeviceMeta(),
     }),
   });
   if (!res.ok) {
-    const body = await res.json().catch(() => ({})) as { message?: string };
-    throw new Error(body.message || 'Wallet verification failed');
+    const body = await res.json().catch(() => ({})) as { message?: string; code?: string };
+    // Preserve the structured code (e.g. ACCOUNT_PENDING_DELETION) so callers
+    // can branch — the recovery prompt keys off it, not the localized message.
+    const err: any = new Error(body.message || 'Wallet verification failed');
+    err.code = body.code;
+    throw err;
   }
   return res.json();
 }
@@ -188,8 +196,13 @@ export interface CollectedSignatures {
  * — both keyed off the vault signature collected in the same session. On
  * success the in-memory master key is loaded and the user is authenticated.
  */
-export async function completeWalletLogin(sigs: CollectedSignatures): Promise<WalletAuthResult> {
-  const result = await verifyWithServer(sigs.pubkeyHex, sigs.authSignature, sigs.authMessage, sigs.nonceId);
+export async function completeWalletLogin(
+  sigs: CollectedSignatures,
+  opts?: { recover?: boolean },
+): Promise<WalletAuthResult> {
+  const result = await verifyWithServer(
+    sigs.pubkeyHex, sigs.authSignature, sigs.authMessage, sigs.nonceId, opts?.recover === true,
+  );
 
   // Sync auth state (tokens + user) into authService.
   await authService.updateAuthData(result.accessToken, result.refreshToken, result.user);
