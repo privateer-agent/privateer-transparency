@@ -1412,7 +1412,7 @@ async function listSubscriptionCatalog() {
   const teeSources = [
     { name: 'NEAR',    on: true,                                        load: () => require('../data/nearModels').loadNearModels('chat') },
     { name: 'Tinfoil', on: true,                                        load: () => require('../data/tinfoilModels').loadTinfoilModels('chat') },
-    { name: 'Phala',   on: process.env.SEALED_MODELS_ENABLED === '1',   load: () => require('../data/phalaModels').loadPhalaModels('chat') },
+    { name: 'Phala',   on: process.env.SEALED_MODELS_ENABLED !== '0',   load: () => require('../data/phalaModels').loadPhalaModels('chat') },
   ];
   for (const src of teeSources) {
     if (!src.on) continue;
