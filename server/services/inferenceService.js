@@ -1549,6 +1549,10 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
   const decoder = new TextDecoder();
   let inputTokens = 0;
   let outputTokens = 0;
+  // Set when the upstream stream failed mid-flight AFTER content had already been
+  // delivered — the reply is salvaged as a truncated partial instead of throwing
+  // the whole turn away (see the readErr catch in streamOnce).
+  let interrupted = false;
   const annotationsById = new Map();
 
   const collectAnnotations = (arr) => {
@@ -1649,8 +1653,16 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
         read = await reader.read();
       } catch (readErr) {
         // An abort rejects the in-flight read() with an AbortError — expected when
-        // options.signal fired. Anything else is a real stream failure: rethrow.
+        // options.signal fired.
         if (options.signal?.aborted) break;
+        // A real mid-stream failure. If the model already delivered content, the
+        // dominant shape is a trailing connection reset after the reply was
+        // (mostly) sent — don't discard it. Mark the reply interrupted, stop
+        // reading, and let the caller finalize the partial (the finally below
+        // still flushes the buffered persona-guard tail). With nothing delivered
+        // yet there's no partial to save and a caller may fall back to another
+        // model, so rethrow.
+        if (fullText.length > resumeSeed.length) { interrupted = true; break outer; }
         throw readErr;
       }
       const { done, value } = read;
@@ -1692,37 +1704,52 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
   const firstMessages = resumeSeed
     ? [...windowed, { role: 'assistant', content: resumeSeed }, { role: 'user', content: CONTINUE_DIRECTIVE }]
     : windowed;
-  let finishReason = await streamOnce(firstMessages);
+  let finishReason = null;
+  try {
+    finishReason = await streamOnce(firstMessages);
 
-  // Auto-continue a length-truncated reply. Opt-in via options.maxContinuations
-  // (default 0 → unchanged behavior): a large artifact (Build/Cargo mode) can
-  // exceed max_tokens, and the model stops mid-document with finish_reason
-  // 'length'. Feed the partial back as the assistant turn and ask it to continue
-  // verbatim, streaming the tail through the same onChunk so the client sees one
-  // continuous reply. Bounded so a model that never emits 'stop' can't loop.
-  let continuations = options.maxContinuations ?? 0;
-  while (
-    finishReason === 'length' &&
-    continuations > 0 &&
-    !options.signal?.aborted
-  ) {
-    continuations--;
-    const contMessages = [
-      ...windowed,
-      { role: 'assistant', content: fullText },
-      { role: 'user', content: CONTINUE_DIRECTIVE },
-    ];
-    finishReason = await streamOnce(contMessages);
+    // Auto-continue a length-truncated reply. Opt-in via options.maxContinuations
+    // (default 0 → unchanged behavior): a large artifact (Build/Cargo mode) can
+    // exceed max_tokens, and the model stops mid-document with finish_reason
+    // 'length'. Feed the partial back as the assistant turn and ask it to continue
+    // verbatim, streaming the tail through the same onChunk so the client sees one
+    // continuous reply. Bounded so a model that never emits 'stop' can't loop.
+    let continuations = options.maxContinuations ?? 0;
+    while (
+      finishReason === 'length' &&
+      continuations > 0 &&
+      !options.signal?.aborted
+    ) {
+      continuations--;
+      const contMessages = [
+        ...windowed,
+        { role: 'assistant', content: fullText },
+        { role: 'user', content: CONTINUE_DIRECTIVE },
+      ];
+      finishReason = await streamOnce(contMessages);
+    }
+  } finally {
+    // Always flush the table-converter / persona-guard tail — even if streamOnce
+    // threw (a trailing connection reset after the last delta, an undici
+    // body-timeout at stream close). Both transformers hold back the trailing
+    // window (up to CARRY_CHARS, and for a short reply the ENTIRE text) until
+    // end(); skipping it silently drops that tail and leaves the reply cut off
+    // mid-sentence. See personaGuard.js.
+    tableConverter.end();
+    personaGuard.end();
   }
-
-  tableConverter.end();
-  personaGuard.end();
 
   const { costUsd, providerCostUsd } = await calcOpenRouterCost(effectiveModelId, null, inputTokens, outputTokens);
   const sources = await enrichWithImages(extractWebCitations(Array.from(annotationsById.values())));
-  // `truncated` stays true only when the reply was still length-capped after the
-  // continuation budget ran out — callers can surface a soft warning.
-  return { inputTokens, outputTokens, costUsd, providerCostUsd, sources, finishReason, truncated: finishReason === 'length' };
+  // `truncated` is true when the reply is incomplete for either reason: it was
+  // still length-capped after the continuation budget ran out, OR the upstream
+  // stream was interrupted mid-flight after partial delivery. Callers surface a
+  // soft "may be incomplete" note. `interrupted` distinguishes the latter cause.
+  return {
+    inputTokens, outputTokens, costUsd, providerCostUsd, sources, finishReason,
+    truncated: finishReason === 'length' || interrupted,
+    interrupted,
+  };
 }
 
 /**

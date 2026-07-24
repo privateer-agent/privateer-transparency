@@ -266,47 +266,62 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
   let buffer = '';
   let inputTokens = 0;
   let outputTokens = 0;
+  let sawContent = false;
+  // Set when the stream failed mid-flight after content was already delivered —
+  // the partial is salvaged as a truncated reply instead of throwing the turn.
+  let interrupted = false;
 
   // Persona guard sits last, closest to the wire (see inferenceService).
   const personaGuard = createPersonaGuard(onChunk, options);
   const tableConverter = createStreamingTableConverter((text) => personaGuard.push(text));
 
-  outer: while (true) {
-    if (options.signal?.aborted) break;
-    let read;
-    try {
-      read = await reader.read();
-    } catch (readErr) {
+  try {
+    outer: while (true) {
       if (options.signal?.aborted) break;
-      throw readErr;
-    }
-    const { done, value } = read;
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-
-    const lines = buffer.split('\n');
-    buffer = lines.pop() ?? '';
-
-    for (const line of lines) {
-      if (!line.startsWith('data: ')) continue;
-      const raw = line.slice(6).trim();
-      if (raw === '[DONE]') break outer;
+      let read;
       try {
-        const parsed = JSON.parse(raw);
-        const delta = parsed.choices?.[0]?.delta?.content;
-        if (delta) tableConverter.push(delta);
-        if (parsed.usage) {
-          inputTokens = parsed.usage.prompt_tokens || inputTokens;
-          outputTokens = parsed.usage.completion_tokens || outputTokens;
-        }
-      } catch { /* skip malformed chunk */ }
+        read = await reader.read();
+      } catch (readErr) {
+        if (options.signal?.aborted) break;
+        // Mid-stream failure after partial delivery (trailing reset): salvage the
+        // partial rather than discard it. Nothing delivered yet → rethrow. See
+        // inferenceService.js.
+        if (sawContent) { interrupted = true; break outer; }
+        throw readErr;
+      }
+      const { done, value } = read;
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const raw = line.slice(6).trim();
+        if (raw === '[DONE]') break outer;
+        try {
+          const parsed = JSON.parse(raw);
+          const delta = parsed.choices?.[0]?.delta?.content;
+          if (delta) { sawContent = true; tableConverter.push(delta); }
+          if (parsed.usage) {
+            inputTokens = parsed.usage.prompt_tokens || inputTokens;
+            outputTokens = parsed.usage.completion_tokens || outputTokens;
+          }
+        } catch { /* skip malformed chunk */ }
+      }
     }
+  } finally {
+    // Always flush the buffered tail, even if reader.read() threw mid-stream
+    // (trailing connection reset). Both transformers hold back the trailing
+    // window until end(); skipping it drops that tail and cuts the reply off
+    // mid-sentence. See inferenceService.js / personaGuard.js.
+    tableConverter.end();
+    personaGuard.end();
   }
-  tableConverter.end();
-  personaGuard.end();
 
   const { costUsd, providerCostUsd } = await calcTinfoilCost(modelId, inputTokens, outputTokens);
-  return { inputTokens, outputTokens, costUsd, providerCostUsd, sources: [] };
+  return { inputTokens, outputTokens, costUsd, providerCostUsd, sources: [], truncated: interrupted, interrupted };
 }
 
 /**
