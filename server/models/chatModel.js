@@ -42,6 +42,19 @@ const chatSchema = new mongoose.Schema(
     },
     // E2EE: encrypted chat title. JSON string: { "iv": "<base64>", "ct": "<base64>" }
     encryptedTitle: { type: String, default: null },
+    // E2EE: the chat's Stage — what it keeps in front of the model across turns.
+    // Decrypts to a JSON array of { kind, id, title, role, isLocal?, pinnedAt?,
+    // text?, file? } (client types/stage.ts, PersistedStagedItem).
+    //
+    // Deliberately POINTERS, not payloads: the resolved text is rebuilt per turn
+    // by client stageService, so an artifact edited in the Cargo editor is seen
+    // at its current version rather than the copy frozen into history. That also
+    // keeps this field small — it is chat-level state, not per-message, unlike
+    // messages[].encryptedContextRefs which is a historical record of one turn.
+    //
+    // The title inside is decrypted user content, which is why the whole array
+    // is one ciphertext blob rather than a plain subdocument.
+    encryptedStage: { type: String, default: null },
     // Chat messages stored inline for simplicity (no separate Message model needed)
     messages: [{
       role: {
