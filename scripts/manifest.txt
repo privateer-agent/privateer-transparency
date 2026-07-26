@@ -24,6 +24,7 @@ server/models/chatEdgeModel.js
 server/models/chatGraphModel.js
 server/models/chatModel.js
 server/models/chatNodeModel.js
+server/models/libraryAudioModel.js
 server/models/messageModel.js
 server/models/outboxItemModel.js
 server/models/projectFileModel.js
