@@ -84,6 +84,40 @@ function prettyName(slug) {
     || slug.split('-').map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w)).join(' ');
 }
 
+/**
+ * Preset speakers per TTS model.
+ *
+ * Tinfoil's /v1/models catalog does NOT publish these (every entry's `voices`
+ * is null), but /v1/audio/speech *requires* a `voice` and rejects anything
+ * outside the model's own set — so an empty list here is not a harmless
+ * "unknown", it's a guaranteed 400. These were read off the endpoint's own
+ * rejection message ("Invalid speaker 'x'. Supported: …").
+ *
+ * First entry is the default when the user hasn't chosen one. Voice names are
+ * strictly per-model: passing a Gemini name ("Zephyr") or an OpenAI one
+ * ("alloy") to either of these 400s.
+ */
+const TINFOIL_VOICES = {
+  'voxtral-tts': [
+    'neutral_female', 'neutral_male', 'casual_female', 'casual_male', 'cheerful_female',
+    'ar_male', 'de_female', 'de_male', 'es_female', 'es_male', 'fr_female', 'fr_male',
+    'hi_female', 'hi_male', 'it_female', 'it_male', 'nl_female', 'nl_male',
+    'pt_female', 'pt_male',
+  ],
+  'qwen3-tts': ['serena', 'aiden', 'dylan', 'eric', 'ono_anna', 'ryan', 'sohee', 'uncle_fu', 'vivian'],
+};
+
+/**
+ * Preset speakers for a Tinfoil TTS model, by namespaced or upstream id.
+ * Returns [] for non-TTS / unknown models. Synchronous — the list is static,
+ * so callers on the request path don't need to await the catalog.
+ */
+function tinfoilVoicesFor(modelId) {
+  if (typeof modelId !== 'string') return [];
+  const slug = modelId.startsWith(TINFOIL_PREFIX) ? modelId.slice(TINFOIL_PREFIX.length) : modelId;
+  return TINFOIL_VOICES[slug] || [];
+}
+
 // Catalog prices are USD per 1M tokens → USD per token (null when absent).
 const perTokenFromPer1M = (v) => (typeof v === 'number' ? v / 1_000_000 : null);
 
@@ -164,10 +198,10 @@ function mapTinfoilModel(m, cls) {
     provider: 'tinfoil',
     inputModalities,
     outputModalities,
-    // Tinfoil doesn't publish per-model voice lists; the /v1/audio/speech
-    // `voice` param is optional, so the client's voice picker stays empty and
-    // synthesis uses the model default.
-    supportedVoices: [],
+    // The catalog publishes no voice list, but /v1/audio/speech requires one —
+    // see TINFOIL_VOICES. Serving them here is what lets the client's voice
+    // picker work and stops a foreign voice name reaching the endpoint.
+    supportedVoices: cls === 'tts' ? tinfoilVoicesFor(m.id) : [],
     tokenizer: null,
     rankings: null,
     // Hardware confidential compute is a strictly stronger guarantee than
@@ -269,4 +303,11 @@ async function getTinfoilPricing(modelId) {
   return _cache.pricing.get(upstream) || null;
 }
 
-module.exports = { loadTinfoilModels, getTinfoilPricing, isTinfoilImageInputModel, TINFOIL_PREFIX, TINFOIL_TEE_STACK };
+module.exports = {
+  loadTinfoilModels,
+  getTinfoilPricing,
+  isTinfoilImageInputModel,
+  tinfoilVoicesFor,
+  TINFOIL_PREFIX,
+  TINFOIL_TEE_STACK,
+};

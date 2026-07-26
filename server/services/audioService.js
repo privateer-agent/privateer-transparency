@@ -38,12 +38,20 @@ const billingService = require('./billingService');
 const inferenceService = require('./inferenceService');
 const nearAiService = require('./nearAiService');
 const tinfoilService = require('./tinfoilService');
+const { tinfoilVoicesFor } = require('../data/tinfoilModels');
 const UserStoragePrefs = require('../models/userStoragePrefsModel');
 
 const OPENROUTER_BASE = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
 
 const DEFAULT_STT_MODEL = process.env.DEFAULT_STT_MODEL || 'openai/whisper-1';
-const DEFAULT_TTS_MODEL = process.env.DEFAULT_TTS_MODEL || 'google/gemini-3.1-flash-tts-preview';
+// Default to a confidential-compute voice: Voxtral runs in a Tinfoil enclave
+// (AMD SEV-SNP + confidential GPU) with a fetchable attestation, so spoken text
+// is processed somewhere the operator can't read into — a strictly stronger
+// guarantee than contractual ZDR, and it satisfies the requireZdr gate on its
+// own. Also the cheapest TTS on offer and the only one with per-locale voices.
+const DEFAULT_TTS_MODEL = process.env.DEFAULT_TTS_MODEL || 'tinfoil/voxtral-tts';
+// Fallback for models whose voice set we don't enumerate (Gemini et al.).
+// Tinfoil models never use this — see resolveVoice.
 const DEFAULT_TTS_VOICE = process.env.DEFAULT_TTS_VOICE || 'Zephyr';
 
 // OpenAI-compatible clients always send an OpenAI voice name (`alloy`, `nova`,
@@ -57,9 +65,19 @@ const OPENAI_TO_GEMINI_VOICE = {
   coral: 'Kore', sage: 'Iapetus', verse: 'Fenrir',
 };
 
-// Resolve the wire voice for a given model. OpenAI TTS models keep OpenAI voice
-// names; every other backend (Gemini default, etc.) gets the mapped/default name.
+// Resolve the wire voice for a given model. Voice names are strictly per-model
+// family, so this must never hand one family's name to another.
+//
+// Tinfoil is handled first and separately: its /v1/audio/speech *requires* a
+// voice and rejects anything outside that model's own preset speakers, so both
+// the Gemini mapping below and a bare passthrough 400 there. Fall back to the
+// model's own first speaker rather than the global Gemini default.
 function resolveVoice(voice, model) {
+  if (tinfoilService.isTinfoilModel(model)) {
+    const presets = tinfoilVoicesFor(model);
+    if (voice && presets.includes(voice)) return voice;
+    return presets[0] || '';
+  }
   if (typeof model === 'string' && model.startsWith('openai/')) return voice || 'alloy';
   if (!voice || typeof voice !== 'string') return DEFAULT_TTS_VOICE;
   return OPENAI_TO_GEMINI_VOICE[voice.toLowerCase()] || voice;

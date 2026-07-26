@@ -454,8 +454,10 @@ async function speechRequest({ text, voice, responseFormat, modelId }) {
     model: upstream,
     input: text,
     response_format: responseFormat || 'mp3',
-    // Tinfoil's voice param is optional (model default when omitted); voice
-    // identifiers are model-specific, so only forward an explicit choice.
+    // Not optional, despite the catalog publishing no voice list: omitting this
+    // 400s with "Either 'voice' (preset speaker) or 'ref_audio' … must be
+    // provided". Callers resolve it via audioService.resolveVoice, which picks
+    // from the model's own presets (data/tinfoilModels.js TINFOIL_VOICES).
     ...(voice ? { voice } : {}),
   };
   const res = await tinfoilMediaRequest('/audio/speech', {
