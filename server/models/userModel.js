@@ -213,7 +213,7 @@ const userSchema = new mongoose.Schema(
     //
     // Deliberately not driven off a Stripe downgrade webhook. A user can end up
     // over their cap without any billing event at all — the pass-tier mechanic
-    // (entitlementService PASS_TIERS) promotes a free user holding $20 of top-up
+    // (entitlementService PASS_TIERS) promotes a free user holding $10 of top-up
     // to Navigator's 2 GB, and spending that balance down silently drops them to
     // Deckhand's 50 MB. Expiry and Apple/Play lapse are the same shape. Deriving
     // the state from `usage > cap` catches every path with no event plumbing.
