@@ -155,10 +155,11 @@ router.post(
     const text = typeof body.input === 'string' ? body.input : body.text;
     if (!text || typeof text !== 'string' || !text.trim()) return oaError(res, 400, '`input` text is required.', 'TEXT_REQUIRED');
 
-    // Default to PCM (returned as playable WAV) — the default voice model is
-    // pcm-only. mp3 is honored only when explicitly requested and the chosen
-    // model supports it.
-    const format = body.response_format === 'mp3' ? 'mp3' : 'pcm';
+    // mp3 by default, like OpenAI's own /v1/audio/speech, and pcm when asked
+    // for. Models that can't do mp3 (Gemini TTS) are overridden inside
+    // audioService.resolveResponseFormat and come back as WAV, so an
+    // unsupported combination downgrades the container instead of 400ing.
+    const format = body.response_format === 'pcm' ? 'pcm' : 'mp3';
     const requireZdr = await audioService.resolveRequireZdr(req.userId, body.requireZdr);
     const { buffer, mimeType } = await audioService.synthesizeSpeech({
       userId: req.userId, text, voice: body.voice, format, modelId: body.model, requireZdr,

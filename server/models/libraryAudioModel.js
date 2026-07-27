@@ -23,7 +23,8 @@
 const mongoose = require('mongoose');
 
 /**
- * Standalone audio clips generated in the Audio studio (text-to-speech).
+ * Standalone audio clips generated in the Audio studio — spoken text (source
+ * 'tts') or generated music (source 'music'). Both are MP3 and share this shelf.
  *
  * Every other Library row is derived from an attachment embedded on a chat
  * message. A studio clip has no conversation, and `Message` has no
@@ -56,7 +57,7 @@ const libraryAudioSchema = new mongoose.Schema(
     storageType: { type: String, enum: ['cloud'], default: 'cloud' },
 
     // Encrypted JSON: { filename, mimeType, size, source, voice, ttsModelId,
-    // prompt, durationMs }. A superset of the { filename, mimeType, size }
+    // musicModelId, prompt, durationMs }. A superset of the { filename, mimeType, size }
     // shape chatService writes for chat file attachments, so any client that
     // can decrypt one can decrypt the other.
     encryptedMetadata: { type: String, default: null },
@@ -68,11 +69,11 @@ const libraryAudioSchema = new mongoose.Schema(
     // field that doesn't exist and under-refunds by the AES-GCM overhead.)
     encryptedSize: { type: Number, default: null },
 
-    // Provenance. 'tts' = generated in the Audio studio. 'upload' is reserved
-    // for a future chatless audio import; audio that arrives via a chat keeps
-    // living in Chat.messages[].fileAttachments[] and is shaped with
-    // source: 'chat'.
-    source: { type: String, enum: ['tts', 'upload'], default: 'tts', index: true },
+    // Provenance. 'tts' and 'music' are the Audio studio's two modes (spoken
+    // text and generated music). 'upload' is reserved for a future chatless
+    // audio import; audio that arrives via a chat keeps living in
+    // Chat.messages[].fileAttachments[] and is shaped with source: 'chat'.
+    source: { type: String, enum: ['tts', 'music', 'upload'], default: 'tts', index: true },
 
     // Render hint only — not content, not identifying.
     durationMs: { type: Number, default: null },
@@ -94,7 +95,7 @@ libraryAudioSchema.index({ userId: 1, storageRef: 1 }, { unique: true });
 // add a title field" change trips a reviewer rather than silently persisting
 // the prompt text or the user's chosen voice in plaintext.
 const PLAINTEXT_KEYS = [
-  'filename', 'fileName', 'mimeType', 'prompt', 'text', 'voice', 'ttsModelId', 'title',
+  'filename', 'fileName', 'mimeType', 'prompt', 'text', 'voice', 'ttsModelId', 'musicModelId', 'title',
 ];
 
 libraryAudioSchema.pre('save', function (next) {

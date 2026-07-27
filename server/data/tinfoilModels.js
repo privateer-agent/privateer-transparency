@@ -146,10 +146,27 @@ const ACTION_CLASSES = {
   tts:    new Set(['tts']),
 };
 
+/**
+ * Catalog entries we refuse to surface even though Tinfoil serves them.
+ *
+ * `voxtral-tts` is listed, priced, and returns a well-formed 24 kHz mono MP3 —
+ * it just doesn't say what you asked it to. Measured 2026-07-27: "The quick
+ * brown fox jumps over the lazy dog." with `neutral_female` produced 8.3s of
+ * audio that transcribes to "Thank you.", and the same kind of babble for
+ * casual_male / cheerful_female / de_male, for `wav` as well as `mp3`, and for
+ * every candidate sample-rate reinterpretation of the raw PCM (so it is not a
+ * container mislabel). `qwen3-tts`, same host and same request shape, returns
+ * the sentence verbatim. Offering a model that bills for unusable audio is
+ * worse than offering one fewer voice — delete this entry when it's fixed.
+ * (audioService.RETIRED_AUDIO_MODELS heals prefs that already point here.)
+ */
+const UNSERVABLE_MODELS = new Set(['voxtral-tts']);
+
 // Classify a raw catalog entry into one of our action classes, or null to drop
 // it. Classification keys off the catalog's own `type` + served `endpoints` so
 // new models slot in without a code change.
 function classifyTinfoilModel(m) {
+  if (UNSERVABLE_MODELS.has(m?.id)) return null;
   const endpoints = Array.isArray(m?.endpoints) ? m.endpoints : [];
   switch (m?.type) {
     case 'chat':
@@ -308,6 +325,10 @@ module.exports = {
   getTinfoilPricing,
   isTinfoilImageInputModel,
   tinfoilVoicesFor,
+  // Exported for test/audioModels.test.js — classification is pure, so it can be
+  // asserted against catalog-shaped fixtures without touching the network.
+  classifyTinfoilModel,
+  UNSERVABLE_MODELS,
   TINFOIL_PREFIX,
   TINFOIL_TEE_STACK,
 };

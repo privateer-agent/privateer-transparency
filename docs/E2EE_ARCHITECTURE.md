@@ -20,7 +20,8 @@ What this does **not** protect against:
 - Compromise of the user's device or wallet.
 - Exposure during AI inference. The plaintext message and response transit
   the inference provider (OpenRouter) for model execution. We use Zero Data
-  Retention providers where available.
+  Retention providers where available — **with one surface where none is
+  available at all: music generation. See the carve-out below.**
 - Loss of the user's password or wallet — there is no recovery path.
 - **Harbor hosted agents (opt-in, Navigator+) — see the carve-out below.** When a
   user opts a coding agent into Harbor, its plaintext is processed inside an
@@ -88,6 +89,52 @@ kept so it isn't lost. There, and only there:
 Note: the composer-**draft** persistence that ships alongside this is **fully
 on-device** (EncryptedStorage only, `services/draftService.ts`) — no server, no
 carve-out.
+
+### Music generation — a ZDR carve-out, **not** opt-in, live today
+
+Be precise about what this is and isn't. It is **not** an E2EE carve-out: we
+persist nothing in plaintext, and a saved track is client-encrypted like any
+other Library object. It is a **Zero Data Retention** carve-out inside the
+already-accepted "plaintext transits during inference" exposure — and the only
+one that is **not gated behind a user opt-in**.
+
+The facts (measured 2026-07-27 against the live catalog):
+
+- OpenRouter's entire catalog contains **two** audio-*output* generators,
+  `google/lyria-3-clip-preview` and `google/lyria-3-pro-preview`. **Neither has a
+  ZDR endpoint**, and there is no confidential-compute (TEE) music model
+  anywhere. Unlike image generation, there is nothing to fall back to.
+- Every other non-ZDR media model is gated by `assertMediaModelAllowed` behind
+  the `allowNonZdrMedia` opt-in. **Music is deliberately exempt.** Applying the
+  gate here would not protect anyone — with no ZDR model in the catalog it can
+  only ever produce an empty picker and a dead button for every account on the
+  default privacy pref.
+- Note this differs from **speech** models: for the `/audio/speech` and
+  `/audio/transcriptions` collections, non-ZDR membership predicts unservability
+  exactly (they 404 on both keys). Lyria is a `/chat/completions` media model and
+  **is** served on the standard key — verified end-to-end, 30.8s 44.1kHz stereo
+  MP3, $0.04 inline `usage.cost`.
+
+What is offered in place of the gate, and what the user is told:
+
+- **The request is unattributed.** `audioService.generateMusic` sends the bare
+  prompt as the only message and **no `user` field** — OpenRouter forwards that
+  field to the provider as an end-user identifier, so omitting it is what keeps a
+  retained prompt from being tied to a Privateer account. No chat id, no history,
+  no account metadata travels with it either. This is pinned by
+  `server/test/mediaZdrEnforcement.test.js`.
+- **The posture is disclosed at the point of generation**, not in a settings
+  screen: the Music composer renders `audio.music.privacyNote` on every pass,
+  undismissible, stating that the provider may keep the prompt and that we send
+  it without account details. Also pinned by that test.
+- Frame honestly (matches `CLAUDE.md §5`): this is a **mitigation, not a
+  guarantee**. Never describe music prompts as private, ZDR, or confidential.
+  If a ZDR or confidential music model ever ships, this exemption should collapse
+  back into the normal `assertMediaModelAllowed` gate.
+
+Impl: `server/services/audioService.js` (`generateMusic`), `POST
+/api/audio/music`, `client/services/musicService.ts`, Music mode in
+`client/screens/AudioScreen.tsx`.
 
 ## Identity model
 
