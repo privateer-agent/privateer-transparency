@@ -50,3 +50,34 @@ server/services/openaiProxyHandler.js
 server/services/sessionRevocation.js
 server/services/tinfoilService.js
 server/utils/shareCargoValidation.js
+
+# ── Voice + read-aloud ────────────────────────────────────────────────────────
+# Speech is the newest place plaintext transits our proxy: recorded audio out for
+# transcription, reply text out for synthesis. Neither is ever persisted server-
+# side, and these are the files that show it (the audio SERVICE above already
+# shows the provider/ZDR routing; these show what the client sends and what the
+# route does with it).
+client/services/voiceChatService.ts
+client/services/speechPlaybackService.ts
+client/services/streamingSpeech.ts
+server/routes/audio.js
+
+# ── "Finish replies in the cloud" — the opt-in plaintext-hold carve-out ───────
+# The single exception to "no plaintext at rest on our servers", documented in
+# docs/E2EE_ARCHITECTURE.md. Publishing the implementation is the point: the
+# bounds we claim for it (opt-in, Redis-only, short TTL, tenant-scoped key,
+# deleted on pickup) are only verifiable if the store itself is readable.
+client/services/pendingReplyService.ts
+server/services/pendingReplyStore.js
+
+# ── Harbor (hosted agents) — the attested-TEE carve-out ──────────────────────
+# The other exception: a Harbor agent's plaintext IS processed on our
+# infrastructure, inside an AMD SEV-SNP confidential VM. The whole claim rests on
+# attestation, so the verifier is the thing worth reading — especially the
+# client-side chain check, which is what makes the verdict mean something against
+# a malicious or compromised server rather than trusting a boolean we send.
+client/services/harborAttestation.ts
+client/services/harborChainVerify.ts
+server/routes/harbor.js
+server/services/harborHostSevSnp.js
+server/services/harborOrchestrator/attest.js

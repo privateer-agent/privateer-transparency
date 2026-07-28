@@ -44,12 +44,16 @@ const UserStoragePrefs = require('../models/userStoragePrefsModel');
 
 const OPENROUTER_BASE = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
 
-// Whisper Large v3, not `openai/whisper-1`: only the former has a ZDR endpoint.
-// requireZdr defaults ON, which puts the request on the ZDR key, and that key
-// 404s whisper-1 with "No endpoints available matching your guardrail
-// restrictions and data policy" (measured 2026-07-27 — v3 and v3-turbo both
-// transcribe fine on the same key).
-const DEFAULT_STT_MODEL = process.env.DEFAULT_STT_MODEL || 'openai/whisper-large-v3';
+// Whisper Large v3 *turbo*, not `openai/whisper-1`: only the Large v3 family has
+// a ZDR endpoint. requireZdr defaults ON, which puts the request on the ZDR key,
+// and that key 404s whisper-1 with "No endpoints available matching your
+// guardrail restrictions and data policy" (measured 2026-07-27).
+//
+// Turbo over plain v3 because transcription sits directly in the voice loop's
+// critical path and the two are otherwise interchangeable: same family, same
+// ZDR posture, same transcript on our test clip — but 342ms vs 1453ms measured
+// 2026-07-28. Over a second of every spoken turn, for free.
+const DEFAULT_STT_MODEL = process.env.DEFAULT_STT_MODEL || 'openai/whisper-large-v3-turbo';
 // Default to a confidential-compute voice: Qwen3 TTS runs in a Tinfoil enclave
 // (AMD SEV-SNP + confidential GPU) with a fetchable attestation, so spoken text
 // is processed somewhere the operator can't read into — a strictly stronger
@@ -319,6 +323,80 @@ async function synthesizeSpeech({ userId, text, voice, format, modelId, requireZ
   return { buffer, mimeType, model };
 }
 
+/**
+ * Same synthesis, but hand back the provider's response unread so the caller can
+ * pipe bytes through as they arrive → { response, mimeType, model, generationId,
+ * settle }. Throws {statusCode,code} exactly like synthesizeSpeech.
+ *
+ * Why a second entry point rather than a flag: `synthesizeSpeech` is defined by
+ * what it does *after* the response — buffers it, wraps raw PCM into a WAV
+ * container, and returns finished bytes. None of that is possible on a stream.
+ * The PCM wrap in particular needs the total length for the RIFF header, which
+ * is unknown until the last byte, so this path serves mp3 only and refuses
+ * pcm-only models (the caller falls back to the buffered endpoint).
+ *
+ * Billing can't be settled inline either — the cost lands on the generation
+ * record after the stream ends — so the caller invokes `settle()` once it has
+ * finished piping.
+ */
+async function synthesizeSpeechStream({ userId, text, voice, format, modelId, requireZdr = true, billingMarkup, origin = 'app' }) {
+  if (!text || typeof text !== 'string' || !text.trim()) {
+    throw Object.assign(new Error('text is required'), { statusCode: 400, code: 'TEXT_REQUIRED' });
+  }
+  const model = resolveAudioModel(modelId, DEFAULT_TTS_MODEL);
+  if (PCM_ONLY_TTS_MODEL.test(model)) {
+    // Not a failure — just not streamable. A distinct code so the client falls
+    // back to the buffered endpoint instead of surfacing an error.
+    throw Object.assign(new Error('model cannot stream'), { statusCode: 409, code: 'TTS_STREAM_UNSUPPORTED' });
+  }
+  const responseFormat = resolveResponseFormat(model, format);
+  const wireVoice = resolveVoice(voice, model);
+
+  let r;
+  let tinfoilCostUsd = null;
+  if (tinfoilService.isTinfoilModel(model)) {
+    const out = await tinfoilService.speechRequest({ text: text.slice(0, 8000), voice: wireVoice, responseFormat, modelId: model });
+    r = out.response;
+    tinfoilCostUsd = out.providerCostUsd;
+  } else {
+    r = await fetch(`${OPENROUTER_BASE}/audio/speech`, {
+      method: 'POST',
+      headers: { ...inferenceService.orHeaders(requireZdr), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, input: text.slice(0, 8000), voice: wireVoice, response_format: responseFormat }),
+    });
+  }
+  if (!r.ok) {
+    const errText = await r.text().catch(() => '');
+    logger.error('[audioService.speechStream] provider error', r.status, errText);
+    throw Object.assign(new Error('speech synthesis failed'), {
+      statusCode: 502, code: 'TTS_FAILED', upstreamStatus: r.status, upstreamDetail: errText.slice(0, 300),
+    });
+  }
+
+  const upstreamType = (r.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  // A provider that answered with PCM despite an mp3 request can't be streamed
+  // either — the client has no container to open. Rare, but it would otherwise
+  // send unplayable bytes and look like a decode bug.
+  if (!upstreamType.includes('mpeg') && !upstreamType.includes('mp3')) {
+    throw Object.assign(new Error('unstreamable content type'), {
+      statusCode: 409, code: 'TTS_STREAM_UNSUPPORTED', upstreamDetail: upstreamType,
+    });
+  }
+
+  const generationId = r.headers.get('x-generation-id');
+  const settle = () => {
+    if (tinfoilCostUsd !== null) {
+      chargeAudio(userId, tinfoilCostUsd, { model, kind: 'tts', markup: billingMarkup, origin }).catch(() => {});
+      return;
+    }
+    fetchGenerationCost(generationId, requireZdr)
+      .then(cost => chargeAudio(userId, cost, { model, kind: 'tts', markup: billingMarkup, origin }))
+      .catch(() => {});
+  };
+
+  return { response: r, mimeType: 'audio/mpeg', model, generationId, settle };
+}
+
 // ── Music generation (Lyria) ─────────────────────────────────────────────────
 //
 // Not a /audio/speech call. Lyria is exposed as a chat-completions model that
@@ -541,6 +619,7 @@ async function readMusicStream(response) {
 module.exports = {
   transcribe,
   synthesizeSpeech,
+  synthesizeSpeechStream,
   generateMusic,
   resolveMusicModel,
   musicCostEstimateUsd,
