@@ -38,6 +38,7 @@ const {
   ackBuild,
   planNodes,
   compactContext,
+  generateChatTitle,
   getPendingReply,
   ackPendingReply,
   getTokenStatus,
@@ -112,6 +113,11 @@ router.post('/plan', limitTextInput, checkCreditBalance(0), planNodes);
 // no concurrency slot, since this fires on a drag rather than on a send — it
 // must not consume the user's message quota.
 router.post('/compact', limitTextInput, checkCreditBalance(0), compactContext);
+
+// Name a new chat from its opening exchange (the side nav's chat list label).
+// Cheap-utility gating like /compact: it fires as a side effect of a send that
+// was already counted, so it must not consume the daily cap or a slot of its own.
+router.post('/title', limitTextInput, checkCreditBalance(0), generateChatTitle);
 
 // Generate or edit image based on intent
 router.post('/generate-or-edit-image', limitTextInput, requireCloudBackend(), requireDailyCap('imageGen'), checkCreditBalance(0), requireConcurrencySlot(), async (req, res) => {

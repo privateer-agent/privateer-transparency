@@ -33,7 +33,7 @@ interface Props {
  * inspection; full on-device cryptographic verification is a follow-up.
  */
 const AttestationSheet: React.FC<Props> = ({ visible, model, onClose }) => {
-  const { theme } = useTheme();
+  const { theme, ambientSurface, ambientAccent, ambientOnAccent } = useTheme();
   const { t } = useTranslation();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -72,7 +72,7 @@ const AttestationSheet: React.FC<Props> = ({ visible, model, onClose }) => {
     </View>
   );
 
-  const s = styles(theme);
+  const s = styles(theme, ambientSurface);
 
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
@@ -137,14 +137,14 @@ const AttestationSheet: React.FC<Props> = ({ visible, model, onClose }) => {
 
           {!attestation && (
             <TouchableOpacity
-              style={[s.primaryBtn, { backgroundColor: theme.primary, opacity: loading ? 0.6 : 1 }]}
+              style={[s.primaryBtn, { backgroundColor: ambientAccent, opacity: loading ? 0.6 : 1 }]}
               onPress={fetchReport}
               disabled={loading}
             >
               {loading ? (
-                <ActivityIndicator color="#fff" size="small" />
+                <ActivityIndicator color={ambientOnAccent} size="small" />
               ) : (
-                <Text style={s.primaryBtnText}>{t('attestation.viewReport')}</Text>
+                <Text style={[s.primaryBtnText, { color: ambientOnAccent }]}>{t('attestation.viewReport')}</Text>
               )}
             </TouchableOpacity>
           )}
@@ -154,7 +154,7 @@ const AttestationSheet: React.FC<Props> = ({ visible, model, onClose }) => {
               openExternal(model?.id.startsWith('tinfoil/') ? TINFOIL_VERIFY_DOCS : NEAR_VERIFY_DOCS)
             }
           >
-            <Text style={[s.link, { color: theme.primary }]}>{t('attestation.learnMore')}</Text>
+            <Text style={[s.link, { color: ambientAccent }]}>{t('attestation.learnMore')}</Text>
           </TouchableOpacity>
         </TouchableOpacity>
       </TouchableOpacity>
@@ -162,11 +162,11 @@ const AttestationSheet: React.FC<Props> = ({ visible, model, onClose }) => {
   );
 };
 
-const styles = (theme: any) =>
+const styles = (theme: any, ambientSurface: string) =>
   StyleSheet.create({
     backdrop: {
       flex: 1,
-      backgroundColor: 'rgba(0,0,0,0.5)',
+      backgroundColor: theme.overlay,
       justifyContent: 'center',
       alignItems: 'center',
       padding: 20,
@@ -176,7 +176,9 @@ const styles = (theme: any) =>
       maxWidth: 460,
       borderRadius: 16,
       padding: 18,
-      backgroundColor: theme.secondaryBackground,
+      // Ambient-tinted surface so the dialog sits in the chosen wash rather than
+      // reading as a flat neutral box over it. (`off` = the neutral theme value.)
+      backgroundColor: ambientSurface,
       borderWidth: StyleSheet.hairlineWidth,
       borderColor: theme.border,
     },
@@ -193,7 +195,7 @@ const styles = (theme: any) =>
     meta: { fontSize: 11, fontFamily: 'monospace' },
     error: { fontSize: 13, marginTop: 12 },
     primaryBtn: { marginTop: 16, borderRadius: 12, paddingVertical: 13, alignItems: 'center', justifyContent: 'center' },
-    primaryBtnText: { color: '#fff', fontSize: 15, fontWeight: '700' },
+    primaryBtnText: { fontSize: 15, fontWeight: '700' },
     link: { fontSize: 13, fontWeight: '600', textAlign: 'center', marginTop: 14 },
   });
 
