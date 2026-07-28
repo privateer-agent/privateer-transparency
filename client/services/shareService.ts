@@ -1,5 +1,5 @@
 /**
- * Share service — turns an E2EE chat/graph/cargo artifact into a public,
+ * Share service — turns an E2EE chat/graph/cargo/audio artifact into a public,
  * read-only snapshot.
  *
  * At share time we (the owner, holding the master key) decrypt the conversation,
@@ -36,19 +36,53 @@ import {
 const req = (endpoint: string, options: RequestInit = {}): Promise<Response> =>
   authService.makeAuthenticatedRequest(endpoint, options);
 
-export type ShareSourceType = 'chat' | 'graph' | 'cargo';
+export type ShareSourceType = 'chat' | 'graph' | 'cargo' | 'audio';
 export type ShareSourceBackend = 'cloud' | 'local';
+
+/** What produced a shared clip — the viewer labels speech and music apart. */
+export type ShareAudioKind = 'speech' | 'music';
+
+/**
+ * Audio only: everything a clip share needs, all of it already in the caller's
+ * hands (the Audio studio and the Library both hold a decrypted row when the
+ * share button is pressed).
+ *
+ * The handles fetch the *current* ciphertext: `signedUrl` + `encIv` for a cloud
+ * clip, or `storageRef` as an on-device file id when `backend` is `local`.
+ * Everything else is rendered by the viewer and is sealed under the share key —
+ * none of it is ever sent plaintext.
+ */
+export interface ShareAudio {
+  storageRef: string;
+  encIv?: string | null;
+  signedUrl?: string | null;
+  filename: string;
+  mimeType: string;
+  durationMs?: number | null;
+  /** The text that was spoken, or the description that made the track. */
+  prompt?: string | null;
+  kind?: ShareAudioKind;
+}
 
 export interface ShareSource {
   type: ShareSourceType;
+  /**
+   * Identifies the source to the server. Chat/graph/cargo pass the row id; an
+   * `audio` source passes the clip's **storageRef** instead — a Library audio
+   * row's id is positional for chat-attached clips (`<chatId>_<msg>_<file>`),
+   * so it is neither stable across an edit nor something ownership can be
+   * checked against. See shareSnapshotModel's `sourceId`.
+   */
   id: string;
   // Where the source lives. The UI knows this at share time; if omitted we
-  // resolve it. Only linear chats can be `local` (local graphs don't exist).
+  // resolve it. Only linear chats and audio clips can be `local`.
   backend?: ShareSourceBackend;
   // Cargo only: metadata the caller already holds (CargoScreen has the
   // decrypted row) — saves re-listing at share time. Ends up encrypted under
   // the share key; never sent plaintext.
   cargo?: { title: string; kind: CargoKind };
+  // Audio only — see ShareAudio.
+  audio?: ShareAudio;
 }
 
 interface PresignSlot {
@@ -62,7 +96,7 @@ interface PresignSlot {
 // sources instead carry an on-device `localFileId` whose bytes are read (already
 // decrypted) via the local storage service — no signed URL / master-key IV.
 interface PendingAsset {
-  kind: 'image' | 'video';
+  kind: 'image' | 'video' | 'audio';
   signedUrl?: string;
   encIv?: string;
   localFileId?: string;
@@ -77,7 +111,7 @@ interface PendingAsset {
 }
 
 interface AssetRef {
-  kind: 'image' | 'video';
+  kind: 'image' | 'video' | 'audio';
   s3Key: string;
   encIv: string;
   mimeType: string | null;
@@ -118,14 +152,23 @@ export function buildShareUrl(token: string, shareKey: Uint8Array): string {
  * "copy existing link" vs "create". Returns the token, or null.
  */
 export async function getExistingShare(source: ShareSource): Promise<string | null> {
-  const response = await req(`/api/share/source/${source.id}`);
+  const response = await req(sourceLookupPath(source.id));
   if (!response.ok) return null;
   const data = await response.json().catch(() => ({}));
   return data?.token || null;
 }
 
 /**
- * Create or refresh a public snapshot for a chat/graph/cargo artifact and
+ * Owner-scoped lookup by source id. Always the query form: an audio share's id
+ * is an S3 key, and a path segment can't carry its slashes — `%2F` is decoded
+ * (or rejected) inconsistently across Express and the proxies in front of it.
+ */
+function sourceLookupPath(sourceId: string): string {
+  return `/api/share/source?sourceId=${encodeURIComponent(sourceId)}`;
+}
+
+/**
+ * Create or refresh a public snapshot for a chat/graph/cargo/audio source and
  * return the full share URL (with the share key in the #fragment). Requires
  * the master key.
  */
@@ -144,7 +187,7 @@ export async function createOrUpdateShare(source: ShareSource): Promise<string> 
   const backend: ShareSourceBackend =
     source.type === 'graph'
       ? 'cloud'
-      : source.type === 'cargo'
+      : source.type === 'cargo' || source.type === 'audio'
         ? source.backend ?? 'cloud'
         : source.backend ?? ((await resolveChatBackend(source.id)) === 'local' ? 'local' : 'cloud');
 
@@ -153,9 +196,11 @@ export async function createOrUpdateShare(source: ShareSource): Promise<string> 
       ? await buildGraphSnapshot(source.id, shareKey)
       : source.type === 'cargo'
         ? await buildCargoSnapshot(source, shareKey)
-        : backend === 'local'
-          ? await buildLocalChatSnapshot(source.id, shareKey)
-          : await buildChatSnapshot(source.id, shareKey);
+        : source.type === 'audio'
+          ? buildAudioSnapshot(source, shareKey, backend)
+          : backend === 'local'
+            ? await buildLocalChatSnapshot(source.id, shareKey)
+            : await buildChatSnapshot(source.id, shareKey);
 
   // 1) Reserve a token + presigned upload slots for the media.
   const presign = await postJson('/api/share/assets/presign', {
@@ -199,6 +244,11 @@ export async function createOrUpdateShare(source: ShareSource): Promise<string> 
     edges: built.edges,
     entryNodeIds: built.entryNodeIds,
     cargo: built.cargo ?? null,
+    // The clip's bytes are one of the uploaded assets; its ref only resolves
+    // (s3Key + IV) after the upload loop above, which is why it's read here.
+    audio: built.audio
+      ? { encryptedMeta: built.audio.encryptedMeta, asset: { s3Key: built.audio.asset.s3Key, encIv: built.audio.asset.encIv } }
+      : null,
   });
 
   return buildShareUrl(token, shareKey);
@@ -215,7 +265,7 @@ export async function createOrUpdateShare(source: ShareSource): Promise<string> 
  */
 async function resolveShareKey(source: ShareSource, masterKey: Uint8Array): Promise<Uint8Array> {
   try {
-    const response = await req(`/api/share/source/${encodeURIComponent(source.id)}`);
+    const response = await req(sourceLookupPath(source.id));
     if (response.ok) {
       const data = await response.json().catch(() => ({}));
       if (data?.token && typeof data?.wrappedShareKey === 'string' && data.wrappedShareKey) {
@@ -240,7 +290,7 @@ export async function revokeShare(token: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export interface PublicAsset {
-  kind: 'image' | 'video';
+  kind: 'image' | 'video' | 'audio';
   encIv: string;
   mimeType: string | null;
   fileName: string | null;
@@ -282,6 +332,18 @@ export interface PublicSnapshot {
   // Cargo artifact: {iv,ct} blobs under the share key. encryptedMeta decrypts
   // to JSON {title, kind}.
   cargo?: { encryptedMeta: string; encryptedContent: string } | null;
+  // Audio clip: the re-encrypted bytes (asset) plus {iv,ct} of JSON
+  // {filename, mimeType, durationMs, kind, prompt}.
+  audio?: { encryptedMeta: string; asset: PublicAsset | null } | null;
+}
+
+/** The decrypted shape of a shared clip's `encryptedMeta`. */
+export interface PublicAudioMeta {
+  filename: string;
+  mimeType: string;
+  durationMs: number | null;
+  kind: ShareAudioKind;
+  prompt: string | null;
 }
 
 /** Fetch a public snapshot by token. No auth — used by PublicShareScreen. */
@@ -304,6 +366,7 @@ interface BuiltSnapshot {
   edges: any[];
   entryNodeIds: string[];
   cargo?: { encryptedMeta: string; encryptedContent: string } | null;
+  audio?: { encryptedMeta: string; asset: AssetRef } | null;
   // Flat list of media to upload; the message/node attachment entries hold
   // references into this list (filled with s3Key/newIv after upload).
   assets: PendingAsset[];
@@ -544,6 +607,60 @@ async function buildCargoSnapshot(source: ShareSource, shareKey: Uint8Array): Pr
     edges: [],
     entryNodeIds: [],
     assets: [],
+  };
+}
+
+/**
+ * Build a snapshot for one audio clip — the bytes plus a small metadata blob.
+ *
+ * Nothing is read here: the caller already holds the row, so this only stages
+ * the fetch handles as a PendingAsset (the same shape images and videos use, so
+ * the upload loop and reencryptBinary work unchanged) and seals the metadata.
+ * The name, the prompt, the mime and the length all live inside encryptedMeta —
+ * the server sees an opaque object key and an IV, exactly as it does for a
+ * shared image.
+ *
+ * A local clip's `storageRef` is an on-device file id whose bytes come back
+ * already decrypted; a cloud clip is fetched from its signed URL and opened with
+ * the master key first.
+ */
+function buildAudioSnapshot(
+  source: ShareSource,
+  shareKey: Uint8Array,
+  backend: ShareSourceBackend,
+): BuiltSnapshot {
+  const clip = source.audio;
+  if (!clip) throw new Error('Nothing to share — this clip has no audio.');
+  if (backend === 'cloud' && (!clip.signedUrl || !clip.encIv)) {
+    // Signed URLs expire, so a stale row can reach here with nothing to fetch.
+    // A cloud clip with no IV is a legacy unencrypted object — the other
+    // builders skip those; a one-clip share has nothing left to make.
+    throw new Error('Reopen this clip and try sharing again.');
+  }
+
+  const asset: PendingAsset = backend === 'local'
+    ? { kind: 'audio', localFileId: clip.storageRef, mimeType: clip.mimeType, fileName: null }
+    : { kind: 'audio', signedUrl: clip.signedUrl!, encIv: clip.encIv || undefined, mimeType: clip.mimeType, fileName: null };
+
+  const meta = {
+    filename: clip.filename || '',
+    mimeType: clip.mimeType || 'audio/mpeg',
+    durationMs: clip.durationMs ?? null,
+    kind: clip.kind || 'speech',
+    prompt: clip.prompt || null,
+  };
+
+  return {
+    encryptedTitle: encTitle(clip.filename, shareKey),
+    audio: {
+      encryptedMeta: encryptTextWithKey(JSON.stringify(meta), shareKey),
+      asset: refFor(asset),
+    },
+    messages: [],
+    nodes: [],
+    edges: [],
+    entryNodeIds: [],
+    assets: [asset],
   };
 }
 

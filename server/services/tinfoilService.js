@@ -105,7 +105,7 @@ function asProviderError(message, modelId, extra = {}) {
 
 // Assemble OpenAI-style messages from the inferenceService `parts` + options.
 // Tinfoil enclave models are text-first; we still handle inline images for the
-// vision-capable models (Kimi, Gemma), but skip pdf/audio/video (not offered
+// vision-capable models (Gemma), but skip pdf/audio/video (not offered
 // on chat/completions).
 function buildMessages(parts, options) {
   const { withNoTables } = shared();

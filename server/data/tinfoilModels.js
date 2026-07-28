@@ -65,6 +65,13 @@ function tinfoilBase() {
 // The catalog only exposes slugs (`gpt-oss-120b`); pretty labels + one-line
 // descriptions come from Tinfoil's model docs. Unknown slugs fall back to a
 // title-cased slug so new upstream models still render acceptably.
+//
+// Entries for slugs Tinfoil no longer serves are kept, not deleted: this map is
+// pure metadata (a delisted slug simply never comes back from /v1/models), and
+// keeping it means a re-listing renders with its real name instead of a
+// title-cased slug. Delisted as of 2026-07-28: `kimi-k2-6`, `deepseek-v4-pro`,
+// `qwen3-vl-30b`. A delisted id a user may have *persisted* is a different
+// problem — that heals in inferenceService.RETIRED_MODEL_ALIASES.
 const MODEL_INFO = {
   'deepseek-v4-pro':        { name: 'DeepSeek V4 Pro',        description: 'Long-context reasoning, coding, math, and agentic tasks.' },
   'glm-5-2':                { name: 'GLM 5.2',                 description: 'Agentic engineering, long-horizon tool use, sustained reasoning.' },

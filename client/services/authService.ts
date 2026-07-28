@@ -22,6 +22,7 @@ import { syncOutboxPublicKey, resetOutboxKeyState } from './outboxKeyService';
 import { clearOutboxResults } from './outboxService';
 import { clearAccountModelsCache } from './accountModelsService';
 import { clearTrustedTerminalKeys } from './terminalTrustService';
+import { clearCargoContentCache } from './internal/cargoContentCache';
 import { Sentry } from './sentryService';
 import { sessionDeviceMeta } from '../utils/sessionDevice';
 
@@ -348,6 +349,7 @@ class AuthService {
       secureKv.removeItem('user'),
     ]);
     await clearSessionKeyState();
+    clearCargoContentCache();
     this.accessToken = null;
     this.refreshToken = null;
     this.user = null;
@@ -388,6 +390,9 @@ class AuthService {
     // Drop pinned terminal keys — they belong to this account's terminals; a
     // different account signing in on this device must not inherit their trust.
     void clearTrustedTerminalKeys();
+    // Decrypted artifact content held for the preview path — same rule as the
+    // outbox results above: plaintext must not survive sign-out.
+    clearCargoContentCache();
   }
 
   // ---------------------------------------------------------------------------

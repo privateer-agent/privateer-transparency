@@ -276,6 +276,7 @@ export async function clearAllKeyMaterial(): Promise<void> {
     secureKv.removeItem(`${p}/preferred_model_id`),
     secureKv.removeItem(`${p}/preferred_model_name`),
     secureKv.removeItem(`${p}/recent_model_ids`),
+    secureKv.removeItem(`${p}/favorite_model_ids`),
     secureKv.removeItem(`${p}/vision_model_id`),
     secureKv.removeItem(`${p}/vision_model_name`),
     secureKv.removeItem(`${p}/image_gen_model_id`),

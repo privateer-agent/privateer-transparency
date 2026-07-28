@@ -23,8 +23,8 @@
 const mongoose = require('mongoose');
 
 /**
- * ShareSnapshot — a public, read-only, point-in-time copy of a chat, graph, or
- * cargo artifact.
+ * ShareSnapshot — a public, read-only, point-in-time copy of a chat, graph,
+ * cargo artifact, or audio clip.
  *
  * E2EE is preserved: at share time the client re-encrypts the conversation
  * under a fresh 32-byte *share key* (separate from the account master key) and
@@ -45,7 +45,7 @@ const mongoose = require('mongoose');
 // bytes are AES-256-GCM ciphertext under the share key; `encIv` is that IV.
 const assetRefSchema = new mongoose.Schema(
   {
-    kind: { type: String, enum: ['image', 'video'], required: true },
+    kind: { type: String, enum: ['image', 'video', 'audio'], required: true },
     s3Key: { type: String, required: true },
     encIv: { type: String, required: true },
     mimeType: { type: String, default: null },
@@ -76,16 +76,20 @@ const shareSnapshotSchema = new mongoose.Schema(
 
     ownerUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
 
-    sourceType: { type: String, enum: ['chat', 'graph', 'cargo'], required: true },
+    sourceType: { type: String, enum: ['chat', 'graph', 'cargo', 'audio'], required: true },
     // Where the original chat/graph lives. `cloud` sources exist in our DB (and
     // ownership is verified against it); `local` sources live only on the user's
     // device — the owner uploads their own re-encrypted snapshot, so there is no
     // server-side record to verify against.
     sourceBackend: { type: String, enum: ['cloud', 'local'], default: 'cloud' },
-    // Original Chat / ChatGraph id — lets the owner find an existing share to
-    // re-copy/update or to show "already shared" state. Unique per owner+source.
-    // Stored as a string so it covers both cloud ObjectId hex (24 chars) and
-    // local on-device ids (32 hex chars, which are NOT valid ObjectIds).
+    // Original Chat / ChatGraph / Cargo id — lets the owner find an existing
+    // share to re-copy/update or to show "already shared" state. Unique per
+    // owner+source. Stored as a string so it covers both cloud ObjectId hex (24
+    // chars) and local on-device ids (32 hex chars, which are NOT valid
+    // ObjectIds). For `audio` it is the clip's `storageRef` (an S3 key, or a
+    // local file id) rather than a row id: a chat-attached clip's Library row id
+    // is positional (`<chatId>_<msgIdx>_<fileIdx>`) and so is neither stable nor
+    // ownership-checkable, while storageRef is both.
     sourceId: { type: String, required: true, index: true },
 
     // Share key wrapped under the owner master key. Owner-only, never public.
@@ -136,6 +140,21 @@ const shareSnapshotSchema = new mongoose.Schema(
         {
           encryptedMeta: { type: String, required: true },
           encryptedContent: { type: String, required: true },
+        },
+        { _id: false }
+      ),
+      default: null,
+    },
+
+    // Audio snapshot: one re-encrypted clip plus a metadata blob. encryptedMeta
+    // is {iv,ct} of JSON {filename, mimeType, durationMs, kind, prompt} — the
+    // name, the prompt that produced it and the length all stay inside the
+    // ciphertext, so the server holds nothing but an opaque object key.
+    audio: {
+      type: new mongoose.Schema(
+        {
+          encryptedMeta: { type: String, required: true },
+          asset: { type: assetRefSchema, required: true },
         },
         { _id: false }
       ),

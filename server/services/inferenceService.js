@@ -602,18 +602,32 @@ async function openRouterChat(messages, modelId, options = {}) {
 
 // ── Validate model ───────────────────────────────────────────────────────────
 
-// Retired OpenRouter slugs → their GA replacement.
+// Retired slugs → their replacement.
 //
-// A `-preview` alias stays listed in /models after the GA id ships, but its
-// endpoints get deranked to status -5 (dead). That is invisible to us on the
-// happy path *except* for ZDR: applyZdrRouting pins `provider.zdr: true` for
+// A `-preview` alias stays listed in OpenRouter's /models after the GA id ships,
+// but its endpoints get deranked to status -5 (dead). That is invisible to us on
+// the happy path *except* for ZDR: applyZdrRouting pins `provider.zdr: true` for
 // any ZDR-eligible model, which excludes the one still-healthy non-ZDR endpoint
 // (Google AI Studio) and leaves only the dead Vertex one — so the request 404s
 // with `Publisher model ... was not found or your project does not have access`.
 // Rewriting here (rather than only at the call sites) also heals the id already
-// persisted in UserStoragePrefs.preferredImageGenModelId.
+// persisted in UserStoragePrefs.preferredModelId / preferredVisionModelId /
+// preferredImageGenModelId.
 const RETIRED_MODEL_ALIASES = {
   'google/gemini-3.1-flash-image-preview': 'google/gemini-3.1-flash-image',
+  // Tinfoil is deprecating Kimi K2.6: it's gone from /v1/models as of
+  // 2026-07-28, but /v1/chat/completions still answers on it — delisted first,
+  // switched off later, with no announced date. So this alias is defensive: the
+  // picker (catalog-driven) can no longer offer the id, and a persisted pref
+  // that still works today would start 404ing without warning.
+  //
+  // Gemma 4 31B is the replacement because it's the only Tinfoil model left
+  // with image input — the one substitution that keeps BOTH properties this
+  // pick implied: confidential compute and vision. Tinfoil serves no Kimi K3
+  // (every plausible slug 404s on the enclave; K3's open weights only landed
+  // 2026-07-27), so there is no in-family upgrade to point at. If a Kimi lands
+  // on the enclave fleet later, retarget this line.
+  'tinfoil/kimi-k2-6': 'tinfoil/gemma4-31b',
 };
 
 /**
@@ -683,7 +697,7 @@ const IMAGE_MODEL_CACHE_MS = 5 * 60 * 1000;
 
 async function isImageInputModel(modelId) {
   if (!modelId || typeof modelId !== 'string') return false;
-  // NEAR/Tinfoil vision models (Qwen-VL, Gemma, Kimi…) aren't in OpenRouter's
+  // NEAR/Tinfoil vision models (Qwen-VL, Gemma…) aren't in OpenRouter's
   // catalog, so the lookup below would miss them and silently substitute an
   // OpenRouter vision model — breaking the confidential guarantee. Honor the
   // provider's own catalog instead.

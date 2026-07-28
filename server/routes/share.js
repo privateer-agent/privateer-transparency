@@ -27,7 +27,8 @@
  *
  *   POST   /api/share/assets/presign  → (auth) presigned S3 PUT URLs for media
  *   POST   /api/share                 → (auth) create/update a snapshot
- *   GET    /api/share/source/:sourceId→ (auth) existing share token for a source
+ *   GET    /api/share/source?sourceId=→ (auth) existing share token for a source
+ *   GET    /api/share/source/:sourceId→ (auth) same, path form (older clients)
  *   GET    /api/share/:token          → (public) fetch a snapshot to render
  *   DELETE /api/share/:token          → (auth) revoke + purge media
  *
@@ -54,22 +55,25 @@ const ShareSnapshot = require('../models/shareSnapshotModel');
 const Chat = require('../models/chatModel');
 const ChatGraph = require('../models/chatGraphModel');
 const Cargo = require('../models/cargoModel');
+const LibraryAudio = require('../models/libraryAudioModel');
 
 const { validateCargoPayload } = require('../utils/shareCargoValidation');
+const { validateAudioPayload } = require('../utils/shareAudioValidation');
 
 const MAX_ASSETS = 200;
 const SHARE_ASSET_CONTENT_TYPE = 'application/octet-stream';
-const SHARE_SOURCE_TYPES = ['chat', 'graph', 'cargo'];
+const SHARE_SOURCE_TYPES = ['chat', 'graph', 'cargo', 'audio'];
 
 function newToken() {
   return crypto.randomBytes(16).toString('base64url');
 }
 
-// Verify the authenticated user owns the chat/graph/cargo being shared. Local sources
+// Verify the authenticated user owns the chat/graph/cargo/clip being shared. Local sources
 // live only on the owner's device — there's nothing to verify against, and
 // ownership is implicit (the snapshot is keyed to req.user), so allow them.
 async function assertOwnsSource(userId, sourceType, sourceId, sourceBackend) {
   if (sourceBackend === 'local') return true;
+  if (sourceType === 'audio') return assertOwnsAudio(userId, sourceId);
   if (sourceType === 'chat') {
     const chat = await Chat.findOne({ _id: sourceId, userId }).select('_id').lean();
     return !!chat;
@@ -83,6 +87,28 @@ async function assertOwnsSource(userId, sourceType, sourceId, sourceBackend) {
     return !!cargo;
   }
   return false;
+}
+
+/**
+ * Ownership for an audio clip. `sourceId` is the clip's `storageRef`, not a row
+ * id — the same handle libraryDeletion.deleteFile keys on, and for the same
+ * reason: a chat-attached clip's Library row id is positional
+ * (`<chatId>_<msgIdx>_<fileIdx>`), so it neither survives an edit to the
+ * conversation nor proves anything about who owns the bytes.
+ *
+ * A clip has exactly one home — a LibraryAudio row (Audio studio) or a chat
+ * message's fileAttachments (audio that arrived in a conversation) — so the two
+ * lookups are a fall-through, not a tiebreak.
+ */
+async function assertOwnsAudio(userId, storageRef) {
+  if (!storageRef || typeof storageRef !== 'string') return false;
+  const clip = await LibraryAudio.findOne({ userId, storageRef, deleted: { $ne: true } })
+    .select('_id').lean();
+  if (clip) return true;
+  const chat = await Chat.findOne({
+    userId, isActive: true, 'messages.fileAttachments.storageRef': storageRef,
+  }).select('_id').lean();
+  return !!chat;
 }
 
 // ── POST /api/share/assets/presign ───────────────────────────────────────────
@@ -157,6 +183,7 @@ router.post('/', authenticate, async (req, res) => {
       edges = [],
       entryNodeIds = [],
       cargo = null,
+      audio = null,
     } = req.body || {};
 
     if (!token || !SHARE_SOURCE_TYPES.includes(sourceType) || typeof sourceId !== 'string' || !sourceId || !wrappedShareKey) {
@@ -164,6 +191,10 @@ router.post('/', authenticate, async (req, res) => {
     }
     if (sourceType === 'cargo') {
       const invalid = validateCargoPayload(cargo);
+      if (invalid) return res.status(invalid.status).json({ message: invalid.message });
+    }
+    if (sourceType === 'audio') {
+      const invalid = validateAudioPayload(audio, token);
       if (invalid) return res.status(invalid.status).json({ message: invalid.message });
     }
     if (!['cloud', 'local'].includes(sourceBackend)) {
@@ -189,6 +220,24 @@ router.post('/', authenticate, async (req, res) => {
     snapshot.cargo = sourceType === 'cargo'
       ? { encryptedMeta: cargo.encryptedMeta, encryptedContent: cargo.encryptedContent }
       : null;
+    snapshot.audio = sourceType === 'audio'
+      ? {
+          encryptedMeta: audio.encryptedMeta,
+          // Name, mime and length all ride inside encryptedMeta — the plaintext
+          // asset fields the image/video shape carries are left null rather
+          // than duplicated, so the server holds only an opaque key + IV.
+          asset: {
+            kind: 'audio',
+            s3Key: audio.asset.s3Key,
+            encIv: audio.asset.encIv,
+            mimeType: null,
+            fileName: null,
+            width: null,
+            height: null,
+            durationMs: null,
+          },
+        }
+      : null;
     snapshot.revokedAt = null;
     await snapshot.save();
 
@@ -199,17 +248,26 @@ router.post('/', authenticate, async (req, res) => {
   }
 });
 
-// ── GET /api/share/source/:sourceId ──────────────────────────────────────────
+// ── GET /api/share/source ────────────────────────────────────────────────────
 // Owner-scoped lookup so the share sheet can show "copy existing link".
 // wrappedShareKey (share key sealed under the owner's master key — useless
 // without it) lets the client reuse the same share key on re-share, so
 // previously distributed links keep decrypting. Owner-only route; the public
 // GET never returns it.
-router.get('/source/:sourceId', authenticate, async (req, res) => {
+//
+// Two forms, one handler. The query form is what the client uses: an audio
+// share's sourceId is an S3 key, and a path segment can't carry the slashes
+// (proxies and Express disagree about whether %2F stays encoded). The path form
+// stays for clients shipped before the query form existed.
+async function lookupBySourceId(req, res) {
   try {
+    const sourceId = req.params.sourceId ?? req.query.sourceId;
+    if (typeof sourceId !== 'string' || !sourceId) {
+      return res.status(400).json({ message: 'sourceId is required' });
+    }
     const snapshot = await ShareSnapshot.findOne({
       ownerUserId: req.user._id,
-      sourceId: req.params.sourceId,
+      sourceId,
     }).lean();
     if (!snapshot || snapshot.revokedAt) return res.json({ token: null });
     res.json({ token: snapshot.token, wrappedShareKey: snapshot.wrappedShareKey || null });
@@ -217,7 +275,10 @@ router.get('/source/:sourceId', authenticate, async (req, res) => {
     logger.error('[share/source] error:', err);
     res.status(500).json({ message: 'Failed to look up share' });
   }
-});
+}
+
+router.get('/source', authenticate, lookupBySourceId);
+router.get('/source/:sourceId', authenticate, lookupBySourceId);
 
 // ── GET /api/share/:token ─────────────────────────────────────────────────────
 // Public, unauthenticated. Returns the ciphertext snapshot plus short-lived
@@ -274,6 +335,11 @@ router.get('/:token', publicShareViewLimiter, async (req, res) => {
     } else if (snapshot.sourceType === 'cargo') {
       out.cargo = snapshot.cargo
         ? { encryptedMeta: snapshot.cargo.encryptedMeta, encryptedContent: snapshot.cargo.encryptedContent }
+        : null;
+    } else if (snapshot.sourceType === 'audio') {
+      const [asset] = snapshot.audio ? await signAssets([snapshot.audio.asset]) : [];
+      out.audio = snapshot.audio
+        ? { encryptedMeta: snapshot.audio.encryptedMeta, asset: asset || null }
         : null;
     } else {
       out.nodes = await Promise.all(
