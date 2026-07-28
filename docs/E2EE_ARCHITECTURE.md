@@ -8,8 +8,9 @@
 
 Privateer is end-to-end encrypted: the server stores ciphertext only, and the
 encryption key never leaves the user's device. Even a full server compromise
-yields no readable user content. (One gated, opt-in exception is forthcoming —
-see **Harbor** below; it is not live today, so this statement holds as written.)
+yields no readable user content. (Two opt-in exceptions scope this: **Harbor**
+hosted agents, which are **live** and process content inside an attested enclave on
+our infrastructure, and **"Finish replies in the cloud"** — both below.)
 
 What this protects against:
 - Server compromise (DB dump, S3 access, server-side code execution).
@@ -31,11 +32,11 @@ What this does **not** protect against:
   (app killed mid-stream) is held briefly in plaintext in our Redis so it can be
   recovered on reopen. This one ships **today**, unlike Harbor.
 
-### Harbor (hosted agents) — a gated carve-out, opt-in, not yet live
+### Harbor (hosted agents) — a gated carve-out, opt-in, LIVE
 
 The guarantees above describe the shipped app and the **on-device** CLI/desktop,
 where user content is only ever ciphertext on our servers. **Harbor** (hosted
-agents, Navigator+ — `docs/HARBOR_HOSTED_RUNTIME.md`) is a forthcoming opt-in
+agents, Navigator+ — `docs/HARBOR_HOSTED_RUNTIME.md`) is an opt-in
 where the same `privateer-agent` runs on **Privateer infrastructure** instead of
 the user's own machine. There, and only there:
 
@@ -50,13 +51,45 @@ the user's own machine. There, and only there:
   This stays on the risk register.
 - Frame honestly (matches the honesty stance in `CLAUDE.md §5`): claim only
   "we can't read *into* the attested enclave," **never** "we can't *process* it."
+- **Web access sends the query back out (on by default, per-agent switch).** A hosted
+  agent starts in an empty workspace with no reach into the user's machine and no
+  connectors, so without the live web the commonest unattended request — "summarize
+  the news every evening" — could only answer from the model's stale memory. Its
+  `web_search` / `web_fetch` tools therefore call **our own** `/api/rag/search` and
+  `/api/rag/links` with the agent's minted account credential
+  (`privateer-agent/src/tools/web.ts`). That choice is deliberate on both counts:
+  - **No provider API key is ever seeded into a tenant container.** A routine runs
+    under an auto-approve gate on prompt text we didn't write; a search key sitting in
+    that environment is a key a prompt-injected run can read out. Routing through the
+    account API means the only secret in the enclave is the user's own session token.
+  - **The derived query leaves the enclave**, and our servers (and the search
+    provider) can read it. The run's prompt and its result do not. This is the same
+    residual metadata leak already disclosed for Sealed mode (`server/routes/rag.js`
+    header, `docs/SEALED_MODE_CLIENT_PIPELINE.md` §3c) — **not** a new plaintext-at-rest
+    carve-out: nothing is persisted, and the reply is still sealed to the E2EE outbox.
 
-**Status (2026-07): waitlist / stub — no agent runs on our infrastructure yet**,
-so the absolute "ciphertext only / full-server-compromise-reveals-nothing"
-statement at the top of this section still holds today. Before the hosted runtime
-ships, this carve-out, `CLAUDE.md §5`, and the App-Review copy flip **together**
-at go-live — the Step 5 honesty gate. The prepared, not-yet-applied reconciliation
-package is `docs/HARBOR_TRANSPARENCY_AND_APPREVIEW_DRAFT.md`.
+  Because it is an egress the enclave promise doesn't cover, it is a switch
+  (`HostedAgent.webAccess` → `HARBOR_WEB` in the tenant env) surfaced on the agent card
+  with the disclosure attached, and it is re-stated in the routine editor whenever a
+  drafted routine will actually use it (`routineIssues.webOn`). Never describe a
+  routine that searches the web as private end-to-end.
+
+**Status (2026-07-28): LIVE.** Production runs `HARBOR_HOST_BACKEND=sevsnp` — set as
+a Render dashboard variable, so it appears in neither `render.yaml` nor
+`server/config.env`, and the repo alone reads as `stub` when it is not. Do not infer
+the backend from the repo.
+
+Consequently the absolute "ciphertext only / full-server-compromise-reveals-nothing"
+statement at the top of this section describes the **on-device** paths and the
+**non-Harbor** app; for an enabled Harbor agent, user content is processed on our
+infrastructure inside the attested enclave, by design. The Step 5 honesty gate — this
+carve-out, `CLAUDE.md §5`, and the App-Review copy — was meant to flip in lockstep
+with that backend change; the backend moved first, so the copy was reconciled after
+the fact on 2026-07-28 from `docs/HARBOR_TRANSPARENCY_AND_APPREVIEW_DRAFT.md`
+(Edits A/B/C-REVISED, now applied to `docs/APP_REVIEW_REPLY.md` and
+`docs/APP_REVIEW_REJECTION_2026-07-09.md`). **Resubmitting that messaging to App
+Review is still open**, as is Gate 2 (publishing the image + verifiers to the
+transparency mirror, which requires a genuinely reproducible measurement).
 
 ### "Finish replies in the cloud" — a gated carve-out, opt-in, live today
 
