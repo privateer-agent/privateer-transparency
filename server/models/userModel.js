@@ -28,13 +28,22 @@ const Subscription = require('./subscriptionModel');
 // (matches the free plan's $0.50 monthly allowance).
 const SIGNUP_GRANT_USD = 0.50;
 
+/**
+ * Wallet accounts have neither an email address nor a password — the wallet is
+ * the credential (CLAUDE.md §1). Both identity fields count: `solanaPublicKey`
+ * alone was the whole test until multi-chain sign-in, and an eip155 account
+ * populates only walletAddress/walletChain, so checking the legacy field by
+ * itself rejects every EVM signup at validation.
+ */
+function requiredUnlessWallet() {
+  return !this.solanaPublicKey && !this.walletAddress;
+}
+
 const userSchema = new mongoose.Schema(
   {
     email: {
       type: String,
-      required: function() {
-        return !this.solanaPublicKey;
-      },
+      required: requiredUnlessWallet,
       unique: true,
       sparse: true,
       trim: true
@@ -45,9 +54,7 @@ const userSchema = new mongoose.Schema(
     },
     password: {
       type: String,
-      required: function() {
-        return !this.solanaPublicKey;
-      }
+      required: requiredUnlessWallet
     },
     role: {
       type: String,

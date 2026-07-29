@@ -90,6 +90,37 @@ export function walletChainLabel(
   return CHAINS[namespace as ChainNamespace]?.label ?? null;
 }
 
+/**
+ * The account's canonical address, whichever chain it is on. Falls back to the
+ * legacy field so pre-multi-chain Solana accounts still resolve.
+ */
+export function walletAddressOf(
+  user?: { walletAddress?: string | null; solanaPublicKey?: string | null } | null,
+): string | null {
+  return user?.walletAddress || user?.solanaPublicKey || null;
+}
+
+/**
+ * Truncated address for display — enough to recognize which account you are
+ * signed into, which is all any of these surfaces need.
+ *
+ * EVM keeps its `0x` prefix plus two bytes; that is the form every wallet UI
+ * shows, and dropping the prefix would make an Ethereum address read as some
+ * other kind of identifier. Base58 has no prefix to preserve, so it splits
+ * evenly.
+ */
+export function shortWalletAddress(
+  user?: { walletAddress?: string | null; solanaPublicKey?: string | null } | null,
+): string | null {
+  const address = walletAddressOf(user);
+  if (!address) return null;
+  const head = address.startsWith('0x') ? 6 : 4;
+  // Anything this short is already readable whole — truncating it would only
+  // lose characters without shortening the line.
+  if (address.length <= head + 5) return address;
+  return `${address.slice(0, head)}…${address.slice(-4)}`;
+}
+
 export function getChain(namespace: ChainNamespace): ChainDescriptor {
   const chain = CHAINS[namespace];
   if (!chain) throw new Error(`Unsupported wallet chain: ${namespace}`);
