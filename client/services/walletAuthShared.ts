@@ -27,13 +27,19 @@ import {
   generateMasterKey,
   deriveKekFromWalletSignature,
   getWalletKekMessage,
+  getWalletKekMessageV3,
   wrapMasterKey,
   unwrapMasterKey,
   clearMasterKeyAsync,
 } from './cryptoService';
+import { WalletAccount, ChainNamespace, getChain, chainScope } from './wallets/chains';
+import { buildAuthMessageText } from './wallets/authMessage';
 import authService, { VaultPayload } from './authService';
+import { assertDeterministicVaultSignature, WALLET_NON_DETERMINISTIC } from './walletDeterminism';
 import { Sentry } from './sentryService';
 import { sessionDeviceMeta } from '../utils/sessionDevice';
+
+export { WALLET_NON_DETERMINISTIC, WalletNonDeterministicError } from './walletDeterminism';
 
 const API_BASE = getServerUrl();
 
@@ -96,32 +102,68 @@ export interface WalletMessages {
   pubkeyHex: string;
   /** UTF-8 bytes of the nonce-bound auth message the server verifies. */
   authMessage: Uint8Array;
-  /** UTF-8 bytes of the deterministic v2 vault message whose signature → KEK. */
+  /** UTF-8 bytes of the deterministic vault message whose signature → KEK. */
   vaultMessage: Uint8Array;
 }
 
-/**
- * Build the two messages a wallet must sign, given its raw 32-byte Ed25519
- * public key. The auth message shows the address in base58 — the form users
- * recognize from their wallet/explorers — so the sign prompt is verifiable at a
- * glance; the server accepts either base58 or hex on the `Wallet:` line. The
- * vault message is version-locked v2 and stays hex.
- */
-export function buildWalletMessages(pubkeyBytes: Uint8Array, nonce: string): WalletMessages {
-  const pubkeyHex = toHex(pubkeyBytes);
-  const pubkeyBase58 = new PublicKey(pubkeyBytes).toBase58();
+/** Normalize a raw 32-byte Ed25519 public key into a Solana WalletAccount. */
+export function solanaAccount(pubkeyBytes: Uint8Array): WalletAccount {
+  return {
+    namespace: 'solana',
+    address: new PublicKey(pubkeyBytes).toBase58(),
+    idHex: toHex(pubkeyBytes),
+  };
+}
 
-  const authMessageText =
-    `Sign in to ${brand.name}\n` +
-    `Domain: ${brand.domain}\n` +
-    `Wallet: ${pubkeyBase58}\n` +
-    `Nonce: ${nonce}\n` +
-    `Issued: ${new Date().toISOString()}`;
+/**
+ * Same, from the lowercase hex form. Used by the desktop hand-off, where the
+ * browser page signs and only the hex identity comes back over the wire.
+ */
+export function solanaAccountFromHex(pubkeyHex: string): WalletAccount {
+  const bytes = new Uint8Array(pubkeyHex.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(pubkeyHex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return solanaAccount(bytes);
+}
+
+/**
+ * Build the two messages a wallet must sign.
+ *
+ * The auth message shows the address in its canonical form — base58 on Solana,
+ * EIP-55 hex on EVM — the form users recognize from their wallet and
+ * explorers, so the sign prompt is verifiable at a glance. The server
+ * normalizes whatever appears on the `Wallet:` line back to lowercase hex
+ * before binding it to the claimed identity.
+ *
+ * Chains other than Solana add a `Chain:` line. Solana's message keeps its
+ * original five lines forever: the server's parser pins that exact shape, and
+ * existing accounts + older clients must keep verifying against it.
+ */
+export function buildWalletMessages(account: WalletAccount, nonce: string): WalletMessages {
+  const chain = getChain(account.namespace);
+
+  const authText = buildAuthMessageText({
+    brandName: brand.name,
+    domain: brand.domain,
+    account,
+    nonce,
+    issuedIso: new Date().toISOString(),
+  });
+
+  // Solana signs the original bare-hex message, forever: it is what every
+  // existing wallet vault was derived from and there is no way back if it
+  // changes. Every other chain signs the namespace-scoped form, which is what
+  // keeps two secp256k1 chains that share an address derivation (Ethereum and
+  // Tron, say) from deriving one another's key.
+  const vaultText = account.namespace === 'solana'
+    ? getWalletKekMessage(account.idHex)
+    : getWalletKekMessageV3(chainScope(account));
 
   return {
-    pubkeyHex,
-    authMessage: new TextEncoder().encode(authMessageText),
-    vaultMessage: new TextEncoder().encode(getWalletKekMessage(pubkeyHex)),
+    pubkeyHex: account.idHex,
+    authMessage: new TextEncoder().encode(authText),
+    vaultMessage: new TextEncoder().encode(vaultText),
   };
 }
 
@@ -142,7 +184,7 @@ export async function fetchNonce(): Promise<{ nonce: string; nonceId: string }> 
 }
 
 async function verifyWithServer(
-  walletPubkeyHex: string,
+  account: WalletAccount,
   signature: Uint8Array,
   signedMessage: Uint8Array,
   nonceId: string,
@@ -152,7 +194,10 @@ async function verifyWithServer(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      walletPublicKey: walletPubkeyHex,
+      walletPublicKey: getChain(account.namespace).wireIdentity(account),
+      // Omitted for Solana so the request stays byte-identical to what older
+      // clients send; the server defaults an absent `chain` to solana.
+      ...(account.namespace === 'solana' ? {} : { chain: account.namespace }),
       signature: toHex(signature),
       signedMessage: toHex(signedMessage),
       nonceId,
@@ -180,7 +225,8 @@ async function verifyWithServer(
 // ---------------------------------------------------------------------------
 
 export interface CollectedSignatures {
-  pubkeyHex: string;
+  /** The connected account, including which chain it belongs to. */
+  account: WalletAccount;
   /** Signature over `authMessage`. */
   authSignature: Uint8Array;
   /** The exact auth-message bytes that were signed. */
@@ -188,6 +234,64 @@ export interface CollectedSignatures {
   /** Signature over the v2 vault message — its HKDF is the KEK. */
   vaultSignature: Uint8Array;
   nonceId: string;
+}
+
+export interface CompleteWalletLoginOptions {
+  /** Lift a pending 30-day deletion (see verifyWithServer). */
+  recover?: boolean;
+  /**
+   * Ask the *same* wallet account to sign the vault message once more.
+   *
+   * Called only when this sign-in is about to create the account's vault, so
+   * the enrollment signature can be checked for reproducibility before a master
+   * key exists to lose (see ./walletDeterminism). Established accounts never
+   * hit it, which is why the extra prompt is a once-per-account cost rather
+   * than a per-login one — and why it can't be collected up front alongside the
+   * other two signatures: whether we're enrolling is only known after the
+   * server responds.
+   *
+   * Implementations MUST re-sign with the account already in `sigs.account` —
+   * re-prompting a picker that lets the user switch accounts would compare two
+   * unrelated signatures and fail the honest wallet.
+   */
+  resignVault?: () => Promise<Uint8Array>;
+}
+
+/**
+ * Enrollment-only guard: the wallet must sign the vault message to the same
+ * bytes twice before we build an account around that signature. A wallet that
+ * fails this — MPC/threshold, smart-contract, passkey — would enroll happily
+ * and then be unable to unwrap on every later sign-in, which under Privateer's
+ * no-recovery rule is permanent data loss. See ./walletDeterminism.
+ *
+ * On any failure the freshly-minted session is torn down. An authenticated user
+ * with no vault cannot encrypt anything, so leaving them signed in would only
+ * move the failure somewhere harder to explain. This also covers the user
+ * simply dismissing the second prompt: nothing was created, so there is nothing
+ * to keep.
+ */
+async function assertWalletCanEnroll(
+  sigs: CollectedSignatures,
+  resignVault?: () => Promise<Uint8Array>,
+): Promise<void> {
+  if (!resignVault) {
+    // Every shipping transport supplies this; reaching here means a caller was
+    // added without one, and enrolling blind is the one thing we must not do.
+    await authService.logout().catch(() => { /* teardown is best-effort */ });
+    throw new Error('This app cannot set up a wallet vault yet. Please update to the latest version.');
+  }
+
+  try {
+    const second = await resignVault();
+    assertDeterministicVaultSignature(sigs.vaultSignature, second);
+  } catch (err) {
+    await authService.logout().catch(() => { /* teardown is best-effort */ });
+    if ((err as any)?.code === WALLET_NON_DETERMINISTIC) {
+      // Worth knowing how often real wallets trip this, and which ones.
+      Sentry.captureException(err, { level: 'warning', tags: { op: 'wallet_enroll_determinism' } });
+    }
+    throw err;
+  }
 }
 
 /**
@@ -198,10 +302,10 @@ export interface CollectedSignatures {
  */
 export async function completeWalletLogin(
   sigs: CollectedSignatures,
-  opts?: { recover?: boolean },
+  opts?: CompleteWalletLoginOptions,
 ): Promise<WalletAuthResult> {
   const result = await verifyWithServer(
-    sigs.pubkeyHex, sigs.authSignature, sigs.authMessage, sigs.nonceId, opts?.recover === true,
+    sigs.account, sigs.authSignature, sigs.authMessage, sigs.nonceId, opts?.recover === true,
   );
 
   // Sync auth state (tokens + user) into authService.
@@ -209,7 +313,10 @@ export async function completeWalletLogin(
 
   if (result.needsMasterKeySetup || !result.vault) {
     // First wallet sign-in for this account — generate a master key and enroll
-    // it, wrapped under the vault signature from this same session.
+    // it, wrapped under the vault signature from this same session. Before that
+    // key exists to be lost, prove the wallet signs reproducibly.
+    await assertWalletCanEnroll(sigs, opts?.resignVault);
+
     const kek = deriveKekFromWalletSignature(sigs.vaultSignature);
     const masterKey = generateMasterKey();
     const wrapped = wrapMasterKey(masterKey, kek);

@@ -81,3 +81,17 @@ client/services/harborChainVerify.ts
 server/routes/harbor.js
 server/services/harborHostSevSnp.js
 server/services/harborOrchestrator/attest.js
+
+# ── Multi-chain wallet sign-in ───────────────────────────────────────────────
+# walletAuthShared.ts and routes/auth.js above no longer hold the chain-specific
+# parts of a wallet login: the bytes a wallet is asked to sign, the signature
+# check, and the message the vault KEK is derived from all moved behind these.
+# They are the whole trust boundary for a wallet account, so mirroring the
+# callers without them would publish an auth flow with its crypto elided.
+client/services/wallets/chains.ts
+client/services/wallets/authMessage.ts
+client/services/wallets/vaultMessage.ts
+client/services/wallets/evmEncoding.ts
+client/services/walletDeterminism.ts
+server/services/walletVerifiers.js
+server/utils/base58.js

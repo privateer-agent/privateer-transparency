@@ -24,7 +24,13 @@ const express = require('express');
 const mongoose = require('mongoose');
 const logger = require('../utils/logger');
 const router = express.Router();
-const nacl = require('tweetnacl');
+const { base58Decode } = require('../utils/base58');
+const {
+  parseWalletIdentity,
+  verifyWalletSignature,
+  isSupportedNamespace,
+  InvalidWalletIdentityError,
+} = require('../services/walletVerifiers');
 const User = require('../models/userModel');
 const UserAuthMethod = require('../models/userAuthMethodModel');
 const UserSession = require('../models/userSessionModel');
@@ -60,6 +66,12 @@ function sanitizeUser(user) {
     email: user.email,
     profileImage: user.profileImage,
     solanaPublicKey: user.solanaPublicKey || null,
+    // Chain-scoped identity, so the UI can label the account with the chain it
+    // actually belongs to. Falls back to the legacy field for accounts created
+    // before multi-chain sign-in — without it an EVM user reads as having no
+    // wallet at all, since solanaPublicKey is null for them.
+    walletAddress: user.walletAddress || user.solanaPublicKey || null,
+    walletChain: user.walletChain || (user.solanaPublicKey ? 'solana' : null),
     kekSource: user.kekSource || null,
     outboxPublicKey: user.outboxPublicKey || null,
   };
@@ -73,6 +85,13 @@ function buildVaultPayload(user) {
       kekSource: user.kekSource,
       kdfSalt: user.kdfSalt || null,
       kdfParams: user.kdfParams || null,
+      // Which chain to re-derive the KEK with — the client picks both the
+      // wallet provider and the vault message from this. Absent on
+      // pre-multi-chain accounts, where falling back to Solana is correct by
+      // construction. (kekMessageVersion is deliberately NOT sent: the message
+      // follows from the chain, and a second source of truth for the same fact
+      // is how the two drift apart.)
+      walletChain: user.walletChain || (user.solanaPublicKey ? 'solana' : null),
     },
   };
 }
@@ -121,24 +140,40 @@ const MAX_AUTH_MESSAGE_SKEW_SECS = 10 * 60;
 function parseCanonicalAuthMessage(text) {
   if (typeof text !== 'string') return null;
   const lines = text.split('\n');
-  if (lines.length !== 5) return null;
+
+  // Two shapes, distinguished by an optional `Chain:` line in position 3:
+  //
+  //   5 lines, no Chain  → Solana. The original format, pinned forever so
+  //                        existing accounts and older clients keep verifying.
+  //   6 lines with Chain → every other namespace, explicitly scoped.
+  //
+  // A Solana signature therefore can't be replayed as an eip155 one (or vice
+  // versa): the bytes the wallet signed differ.
+  const hasChainLine = lines.length === 6;
+  if (lines.length !== 5 && !hasChainLine) return null;
 
   const m0 = lines[0].match(/^Sign in to (.+)$/);
   const m1 = lines[1].match(/^Domain: (.+)$/);
-  const m2 = lines[2].match(/^Wallet: ([0-9a-fA-F]{64}|[1-9A-HJ-NP-Za-km-z]{32,44})$/);
-  const m3 = lines[3].match(/^Nonce: ([0-9a-fA-F]+)$/);
-  const m4 = lines[4].match(/^Issued: (.+)$/);
+  const m2 = lines[2].match(/^Wallet: (0x[0-9a-fA-F]{40}|[0-9a-fA-F]{64}|[1-9A-HJ-NP-Za-km-z]{32,44})$/);
+  const mc = hasChainLine ? lines[3].match(/^Chain: ([a-z0-9]{3,16})$/) : null;
+  const m3 = lines[hasChainLine ? 4 : 3].match(/^Nonce: ([0-9a-fA-F]+)$/);
+  const m4 = lines[hasChainLine ? 5 : 4].match(/^Issued: (.+)$/);
   if (!m0 || !m1 || !m2 || !m3 || !m4) return null;
+  if (hasChainLine && !mc) return null;
 
-  // Normalize the Wallet: token to lowercase hex. Legacy clients send hex
-  // directly; current clients send base58, which we decode here so the
-  // downstream `parsed.wallet === pubKeyHex` binding check is unchanged.
+  // Normalize the Wallet: token to lowercase unprefixed hex, matching
+  // walletVerifiers' `identity.hex`, so the binding check below is one
+  // comparison regardless of chain. EVM addresses arrive 0x-prefixed and
+  // checksummed; Solana arrives base58 (current clients) or hex (legacy ones).
+  const walletToken = m2[1];
   let walletHex;
-  if (/^[0-9a-fA-F]{64}$/.test(m2[1])) {
-    walletHex = m2[1].toLowerCase();
+  if (/^0x[0-9a-fA-F]{40}$/.test(walletToken)) {
+    walletHex = walletToken.slice(2).toLowerCase();
+  } else if (/^[0-9a-fA-F]{64}$/.test(walletToken)) {
+    walletHex = walletToken.toLowerCase();
   } else {
     try {
-      walletHex = base58Decode(m2[1]).toString('hex');
+      walletHex = base58Decode(walletToken).toString('hex');
     } catch {
       return null;
     }
@@ -152,6 +187,7 @@ function parseCanonicalAuthMessage(text) {
     name:   m0[1],
     domain: m1[1],
     wallet: walletHex,
+    chain:  hasChainLine ? mc[1] : 'solana',
     nonce:  m3[1],
     issuedMs,
   };
@@ -938,9 +974,16 @@ router.post('/wallet/nonce', nonceLimiter, async (req, res) => {
 router.post('/wallet/verify', walletVerifyLimiter, async (req, res) => {
   try {
     const { walletPublicKey, signature, signedMessage, nonceId } = req.body;
+    // Absent `chain` means a client that predates multi-chain sign-in, which
+    // could only ever have been Solana.
+    const chain = req.body.chain || 'solana';
 
     if (!walletPublicKey || !signature || !signedMessage || !nonceId) {
       return res.status(400).json({ message: 'walletPublicKey, signature, signedMessage, and nonceId are required' });
+    }
+
+    if (!isSupportedNamespace(chain)) {
+      return res.status(400).json({ message: `Unsupported wallet chain: ${chain}`, code: 'UNSUPPORTED_CHAIN' });
     }
 
     const storedNonce = await redis.getdel(`nonce:${nonceId}`);
@@ -949,18 +992,17 @@ router.post('/wallet/verify', walletVerifyLimiter, async (req, res) => {
       return res.status(401).json({ message: 'Nonce expired or not found. Please request a new one.' });
     }
 
-    let pubKeyBuf;
+    // Identity parsing and signature verification are per-chain and live in
+    // services/walletVerifiers. This route stays chain-independent: nonce,
+    // message binding, account lookup, session issuance.
+    let identity;
     try {
-      if (/^[0-9a-fA-F]{64}$/.test(walletPublicKey)) {
-        pubKeyBuf = Buffer.from(walletPublicKey, 'hex');
-      } else {
-        pubKeyBuf = base58Decode(walletPublicKey);
+      identity = parseWalletIdentity(chain, walletPublicKey);
+    } catch (err) {
+      if (err instanceof InvalidWalletIdentityError) {
+        return res.status(400).json({ message: err.message });
       }
-    } catch {
-      return res.status(400).json({ message: 'Invalid walletPublicKey encoding' });
-    }
-    if (pubKeyBuf.length !== 32) {
-      return res.status(400).json({ message: 'Invalid walletPublicKey length' });
+      throw err;
     }
 
     const msgBuf = Buffer.from(signedMessage, 'hex');
@@ -969,16 +1011,20 @@ router.post('/wallet/verify', walletVerifyLimiter, async (req, res) => {
       return res.status(401).json({ message: 'Signed message format is invalid' });
     }
 
-    // Hex is the canonical form for the signature-binding check and the vault
-    // KEK message (both never displayed). The stored identity, however, is the
-    // real base58 Solana address — the form users see in their wallet/explorers
-    // and the one any on-chain or billing surface needs.
-    const pubKeyHex = pubKeyBuf.toString('hex');
-    const pubKeyBase58 = base58Encode(pubKeyBuf);
+    // Lowercase hex is the form the signature-binding check and the vault KEK
+    // message use (neither is displayed). The stored identity is the canonical
+    // address instead — base58 on Solana, EIP-55 on EVM — because that's what
+    // users see in their wallet and explorers, and what any on-chain or billing
+    // surface needs.
+    const pubKeyHex = identity.hex;
+    const canonicalAddress = identity.canonical;
     if (
       parsed.name !== CANONICAL_BRAND_NAME ||
       parsed.domain !== CANONICAL_BRAND_DOMAIN ||
       parsed.wallet !== pubKeyHex.toLowerCase() ||
+      // The chain the message was scoped to must be the chain we're verifying
+      // under, or a signature could be lifted from one namespace to another.
+      parsed.chain !== chain ||
       parsed.nonce !== storedNonce ||
       Math.abs(Date.now() - parsed.issuedMs) > MAX_AUTH_MESSAGE_SKEW_SECS * 1000
     ) {
@@ -987,27 +1033,47 @@ router.post('/wallet/verify', walletVerifyLimiter, async (req, res) => {
 
     const sigBuf = Buffer.from(signature, 'hex');
 
-    const valid = nacl.sign.detached.verify(
-      new Uint8Array(msgBuf),
-      new Uint8Array(sigBuf),
-      new Uint8Array(pubKeyBuf)
-    );
+    const valid = verifyWalletSignature({
+      namespace: identity.namespace,
+      identity,
+      message: msgBuf,
+      signature: sigBuf,
+    });
 
     if (!valid) {
       return res.status(401).json({ message: 'Invalid signature' });
     }
 
-    let user = await User.findOne({ solanaPublicKey: pubKeyBase58 });
+    // Lookup is chain-scoped. Solana additionally falls back to (and keeps
+    // writing) the legacy `solanaPublicKey` field: every wallet account created
+    // before multi-chain sign-in is keyed on it alone, and dual-writing means a
+    // rollback to the previous server can't strand accounts made in between.
+    let user = chain === 'solana'
+      ? await User.findOne({ $or: [
+          { solanaPublicKey: canonicalAddress },
+          { walletChain: 'solana', walletAddress: canonicalAddress },
+        ] })
+      : await User.findOne({ walletChain: chain, walletAddress: canonicalAddress });
 
     if (!user) {
       user = await User.create({
-        solanaPublicKey: pubKeyBase58,
-        username: `wallet_${pubKeyBase58.slice(0, 8)}`,
+        ...(chain === 'solana' ? { solanaPublicKey: canonicalAddress } : {}),
+        walletChain: chain,
+        walletAddress: canonicalAddress,
+        username: `wallet_${canonicalAddress.slice(0, 8)}`,
         isEmailVerified: false,
         accountStatus: 'active'
       });
-      analyticsService.track('signup', { method: 'wallet' });
-    } else if (user.accountStatus === 'grace_period') {
+      analyticsService.track('signup', { method: 'wallet', chain });
+    } else if (!user.walletChain) {
+      // Backfill on touch: a pre-multi-chain account gets its chain-scoped
+      // identity the first time it signs in, so no migration script is needed.
+      user.walletChain = 'solana';
+      user.walletAddress = user.solanaPublicKey;
+      await user.save();
+    }
+
+    if (user.accountStatus === 'grace_period') {
       // Recovery path for the 30-day deletion grace period (mirrors /auth/login):
       // a fresh, valid wallet signature IS a full re-auth, so honor `recover:
       // true` — sent by the client after the user confirms the "scheduled for
@@ -1029,7 +1095,10 @@ router.post('/wallet/verify', walletVerifyLimiter, async (req, res) => {
 
     await UserAuthMethod.findOneAndUpdate(
       { userId: user._id, method: 'wallet' },
-      { externalId: pubKeyBase58, lastUsedAt: new Date() },
+      // Solana keeps the bare address it has always stored; other chains are
+      // namespace-prefixed so the (method, externalId) unique index can't
+      // collide across chains and the row says what it is.
+      { externalId: chain === 'solana' ? canonicalAddress : `${chain}:${canonicalAddress}`, lastUsedAt: new Date() },
       { upsert: true }
     );
 
@@ -1078,10 +1147,19 @@ router.post('/wallet/master-key', authenticate, async (req, res) => {
     // Atomic conditional update: only set when no master key is already
     // recorded. Two concurrent setup calls can no longer both win the race
     // (the second's $in match fails and we either confirm idempotency or
-    // reject as a conflict). The vault-key message is always v2.
+    // reject as a conflict).
+    //
+    // The vault-message version follows the account's chain: Solana enrolled at
+    // v2 before chains existed and stays there forever, everything else at v3.
+    // Derived from the stored chain rather than anything the client sends —
+    // a client that could choose its own version could pin a new account to a
+    // message its wallet can't reproduce.
+    const walletChain = req.user.walletChain || 'solana';
+    const kekMessageVersion = walletChain === 'solana' ? 2 : 3;
+
     const updated = await User.findOneAndUpdate(
       { _id: req.user._id, $or: [{ wrappedMasterKey: { $in: [null, ''] } }, { wrappedMasterKey: { $exists: false } }] },
-      { $set: { wrappedMasterKey, kekSource: 'wallet', kekMessageVersion: 2 } },
+      { $set: { wrappedMasterKey, kekSource: 'wallet', kekMessageVersion } },
       { new: true }
     );
 
@@ -1105,39 +1183,5 @@ router.post('/wallet/master-key', authenticate, async (req, res) => {
     res.status(500).json({ message: 'Failed to register master key' });
   }
 });
-
-// ---------------------------------------------------------------------------
-// Base58 decode (Solana public keys)
-// ---------------------------------------------------------------------------
-
-const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-
-function base58Decode(str) {
-  let result = BigInt(0);
-  for (const char of str) {
-    const idx = BASE58_ALPHABET.indexOf(char);
-    if (idx < 0) throw new Error(`Invalid base58 character: ${char}`);
-    result = result * BigInt(58) + BigInt(idx);
-  }
-  const hex = result.toString(16).padStart(64, '0');
-  return Buffer.from(hex, 'hex');
-}
-
-// Encode a 32-byte buffer as base58 (the canonical Solana address form).
-// Leading zero bytes map to leading '1's, per the base58 spec.
-function base58Encode(buf) {
-  let result = '';
-  let value = BigInt('0x' + buf.toString('hex'));
-  while (value > BigInt(0)) {
-    const rem = value % BigInt(58);
-    value = value / BigInt(58);
-    result = BASE58_ALPHABET[Number(rem)] + result;
-  }
-  for (const byte of buf) {
-    if (byte === 0) result = '1' + result;
-    else break;
-  }
-  return result;
-}
 
 module.exports = router;

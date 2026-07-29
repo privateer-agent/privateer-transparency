@@ -19,6 +19,15 @@ export async function solanaLogin(_opts?: { recover?: boolean }): Promise<never>
   throw new Error('Solana wallet login is not supported on iOS.');
 }
 
+/**
+ * Never reachable: walletAuthEnabled() is hard-false on iOS (config/
+ * billingMode.ts), so no wallet entry point renders. Present so the shared
+ * import surface type-checks across platforms.
+ */
+export async function evmLogin(_opts?: { recover?: boolean }): Promise<never> {
+  throw new Error('Wallet login is not supported on iOS.');
+}
+
 export async function loadDerivedKey(): Promise<never> {
   throw new Error('Solana wallet login is not supported on iOS.');
 }

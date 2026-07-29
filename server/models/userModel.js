@@ -229,10 +229,29 @@ const userSchema = new mongoose.Schema(
       type: Date,
       default: null
     },
+    // Legacy Solana identity. Kept as the source of truth for every account
+    // created before multi-chain sign-in, and still dual-written for new Solana
+    // accounts so a rollback can't strand anyone. New chains populate only the
+    // walletAddress/walletChain pair below.
     solanaPublicKey: {
       type: String,
       sparse: true,
       unique: true
+    },
+    // Chain-scoped wallet identity (CAIP-2 namespace + canonical address).
+    //   'solana' → base58 pubkey, mirrors solanaPublicKey
+    //   'eip155' → EIP-55 checksummed 0x address. Deliberately namespace-only,
+    //              with no chain id: one EVM address is the same account on
+    //              Ethereum, Base, Arbitrum and the rest, so switching networks
+    //              in the wallet must not look like switching accounts.
+    walletAddress: {
+      type: String,
+      default: null
+    },
+    walletChain: {
+      type: String,
+      enum: ['solana', 'eip155', null],
+      default: null
     },
     // E2EE master key, AES-256-GCM-wrapped under a KEK derived from the user's
     // password (Argon2id) or wallet signature (HKDF). Format: base64 of IV||ciphertext||tag.
@@ -261,13 +280,24 @@ const userSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.Mixed,
       default: null
     },
-    // Version of the wallet vault-key message that was signed to derive the
-    // KEK. Always 2 ("Privateer vault key v2 for <pubkey-hex>") — v1 was never
-    // released, so there is no legacy account class. Wallet users only; null
-    // for password users.
+    // FORENSIC RECORD ONLY — nothing branches on this, and nothing should.
+    //
+    // Which wallet vault-key message this account signed to derive its KEK:
+    //   2 — "Privateer vault key v2 for <pubkey-hex>" (Solana). Pinned forever:
+    //       that exact string is what every existing wallet vault was derived
+    //       from, and there is no recovery if it changes.
+    //   3 — "Privateer vault key v3 for <namespace>:<hex>" (every other chain),
+    //       namespace-scoped so two secp256k1 chains that share an address
+    //       derivation (Ethereum and Tron) can't derive each other's key.
+    // v1 was never released, so there is no legacy account class.
+    //
+    // The message a client must sign is derived from `walletChain`, not from
+    // this field — one source of truth. This is kept because knowing what an
+    // account actually signed is worth having if we ever need to reason about
+    // a vault after the fact, and it costs a column.
     kekMessageVersion: {
       type: Number,
-      enum: [2, null],
+      enum: [2, 3, null],
       default: null
     },
     accountStatus: {

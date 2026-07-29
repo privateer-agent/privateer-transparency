@@ -36,7 +36,11 @@ interface UserData {
   id: string;
   email?: string;
   profileImage?: string;
+  /** Legacy Solana-only identity. Null for wallet accounts on other chains. */
   solanaPublicKey?: string | null;
+  /** Canonical address for any chain — prefer this over solanaPublicKey. */
+  walletAddress?: string | null;
+  walletChain?: 'solana' | 'eip155' | null;
   kekSource?: 'password' | 'wallet' | null;
 }
 
@@ -45,6 +49,12 @@ interface VaultPayload {
   kekSource: 'password' | 'wallet';
   kdfSalt: string | null;
   kdfParams: KdfParams | null;
+  /**
+   * Which chain this wallet vault was enrolled on. The client picks both the
+   * wallet provider and the vault message from this. Absent on accounts
+   * created before multi-chain sign-in, where Solana is correct.
+   */
+  walletChain?: 'solana' | 'eip155' | null;
 }
 
 interface AuthResponse {

@@ -166,16 +166,12 @@ export function deriveKekFromWalletSignature(signatureBytes: Uint8Array): Uint8A
 }
 
 /**
- * The exact message a Solana wallet must sign to produce its KEK. The wallet's
- * public key (lowercase hex) is baked in so the signature is structurally bound
- * to this account and cannot be replayed to derive any other account's KEK.
+ * The exact messages a wallet signs to produce its KEK. Defined in
+ * wallets/vaultMessage.ts — dependency-free so they can be unit tested — and
+ * re-exported here because cryptoService is the public surface for key
+ * operations (CLAUDE.md §5).
  */
-export function getWalletKekMessage(pubkeyHex: string): string {
-  if (!pubkeyHex || !/^[0-9a-fA-F]{64}$/.test(pubkeyHex)) {
-    throw new Error('Pubkey (64 hex chars) is required for the wallet vault message');
-  }
-  return `Privateer vault key v2 for ${pubkeyHex.toLowerCase()}`;
-}
+export { getWalletKekMessage, getWalletKekMessageV3 } from './wallets/vaultMessage';
 
 /**
  * Wrap a 32-byte master key with a 32-byte KEK using AES-256-GCM.

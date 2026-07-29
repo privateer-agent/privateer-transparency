@@ -22,12 +22,15 @@
 import {
   WalletAuthResult,
   buildWalletMessages,
+  solanaAccount,
+  solanaAccountFromHex,
   fetchNonce,
   completeWalletLogin,
   fetchWalletVault,
   completeLoadDerivedKey,
 } from './walletAuthShared';
 import { connectBrowserWallet } from './browserWalletProvider.web';
+import { connectEvmWallet } from './evmWalletProvider.web';
 import { canLinkWalletViaBrowser, linkWalletViaBrowser } from './desktopWalletLink';
 
 // Re-export the platform-agnostic surface so existing imports from
@@ -51,21 +54,66 @@ export async function solanaLogin(opts?: { recover?: boolean }): Promise<WalletA
   if (canLinkWalletViaBrowser()) {
     const linked = await linkWalletViaBrowser('login', nonce);
     return completeWalletLogin({
-      pubkeyHex: linked.pubkeyHex,
+      account: solanaAccountFromHex(linked.pubkeyHex),
       authSignature: linked.authSignature!,
       authMessage: linked.authMessage!,
       vaultSignature: linked.vaultSignature,
       nonceId,
-    }, opts);
+    }, {
+      ...opts,
+      // Enrollment only: a second hand-off to the same browser. 'unlock' mode
+      // re-signs just the vault message, and we re-check the pubkey because a
+      // fresh hand-off is a fresh wallet session the user could switch accounts in.
+      resignVault: async () => {
+        const again = await linkWalletViaBrowser('unlock', '');
+        if (again.pubkeyHex !== linked.pubkeyHex) {
+          throw new Error('A different wallet account signed the second time. Use the same account to finish setting up.');
+        }
+        return again.vaultSignature;
+      },
+    });
   }
 
   const wallet = await connectBrowserWallet();
-  const { pubkeyHex, authMessage, vaultMessage } = buildWalletMessages(wallet.pubkeyBytes, nonce);
+  const account = solanaAccount(wallet.pubkeyBytes);
+  const { authMessage, vaultMessage } = buildWalletMessages(account, nonce);
 
   const authSignature = await wallet.signMessage(authMessage);
   const vaultSignature = await wallet.signMessage(vaultMessage);
 
-  return completeWalletLogin({ pubkeyHex, authSignature, authMessage, vaultSignature, nonceId }, opts);
+  return completeWalletLogin({ account, authSignature, authMessage, vaultSignature, nonceId }, {
+    ...opts,
+    // Enrollment only. Re-signs through the handle we're already connected to,
+    // so it's the same account by construction — no second picker.
+    resignVault: () => wallet.signMessage(vaultMessage),
+  });
+}
+
+/**
+ * Sign in via a browser EVM wallet (MetaMask, Rabby, Coinbase, …).
+ *
+ * Structurally identical to solanaLogin — connect, sign the auth message, sign
+ * the vault message, hand both to the shared core — because everything that
+ * differs between the chains is in wallets/chains.ts and the provider module.
+ * One EVM address is the same account on every EVM network, so there is no
+ * network to pick here and switching networks in the wallet changes nothing.
+ *
+ * Gated by multiChainWalletsEnabled(); callers must not reach this otherwise.
+ */
+export async function evmLogin(opts?: { recover?: boolean }): Promise<WalletAuthResult> {
+  const { nonce, nonceId } = await fetchNonce();
+
+  const wallet = await connectEvmWallet();
+  const { account } = wallet;
+  const { authMessage, vaultMessage } = buildWalletMessages(account, nonce);
+
+  const authSignature = await wallet.signMessage(authMessage);
+  const vaultSignature = await wallet.signMessage(vaultMessage);
+
+  return completeWalletLogin({ account, authSignature, authMessage, vaultSignature, nonceId }, {
+    ...opts,
+    resignVault: () => wallet.signMessage(vaultMessage),
+  });
 }
 
 /**
@@ -85,8 +133,20 @@ export async function loadDerivedKey(): Promise<void> {
     return;
   }
 
+  // Re-derive with the chain the account actually enrolled on. An EVM vault
+  // was wrapped under a v3 message signed by an EVM wallet; prompting the
+  // Solana provider here would derive a different KEK and surface as "could not
+  // unlock your data" on an account that is perfectly healthy. Accounts that
+  // predate multi-chain have no walletChain, and Solana is correct for them.
+  if (vault.walletChain === 'eip155') {
+    const evm = await connectEvmWallet();
+    const { vaultMessage } = buildWalletMessages(evm.account, '');
+    await completeLoadDerivedKey(vault, await evm.signMessage(vaultMessage));
+    return;
+  }
+
   const wallet = await connectBrowserWallet();
-  const { vaultMessage } = buildWalletMessages(wallet.pubkeyBytes, '');
+  const { vaultMessage } = buildWalletMessages(solanaAccount(wallet.pubkeyBytes), '');
   const vaultSignature = await wallet.signMessage(vaultMessage);
 
   await completeLoadDerivedKey(vault, vaultSignature);
