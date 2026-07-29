@@ -154,7 +154,7 @@ function parseCanonicalAuthMessage(text) {
 
   const m0 = lines[0].match(/^Sign in to (.+)$/);
   const m1 = lines[1].match(/^Domain: (.+)$/);
-  const m2 = lines[2].match(/^Wallet: (0x[0-9a-fA-F]{40}|[0-9a-fA-F]{64}|[1-9A-HJ-NP-Za-km-z]{32,44})$/);
+  const m2 = lines[2].match(/^Wallet: (0x[0-9a-fA-F]{40}|0x[0-9a-fA-F]{64}|[0-9a-fA-F]{64}|[1-9A-HJ-NP-Za-km-z]{32,44})$/);
   const mc = hasChainLine ? lines[3].match(/^Chain: ([a-z0-9]{3,16})$/) : null;
   const m3 = lines[hasChainLine ? 4 : 3].match(/^Nonce: ([0-9a-fA-F]+)$/);
   const m4 = lines[hasChainLine ? 5 : 4].match(/^Issued: (.+)$/);
@@ -164,10 +164,16 @@ function parseCanonicalAuthMessage(text) {
   // Normalize the Wallet: token to lowercase unprefixed hex, matching
   // walletVerifiers' `identity.hex`, so the binding check below is one
   // comparison regardless of chain. EVM addresses arrive 0x-prefixed and
-  // checksummed; Solana arrives base58 (current clients) or hex (legacy ones).
+  // checksummed; Sui arrives 0x-prefixed and 32 bytes wide; Solana arrives
+  // base58 (current clients) or hex (legacy ones).
+  //
+  // A Sui address and a legacy Solana pubkey normalize to the same 64 hex
+  // chars, which is safe only because the `Chain:` line is checked separately
+  // against the namespace being verified — the hex alone never picks the
+  // account.
   const walletToken = m2[1];
   let walletHex;
-  if (/^0x[0-9a-fA-F]{40}$/.test(walletToken)) {
+  if (/^0x[0-9a-fA-F]{40}$/.test(walletToken) || /^0x[0-9a-fA-F]{64}$/.test(walletToken)) {
     walletHex = walletToken.slice(2).toLowerCase();
   } else if (/^[0-9a-fA-F]{64}$/.test(walletToken)) {
     walletHex = walletToken.toLowerCase();

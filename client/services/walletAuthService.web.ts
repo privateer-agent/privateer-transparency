@@ -31,6 +31,7 @@ import {
 } from './walletAuthShared';
 import { connectBrowserWallet } from './browserWalletProvider.web';
 import { connectEvmWallet } from './evmWalletProvider.web';
+import { connectSuiWallet } from './suiWalletProvider.web';
 import { canLinkWalletViaBrowser, linkWalletViaBrowser } from './desktopWalletLink';
 
 // Re-export the platform-agnostic surface so existing imports from
@@ -117,6 +118,34 @@ export async function evmLogin(opts?: { recover?: boolean }): Promise<WalletAuth
 }
 
 /**
+ * Sign in via a browser Sui wallet (Slush, Suiet, Nightly, …).
+ *
+ * Same three steps as the other two chains. What differs is entirely inside the
+ * provider: Sui wallets announce themselves over the Wallet Standard instead of
+ * injecting a global, and `sui:signPersonalMessage` returns a serialized
+ * `flag || sig || pubkey` rather than a bare signature. A Sui address is the
+ * same account on mainnet, testnet and devnet, so — as with EVM — there is no
+ * network to pick.
+ *
+ * Gated by suiWalletEnabled(); callers must not reach this otherwise.
+ */
+export async function suiLogin(opts?: { recover?: boolean }): Promise<WalletAuthResult> {
+  const { nonce, nonceId } = await fetchNonce();
+
+  const wallet = await connectSuiWallet();
+  const { account } = wallet;
+  const { authMessage, vaultMessage } = buildWalletMessages(account, nonce);
+
+  const authSignature = await wallet.signMessage(authMessage);
+  const vaultSignature = await wallet.signMessage(vaultMessage);
+
+  return completeWalletLogin({ account, authSignature, authMessage, vaultSignature, nonceId }, {
+    ...opts,
+    resignVault: () => wallet.signMessage(vaultMessage),
+  });
+}
+
+/**
  * Re-derive the master key for an authenticated wallet user by prompting the
  * browser wallet for a fresh vault signature. Used when the on-device cache is
  * empty (first sign-in on this device, after logout, or after REAUTH_REQUIRED).
@@ -142,6 +171,13 @@ export async function loadDerivedKey(): Promise<void> {
     const evm = await connectEvmWallet();
     const { vaultMessage } = buildWalletMessages(evm.account, '');
     await completeLoadDerivedKey(vault, await evm.signMessage(vaultMessage));
+    return;
+  }
+
+  if (vault.walletChain === 'sui') {
+    const sui = await connectSuiWallet();
+    const { vaultMessage } = buildWalletMessages(sui.account, '');
+    await completeLoadDerivedKey(vault, await sui.signMessage(vaultMessage));
     return;
   }
 

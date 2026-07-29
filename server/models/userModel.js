@@ -251,13 +251,15 @@ const userSchema = new mongoose.Schema(
     //              with no chain id: one EVM address is the same account on
     //              Ethereum, Base, Arbitrum and the rest, so switching networks
     //              in the wallet must not look like switching accounts.
+    //   'sui'    → 0x-prefixed 32-byte address (lowercase; Sui has no checksum
+    //              case), derived from BLAKE2b-256(flag || pubkey).
     walletAddress: {
       type: String,
       default: null
     },
     walletChain: {
       type: String,
-      enum: ['solana', 'eip155', null],
+      enum: ['solana', 'eip155', 'sui', null],
       default: null
     },
     // E2EE master key, AES-256-GCM-wrapped under a KEK derived from the user's

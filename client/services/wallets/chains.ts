@@ -23,14 +23,18 @@
  * and explorers recognize.
  */
 
-export type ChainNamespace = 'solana' | 'eip155';
+export type ChainNamespace = 'solana' | 'eip155' | 'sui';
 
 /** A connected account, normalized across chains. */
 export interface WalletAccount {
   namespace: ChainNamespace;
-  /** Canonical, user-recognizable address (base58 | EIP-55 hex). */
+  /** Canonical, user-recognizable address (base58 | EIP-55 hex | 0x sui hex). */
   address: string;
-  /** Lowercase unprefixed hex: 64 chars (solana pubkey) | 40 chars (evm address). */
+  /**
+   * Lowercase unprefixed hex: 64 chars (solana pubkey), 40 chars (evm address),
+   * 64 chars (sui address). Solana and Sui are the same width — which is
+   * exactly why the vault message is namespace-scoped rather than bare hex.
+   */
   idHex: string;
 }
 
@@ -74,6 +78,17 @@ export const CHAINS: Record<ChainNamespace, ChainDescriptor> = {
     signatureLength: 65,
     wireIdentity: (account) => `0x${account.idHex}`,
   },
+  sui: {
+    namespace: 'sui',
+    label: 'Sui',
+    includesChainLine: true,
+    // Sui returns a SERIALIZED signature: flag(1) || ed25519 sig(64) ||
+    // public key(32). The key travels inside the signature — the address is a
+    // hash of it, so there is nothing to recover from and nothing else to send.
+    // Only the Ed25519 flag is accepted (see wallets/suiEncoding.ts).
+    signatureLength: 97,
+    wireIdentity: (account) => `0x${account.idHex}`,
+  },
 };
 
 /**
@@ -104,9 +119,9 @@ export function walletAddressOf(
  * Truncated address for display — enough to recognize which account you are
  * signed into, which is all any of these surfaces need.
  *
- * EVM keeps its `0x` prefix plus two bytes; that is the form every wallet UI
- * shows, and dropping the prefix would make an Ethereum address read as some
- * other kind of identifier. Base58 has no prefix to preserve, so it splits
+ * The `0x` chains (EVM, Sui) keep their prefix plus two bytes; that is the form
+ * every wallet UI shows, and dropping the prefix would make the address read as
+ * some other kind of identifier. Base58 has no prefix to preserve, so it splits
  * evenly.
  */
 export function shortWalletAddress(

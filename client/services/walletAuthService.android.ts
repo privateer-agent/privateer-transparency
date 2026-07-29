@@ -58,6 +58,18 @@ export async function evmLogin(): Promise<never> {
   throw new Error('Ethereum wallet sign-in is not supported on this platform yet.');
 }
 
+/**
+ * Sui sign-in has no transport in the native app either, for a different
+ * reason: Sui wallets are discovered over the Wallet Standard, which is a pair
+ * of *window* events. There is no window inside React Native, so there is
+ * nothing to announce to. The route forward is the same browser hand-off
+ * described above; until it exists, the LoginScreen only offers Sui on web
+ * (config/billingMode.ts → suiWalletEnabled).
+ */
+export async function suiLogin(): Promise<never> {
+  throw new Error('Sui wallet sign-in is not supported on this platform yet.');
+}
+
 // Re-export the platform-agnostic surface so existing imports from
 // '../services/walletAuthService' keep working unchanged.
 export {

@@ -40,7 +40,7 @@ interface UserData {
   solanaPublicKey?: string | null;
   /** Canonical address for any chain — prefer this over solanaPublicKey. */
   walletAddress?: string | null;
-  walletChain?: 'solana' | 'eip155' | null;
+  walletChain?: 'solana' | 'eip155' | 'sui' | null;
   kekSource?: 'password' | 'wallet' | null;
 }
 
@@ -54,7 +54,7 @@ interface VaultPayload {
    * wallet provider and the vault message from this. Absent on accounts
    * created before multi-chain sign-in, where Solana is correct.
    */
-  walletChain?: 'solana' | 'eip155' | null;
+  walletChain?: 'solana' | 'eip155' | 'sui' | null;
 }
 
 interface AuthResponse {

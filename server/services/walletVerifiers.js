@@ -46,6 +46,7 @@
 const nacl = require('tweetnacl');
 const { secp256k1 } = require('@noble/curves/secp256k1');
 const { keccak_256 } = require('@noble/hashes/sha3');
+const { blake2b } = require('@noble/hashes/blake2b');
 const { base58Decode, base58Encode } = require('../utils/base58');
 
 /** Thrown for a namespace we have no verifier for. Callers map this to a 400. */
@@ -203,10 +204,125 @@ const eip155 = {
 };
 
 // ---------------------------------------------------------------------------
+// Sui — ed25519 over the BLAKE2b-256 digest of an intent-wrapped message
+// ---------------------------------------------------------------------------
+
+/**
+ * Sui never signs a message directly. `sui:signPersonalMessage` signs
+ *
+ *   BLAKE2b-256( intent || BCS(message) )
+ *
+ * where `intent` is the three bytes [scope, version, appId] — PersonalMessage
+ * (3), V0 (0), Sui (0) — and BCS encoding of a `vector<u8>` is a ULEB128 length
+ * followed by the bytes. That domain separator is why a Sui signature can't be
+ * replayed as a transaction approval, and why the digest has to be rebuilt here
+ * exactly rather than verified against the raw message.
+ *
+ * Mirrors @mysten/sui: cryptography/intent.ts + keypair.ts → signWithIntent.
+ */
+const SUI_INTENT_PERSONAL_MESSAGE = Buffer.from([3, 0, 0]);
+
+/** BCS/ULEB128 length prefix. Auth messages are ~200 bytes, so this is 2 bytes. */
+function uleb128(value) {
+  const out = [];
+  let n = value;
+  do {
+    let byte = n & 0x7f;
+    n >>>= 7;
+    if (n > 0) byte |= 0x80;
+    out.push(byte);
+  } while (n > 0);
+  return Buffer.from(out);
+}
+
+function suiPersonalMessageDigest(message) {
+  const intentMessage = Buffer.concat([
+    SUI_INTENT_PERSONAL_MESSAGE,
+    uleb128(message.length),
+    message,
+  ]);
+  return Buffer.from(blake2b(intentMessage, { dkLen: 32 }));
+}
+
+/**
+ * Sui address = BLAKE2b-256(flag || pubkey), hex, 0x-prefixed. The flag is part
+ * of the preimage, so the same Ed25519 key enrolled under a different scheme
+ * flag is a different account — which is what makes comparing the derived
+ * address to the claimed one a complete check.
+ */
+function suiAddressFromPublicKey(flag, publicKey) {
+  const digest = blake2b(Buffer.concat([Buffer.from([flag]), publicKey]), { dkLen: 32 });
+  return Buffer.from(digest).toString('hex');
+}
+
+/** Ed25519, the flag every mainstream Sui wallet issues by default. */
+const SUI_FLAG_ED25519 = 0x00;
+/** flag(1) + signature(64) + public key(32) */
+const SUI_ED25519_SIGNATURE_LENGTH = 97;
+
+const sui = {
+  namespace: 'sui',
+  signatureScheme: 'ed25519',
+  signatureLength: SUI_ED25519_SIGNATURE_LENGTH,
+
+  /**
+   * A Sui address is 32 bytes of hash output — 0x + 64 hex, no checksum case to
+   * preserve, so lowercase is canonical. Deliberately strict about the `0x`:
+   * bare 64-hex is the legacy *Solana* form, and accepting both here would make
+   * one string mean two different accounts depending on the chain field.
+   */
+  parseIdentity(raw) {
+    if (typeof raw !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(raw)) {
+      throw new InvalidWalletIdentityError('Invalid Sui address (expected 0x + 64 hex chars)');
+    }
+    const lower = raw.slice(2).toLowerCase();
+    return {
+      namespace: 'sui',
+      canonical: `0x${lower}`,
+      hex: lower,
+      // Like EVM: the key arrives inside the signature, and the address is
+      // derived from it and compared.
+      verifyKey: null,
+    };
+  },
+
+  /**
+   * Sui wallets return `flag || signature || publicKey`. Verify the Ed25519
+   * signature over the intent digest, then re-derive the address from the
+   * public key it carries and require it to be the address being claimed —
+   * otherwise any valid signature from any Sui account would authenticate any
+   * other.
+   *
+   * Only the Ed25519 flag is accepted. MultiSig (0x03), zkLogin (0x05) and
+   * Passkey (0x06) can't hold a Privateer vault at all — they have no single
+   * reproducible signature — and Secp256k1/r1 (0x01/0x02) are rejected because
+   * this build has never verified one against a real wallet; a sign-in path
+   * that can't be tested is worse than one that isn't offered. Any of them
+   * fails here as "invalid signature" rather than being trusted blind.
+   */
+  verify({ identity, message, signature }) {
+    if (signature.length !== SUI_ED25519_SIGNATURE_LENGTH) return false;
+    if (signature[0] !== SUI_FLAG_ED25519) return false;
+
+    const sig = signature.subarray(1, 65);
+    const publicKey = signature.subarray(65);
+
+    const ok = nacl.sign.detached.verify(
+      new Uint8Array(suiPersonalMessageDigest(message)),
+      new Uint8Array(sig),
+      new Uint8Array(publicKey),
+    );
+    if (!ok) return false;
+
+    return suiAddressFromPublicKey(SUI_FLAG_ED25519, publicKey) === identity.hex;
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
-const VERIFIERS = { solana, eip155 };
+const VERIFIERS = { solana, eip155, sui };
 
 /** CAIP-2 namespaces this build can verify. */
 const SUPPORTED_NAMESPACES = Object.keys(VERIFIERS);
@@ -250,6 +366,8 @@ module.exports = {
   verifyWalletSignature,
   toChecksumAddress,
   personalSignDigest,
+  suiPersonalMessageDigest,
+  suiAddressFromPublicKey,
   UnsupportedChainError,
   InvalidWalletIdentityError,
 };

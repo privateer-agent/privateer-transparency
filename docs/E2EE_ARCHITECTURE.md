@@ -202,19 +202,53 @@ mid-range mobile devices; can be increased per-user without breaking older
 clients (clients honor the `kdfParams` field returned by the server).
 
 ### KEK derivation — wallet users
-The vault-key message is a single, pubkey-bound string. There is no version
-negotiation — v1 was never released, so there is no legacy account class.
+The vault-key message is an identity-bound string. Which form an account signs
+follows from its chain, not from anything the client chooses. v1 was never
+released, so there is no legacy account class below v2.
 ```
-msg = "Privateer vault key v2 for " + lowercase(hex(walletPubkey))
+v2 (Solana only, frozen forever):
+  msg = "Privateer vault key v2 for " + lowercase(hex(walletPubkey))
 
-sig = wallet.signMessage(msg)                          // 64 bytes, deterministic
+v3 (every chain added after Solana):
+  msg = "Privateer vault key v3 for " + namespace + ":" + lowercase(hex(identity))
+
+sig = wallet.signMessage(msg)                          // deterministic
 KEK = HKDF-SHA256(sig, salt = SHA256("privateer-wallet-kek"),
                        info = "aes-256-gcm", length = 32)
 ```
-The auth signature and the vault signature are collected in a single MWA
-`transact()` session from the same authorized account — one wallet picker, two
-sign prompts, no second session. The server stores `kekMessageVersion: 2` on
-enrollment but it is never branched on; the client always signs the v2 string.
+v2 is frozen because every wallet vault that existed before multi-chain sign-in
+was derived from that exact string, and there is no recovery if it changes. v3's
+namespace prefix is load-bearing in two directions: Ethereum and Tron derive the
+same 20 address bytes from one key, and a Sui address and a Solana public key are
+both 32 bytes — bare hex would hand unrelated accounts the same KEK.
+
+Supported namespaces (`client/services/wallets/chains.ts` +
+`server/services/walletVerifiers.js`, one entry each):
+
+| Namespace | Identity | Signature | Verified by |
+|-----------|----------|-----------|-------------|
+| `solana` | 32-byte Ed25519 public key, base58 | 64-byte Ed25519 over the raw message | the key itself |
+| `eip155` | 20-byte address, EIP-55 hex | 65-byte secp256k1 over the EIP-191 digest | recovering the address |
+| `sui` | 32-byte address, `0x` + hex | 97-byte `flag ‖ sig ‖ pubkey`, Ed25519 over BLAKE2b-256(intent ‖ BCS(msg)) | re-deriving the address from the key inside |
+
+Adding a namespace does **not** mean the chain can hold a vault. That requires
+the wallet to sign the *same bytes* every time, which is enforced client-side at
+enrollment (`client/services/walletDeterminism.ts`): the vault message is signed
+twice and the signatures must be byte-identical before a master key exists to
+lose. MPC/threshold signers, smart-contract (ERC-1271) and passkey accounts fail
+this by construction, as does any wallet API that stamps a timestamp or the app
+domain into the signed payload — which is why TON is not on the list above:
+both `ton_proof` and `signData` sign a wallet-generated timestamp. On Sui, only
+the Ed25519 scheme flag (0x00) is accepted for the same reason; multisig,
+zkLogin and passkey accounts are refused at sign-in rather than enrolled into a
+vault they could never reopen.
+
+The auth signature and the vault signature are collected in one wallet session
+from the same authorized account — a single MWA `transact()` on Android, a
+single connected handle in the browser. One picker, two sign prompts, no second
+session. The server stores `kekMessageVersion` (2 or 3) on enrollment but never
+branches on it; the message follows from `walletChain`, which is the one source
+of truth.
 
 ### Wrap / unwrap
 - AES-256-GCM with a 12-byte random IV per wrap, 128-bit auth tag.
