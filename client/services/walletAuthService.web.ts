@@ -32,6 +32,7 @@ import {
 import { connectBrowserWallet } from './browserWalletProvider.web';
 import { connectEvmWallet } from './evmWalletProvider.web';
 import { connectSuiWallet } from './suiWalletProvider.web';
+import { connectTronWallet } from './tronWalletProvider.web';
 import { canLinkWalletViaBrowser, linkWalletViaBrowser } from './desktopWalletLink';
 
 // Re-export the platform-agnostic surface so existing imports from
@@ -146,6 +147,35 @@ export async function suiLogin(opts?: { recover?: boolean }): Promise<WalletAuth
 }
 
 /**
+ * Sign in via a browser Tron wallet (TronLink, OKX, Bitget, …).
+ *
+ * Same three steps again. Tron's differences are all inside the provider and the
+ * verifier: the wallet is a `tronLink`-shaped injected object rather than an
+ * announced one, `signMessageV2` frames the digest with Tron's own prefix, and
+ * the identity travels as the base58check "T…" address instead of hex. The
+ * signature itself is the same 65-byte secp256k1 shape as EVM's — which is also
+ * why one key's Tron and Ethereum accounts must stay apart, and do: the v3 vault
+ * message is scoped by namespace.
+ *
+ * Gated by tronWalletEnabled(); callers must not reach this otherwise.
+ */
+export async function tronLogin(opts?: { recover?: boolean }): Promise<WalletAuthResult> {
+  const { nonce, nonceId } = await fetchNonce();
+
+  const wallet = await connectTronWallet();
+  const { account } = wallet;
+  const { authMessage, vaultMessage } = buildWalletMessages(account, nonce);
+
+  const authSignature = await wallet.signMessage(authMessage);
+  const vaultSignature = await wallet.signMessage(vaultMessage);
+
+  return completeWalletLogin({ account, authSignature, authMessage, vaultSignature, nonceId }, {
+    ...opts,
+    resignVault: () => wallet.signMessage(vaultMessage),
+  });
+}
+
+/**
  * Re-derive the master key for an authenticated wallet user by prompting the
  * browser wallet for a fresh vault signature. Used when the on-device cache is
  * empty (first sign-in on this device, after logout, or after REAUTH_REQUIRED).
@@ -178,6 +208,13 @@ export async function loadDerivedKey(): Promise<void> {
     const sui = await connectSuiWallet();
     const { vaultMessage } = buildWalletMessages(sui.account, '');
     await completeLoadDerivedKey(vault, await sui.signMessage(vaultMessage));
+    return;
+  }
+
+  if (vault.walletChain === 'tron') {
+    const tron = await connectTronWallet();
+    const { vaultMessage } = buildWalletMessages(tron.account, '');
+    await completeLoadDerivedKey(vault, await tron.signMessage(vaultMessage));
     return;
   }
 

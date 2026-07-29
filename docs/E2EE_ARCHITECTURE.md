@@ -230,6 +230,16 @@ Supported namespaces (`client/services/wallets/chains.ts` +
 | `solana` | 32-byte Ed25519 public key, base58 | 64-byte Ed25519 over the raw message | the key itself |
 | `eip155` | 20-byte address, EIP-55 hex | 65-byte secp256k1 over the EIP-191 digest | recovering the address |
 | `sui` | 32-byte address, `0x` + hex | 97-byte `flag ‖ sig ‖ pubkey`, Ed25519 over BLAKE2b-256(intent ‖ BCS(msg)) | re-deriving the address from the key inside |
+| `tron` | 20-byte address, base58check `0x41 ‖ addr` ("T…") | 65-byte secp256k1 over the TIP-191 digest (`\x19TRON Signed Message:\n`) | recovering the address |
+
+Tron is eip155's twin: same curve, same recovery, the same 20 address bytes for
+the same key. Only the digest prefix and the display encoding differ — which is
+why a `personal_sign` signature cannot authenticate the Tron account of the same
+key (different bytes signed), and why the v3 vault message *must* stay
+namespace-scoped (identical hex, so bare hex would hand both accounts one KEK).
+It is also the only namespace whose wire identity is not hex: the base58check
+form carries a 4-byte checksum, and that checksum is the only protection against
+enrolling a vault against an address the user never had.
 
 Adding a namespace does **not** mean the chain can hold a vault. That requires
 the wallet to sign the *same bytes* every time, which is enforced client-side at

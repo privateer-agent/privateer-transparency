@@ -7,10 +7,11 @@
  * The two things that actually differ:
  *
  *   1. **Identity shape.** Solana's identity IS a 32-byte Ed25519 public key.
- *      An EVM identity is a 20-byte address the signature is recovered to — no
- *      public key is ever transmitted.
- *   2. **Display form.** base58 vs EIP-55 mixed-case hex. The auth message
- *      shows this, so the user can verify it against their wallet at a glance.
+ *      An EVM or Tron identity is a 20-byte address the signature is recovered
+ *      to — no public key is ever transmitted.
+ *   2. **Display form.** base58 vs EIP-55 mixed-case hex vs base58check. The
+ *      auth message shows this, so the user can verify it against their wallet
+ *      at a glance.
  *
  * Which vault-KEK message a chain signs is NOT a field here: it follows from
  * the namespace, and walletAuthShared selects it directly. Solana signs the
@@ -23,17 +24,22 @@
  * and explorers recognize.
  */
 
-export type ChainNamespace = 'solana' | 'eip155' | 'sui';
+export type ChainNamespace = 'solana' | 'eip155' | 'sui' | 'tron';
 
 /** A connected account, normalized across chains. */
 export interface WalletAccount {
   namespace: ChainNamespace;
-  /** Canonical, user-recognizable address (base58 | EIP-55 hex | 0x sui hex). */
+  /**
+   * Canonical, user-recognizable address (base58 | EIP-55 hex | 0x sui hex |
+   * base58check "T…").
+   */
   address: string;
   /**
    * Lowercase unprefixed hex: 64 chars (solana pubkey), 40 chars (evm address),
-   * 64 chars (sui address). Solana and Sui are the same width — which is
-   * exactly why the vault message is namespace-scoped rather than bare hex.
+   * 64 chars (sui address), 40 chars (tron address). Solana and Sui are the same
+   * width, and Tron's 20 bytes are literally the same bytes as its EVM twin —
+   * which is exactly why the vault message is namespace-scoped rather than bare
+   * hex.
    */
   idHex: string;
 }
@@ -88,6 +94,20 @@ export const CHAINS: Record<ChainNamespace, ChainDescriptor> = {
     // Only the Ed25519 flag is accepted (see wallets/suiEncoding.ts).
     signatureLength: 97,
     wireIdentity: (account) => `0x${account.idHex}`,
+  },
+  tron: {
+    namespace: 'tron',
+    label: 'Tron',
+    includesChainLine: true,
+    // secp256k1 ECDSA, same 65-byte r‖s‖v as EVM: Tron's signMessageV2 differs
+    // from personal_sign only in the prefix inside the digest.
+    signatureLength: 65,
+    // The only chain whose wire identity is not hex. A Tron address is a
+    // base58check string over `0x41 ‖ idHex`, and its 4-byte checksum is the
+    // only thing standing between a corrupted address and a vault enrolled
+    // under bytes the user never saw — so the checked form is what travels, and
+    // the server decodes it rather than trusting a hex spelling.
+    wireIdentity: (account) => account.address,
   },
 };
 

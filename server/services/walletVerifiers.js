@@ -43,11 +43,12 @@
  * client/services/walletDeterminism.ts).
  */
 
+const crypto = require('crypto');
 const nacl = require('tweetnacl');
 const { secp256k1 } = require('@noble/curves/secp256k1');
 const { keccak_256 } = require('@noble/hashes/sha3');
 const { blake2b } = require('@noble/hashes/blake2b');
-const { base58Decode, base58Encode } = require('../utils/base58');
+const { base58Decode, base58DecodeVar, base58Encode } = require('../utils/base58');
 
 /** Thrown for a namespace we have no verifier for. Callers map this to a 400. */
 class UnsupportedChainError extends Error {
@@ -148,6 +149,43 @@ function personalSignDigest(message) {
   return keccak_256(Buffer.concat([prefix, message]));
 }
 
+/**
+ * Recover the 20-byte signer address from a 65-byte `r ‖ s ‖ v` signature over
+ * `digest`, as lowercase hex. Returns null for anything that isn't a recoverable
+ * signature — a bad recovery byte, out-of-range r/s, a truncated buffer.
+ *
+ * Shared by eip155 and tron: both are secp256k1 ECDSA recovered to
+ * `keccak256(pubkey)[-20:]`. Only the digest framing and how those 20 bytes are
+ * *displayed* differ, which is the whole reason Tron is a cheap namespace to add
+ * and also the reason the v3 vault message is namespace-scoped — the same key
+ * yields the same 20 bytes on both chains.
+ */
+function recoverSecp256k1Address(signature, digest) {
+  if (signature.length !== 65) return null;
+
+  // Wallets return v as 27/28 (yellow-paper convention) or, less often, the raw
+  // 0/1 recovery bit. Anything else is not a personal_sign signature.
+  const v = signature[64];
+  const recovery = v >= 27 ? v - 27 : v;
+  if (recovery !== 0 && recovery !== 1) return null;
+
+  let recovered;
+  try {
+    recovered = secp256k1.Signature
+      .fromCompact(signature.subarray(0, 64))
+      .addRecoveryBit(recovery)
+      .recoverPublicKey(digest)
+      .toRawBytes(false);
+  } catch {
+    // Malformed r/s (out of range, zero) — noble throws rather than recovering
+    // a bogus point.
+    return null;
+  }
+
+  // Address = last 20 bytes of keccak256(uncompressed pubkey minus its 0x04 tag).
+  return Buffer.from(keccak_256(recovered.slice(1))).toString('hex').slice(-40);
+}
+
 const eip155 = {
   namespace: 'eip155',
   signatureScheme: 'secp256k1-ecdsa',
@@ -176,30 +214,8 @@ const eip155 = {
    * other address and fails.
    */
   verify({ identity, message, signature }) {
-    if (signature.length !== 65) return false;
-
-    // Wallets return v as 27/28 (yellow-paper convention) or, less often, the
-    // raw 0/1 recovery bit. Anything else is not a personal_sign signature.
-    const v = signature[64];
-    const recovery = v >= 27 ? v - 27 : v;
-    if (recovery !== 0 && recovery !== 1) return false;
-
-    let recovered;
-    try {
-      recovered = secp256k1.Signature
-        .fromCompact(signature.subarray(0, 64))
-        .addRecoveryBit(recovery)
-        .recoverPublicKey(personalSignDigest(message))
-        .toRawBytes(false);
-    } catch {
-      // Malformed r/s (out of range, zero) — noble throws rather than
-      // recovering a bogus point.
-      return false;
-    }
-
-    // Address = last 20 bytes of keccak256(uncompressed pubkey minus its 0x04 tag).
-    const addr = Buffer.from(keccak_256(recovered.slice(1))).toString('hex').slice(-40);
-    return addr === identity.hex;
+    const addr = recoverSecp256k1Address(signature, personalSignDigest(message));
+    return addr !== null && addr === identity.hex;
   },
 };
 
@@ -319,10 +335,112 @@ const sui = {
 };
 
 // ---------------------------------------------------------------------------
+// Tron — secp256k1 ECDSA over the TIP-191 digest, base58check identity
+// ---------------------------------------------------------------------------
+
+/**
+ * Tron is eip155's twin below the surface and its opposite above it.
+ *
+ * Same curve, same recovery, same `keccak256(pubkey)[-20:]` address bytes — so a
+ * single private key controls the same 20 bytes on both chains. What differs:
+ *
+ *   1. The signed digest is framed with Tron's own prefix (TIP-191), not
+ *      Ethereum's, so a signature cannot be lifted between the two chains even
+ *      though the recovery math is identical.
+ *   2. The address is *displayed* as base58check over `0x41 ‖ 20 bytes` — the
+ *      "T…" string every Tron wallet and explorer shows. There is no EIP-55
+ *      case checksum; the 4-byte SHA-256d checksum inside the encoding is what
+ *      catches a mistyped address.
+ *
+ * `identity.hex` stays the bare 20 bytes (matching eip155) because that is what
+ * the auth message binds to, and the v3 vault message scopes it as
+ * `tron:<hex>` — without that namespace prefix an Ethereum account and a Tron
+ * account backed by the same key would derive the same KEK.
+ */
+const TRON_ADDRESS_PREFIX = 0x41;
+/** 0x41 ‖ 20 address bytes ‖ 4 checksum bytes. */
+const TRON_ADDRESS_BYTES = 25;
+
+function sha256(buf) {
+  return crypto.createHash('sha256').update(buf).digest();
+}
+
+/** base58check-encode `0x41 ‖ address` into the canonical "T…" form. */
+function tronAddressFromHex(hex20) {
+  const payload = Buffer.concat([Buffer.from([TRON_ADDRESS_PREFIX]), Buffer.from(hex20, 'hex')]);
+  const checksum = sha256(sha256(payload)).subarray(0, 4);
+  return base58Encode(Buffer.concat([payload, checksum]));
+}
+
+/**
+ * Decode a canonical "T…" address to its bare 20-byte hex. Throws on a bad
+ * character, a wrong length, a foreign version byte, or a failed checksum —
+ * every one of which means the string is not the address someone intended.
+ */
+function tronAddressToHex(address) {
+  const decoded = base58DecodeVar(address);
+  if (decoded.length !== TRON_ADDRESS_BYTES) throw new Error('Invalid Tron address length');
+  if (decoded[0] !== TRON_ADDRESS_PREFIX) throw new Error('Invalid Tron address prefix');
+  const payload = decoded.subarray(0, 21);
+  const expected = sha256(sha256(payload)).subarray(0, 4);
+  if (!expected.equals(decoded.subarray(21))) throw new Error('Invalid Tron address checksum');
+  return payload.subarray(1).toString('hex');
+}
+
+/**
+ * keccak256 of Tron's personal-message framing (TIP-191), which is EIP-191 with
+ * a different magic string. This is what `tronWeb.trx.signMessageV2` hashes, and
+ * the byte count — not the character count — is what goes in the prefix.
+ */
+function tronPersonalSignDigest(message) {
+  const prefix = Buffer.from(`\x19TRON Signed Message:\n${message.length}`, 'utf8');
+  return keccak_256(Buffer.concat([prefix, message]));
+}
+
+const tron = {
+  namespace: 'tron',
+  signatureScheme: 'secp256k1-ecdsa',
+  signatureLength: 65,
+
+  /**
+   * Only the base58check form is accepted. Tron wallets also carry a
+   * `41…` hex form internally, but accepting it here would give one account two
+   * spellings on the wire — and a 42-char hex string is exactly what a
+   * mis-scoped EVM address would look like after a naive prefix. The checksum
+   * inside base58check is doing real work: a corrupted address fails to decode
+   * instead of enrolling a vault under bytes the user never saw.
+   */
+  parseIdentity(raw) {
+    if (typeof raw !== 'string' || !/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(raw)) {
+      throw new InvalidWalletIdentityError('Invalid Tron address (expected a base58check "T…" address)');
+    }
+    let hex;
+    try {
+      hex = tronAddressToHex(raw);
+    } catch {
+      throw new InvalidWalletIdentityError('Invalid Tron address (expected a base58check "T…" address)');
+    }
+    return {
+      namespace: 'tron',
+      canonical: raw,
+      hex,
+      // Like EVM: nothing to verify against up front, the address is recovered
+      // from the signature and compared.
+      verifyKey: null,
+    };
+  },
+
+  verify({ identity, message, signature }) {
+    const addr = recoverSecp256k1Address(signature, tronPersonalSignDigest(message));
+    return addr !== null && addr === identity.hex;
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
-const VERIFIERS = { solana, eip155, sui };
+const VERIFIERS = { solana, eip155, sui, tron };
 
 /** CAIP-2 namespaces this build can verify. */
 const SUPPORTED_NAMESPACES = Object.keys(VERIFIERS);
@@ -368,6 +486,9 @@ module.exports = {
   personalSignDigest,
   suiPersonalMessageDigest,
   suiAddressFromPublicKey,
+  tronPersonalSignDigest,
+  tronAddressFromHex,
+  tronAddressToHex,
   UnsupportedChainError,
   InvalidWalletIdentityError,
 };

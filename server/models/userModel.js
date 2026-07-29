@@ -253,13 +253,18 @@ const userSchema = new mongoose.Schema(
     //              in the wallet must not look like switching accounts.
     //   'sui'    → 0x-prefixed 32-byte address (lowercase; Sui has no checksum
     //              case), derived from BLAKE2b-256(flag || pubkey).
+    //   'tron'   → base58check "T…" address over 0x41 || the same 20 address
+    //              bytes eip155 uses. One key therefore owns an account on both
+    //              chains; they stay distinct here because the address strings
+    //              differ, and distinct in the vault because the v3 KEK message
+    //              is namespace-scoped.
     walletAddress: {
       type: String,
       default: null
     },
     walletChain: {
       type: String,
-      enum: ['solana', 'eip155', 'sui', null],
+      enum: ['solana', 'eip155', 'sui', 'tron', null],
       default: null
     },
     // E2EE master key, AES-256-GCM-wrapped under a KEK derived from the user's

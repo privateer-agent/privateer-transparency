@@ -53,6 +53,19 @@ const OPENROUTER_BASE = process.env.OPENROUTER_BASE_URL || 'https://openrouter.a
 // critical path and the two are otherwise interchangeable: same family, same
 // ZDR posture, same transcript on our test clip — but 342ms vs 1453ms measured
 // 2026-07-28. Over a second of every spoken turn, for free.
+//
+// NOT `tinfoil/whisper-large-v3-turbo`, and it's the one audio default that
+// isn't confidential compute, so the reason is worth pinning down. It is the
+// same Whisper weights in an enclave, and on latency it would be affordable —
+// benched 2026-07-29 over 13 alternating runs on one 10s clip, transcripts
+// identical word-for-word every time, median 511ms vs 313ms. Cost is what rules
+// it out: Tinfoil prices transcription at a flat $0.01/request (requestPrice in
+// their catalog) against OpenRouter's metered $0.04/audio-minute, i.e. $0.00011
+// for that same clip — ~90x, breaking even only past ~15 minutes of audio in a
+// single call. Every dictation press and every spoken turn goes through this
+// pref (client transcribeRecording), so the enclave would cost a cent a tap.
+// The enclave model stays a one-tap choice instead: it leads the Recommended
+// STT list in ModelPickerSheet. Revisit if Tinfoil ever meters STT by duration.
 const DEFAULT_STT_MODEL = process.env.DEFAULT_STT_MODEL || 'openai/whisper-large-v3-turbo';
 // Default to a confidential-compute voice: Qwen3 TTS runs in a Tinfoil enclave
 // (AMD SEV-SNP + confidential GPU) with a fetchable attestation, so spoken text

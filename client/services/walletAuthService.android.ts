@@ -70,6 +70,17 @@ export async function suiLogin(): Promise<never> {
   throw new Error('Sui wallet sign-in is not supported on this platform yet.');
 }
 
+/**
+ * Tron sign-in has no transport here either. TronLink is a browser extension;
+ * its Android app carries a dApp browser, which is the same in-app-browser
+ * hand-off the EVM note above describes and which nothing in this build speaks
+ * yet. Until it does, the LoginScreen only offers Tron on web
+ * (config/billingMode.ts → tronWalletEnabled).
+ */
+export async function tronLogin(): Promise<never> {
+  throw new Error('Tron wallet sign-in is not supported on this platform yet.');
+}
+
 // Re-export the platform-agnostic surface so existing imports from
 // '../services/walletAuthService' keep working unchanged.
 export {
@@ -168,9 +179,10 @@ export async function loadDerivedKey(): Promise<void> {
   // Mobile Wallet Adapter would derive a different KEK and report "could not
   // unlock your data" on a perfectly healthy account. Say what's actually wrong
   // instead. (Reachable today only by enrolling on web, then installing the
-  // Android app — there is no native EVM sign-in to create one from.)
+  // Android app — there is no native sign-in on any other chain to create one
+  // from.)
   if (vault.walletChain && vault.walletChain !== 'solana') {
-    throw new Error('This account signs in with an Ethereum wallet. Use the web app to unlock it on this device.');
+    throw new Error('This account signs in with a wallet on another chain. Use the web app to unlock it on this device.');
   }
 
   await completeLoadDerivedKey(vault, await signVaultMessage());

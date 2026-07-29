@@ -32,6 +32,10 @@ export async function suiLogin(_opts?: { recover?: boolean }): Promise<never> {
   throw new Error('Wallet login is not supported on iOS.');
 }
 
+export async function tronLogin(_opts?: { recover?: boolean }): Promise<never> {
+  throw new Error('Wallet login is not supported on iOS.');
+}
+
 export async function loadDerivedKey(): Promise<never> {
   throw new Error('Solana wallet login is not supported on iOS.');
 }

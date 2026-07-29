@@ -32,6 +32,35 @@
 
 const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 
+/**
+ * Decode a base58 string to a Buffer of its natural length — no padding.
+ *
+ * `base58Decode` below always produces 32 bytes, which is right for a Solana
+ * pubkey and wrong for anything else: a Tron address decodes to 25 bytes
+ * (0x41 ‖ 20 address bytes ‖ 4 checksum bytes) and would be silently left-padded
+ * into a different value. Leading '1' characters are the base58 spelling of
+ * leading zero bytes, so they are restored explicitly rather than falling out of
+ * the BigInt.
+ */
+function base58DecodeVar(str) {
+  if (typeof str !== 'string' || str.length === 0) {
+    throw new Error('Invalid base58 string');
+  }
+  let zeros = 0;
+  while (zeros < str.length && str[zeros] === '1') zeros++;
+
+  let value = BigInt(0);
+  for (const char of str) {
+    const idx = BASE58_ALPHABET.indexOf(char);
+    if (idx < 0) throw new Error(`Invalid base58 character: ${char}`);
+    value = value * BigInt(58) + BigInt(idx);
+  }
+
+  let hex = value === BigInt(0) ? '' : value.toString(16);
+  if (hex.length % 2 !== 0) hex = `0${hex}`;
+  return Buffer.concat([Buffer.alloc(zeros), Buffer.from(hex, 'hex')]);
+}
+
 /** Decode a base58 string to a 32-byte Buffer. Throws on an invalid character. */
 function base58Decode(str) {
   let result = BigInt(0);
@@ -63,4 +92,4 @@ function base58Encode(buf) {
   return result;
 }
 
-module.exports = { base58Decode, base58Encode, BASE58_ALPHABET };
+module.exports = { base58Decode, base58DecodeVar, base58Encode, BASE58_ALPHABET };

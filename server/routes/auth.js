@@ -29,6 +29,7 @@ const {
   parseWalletIdentity,
   verifyWalletSignature,
   isSupportedNamespace,
+  tronAddressToHex,
   InvalidWalletIdentityError,
 } = require('../services/walletVerifiers');
 const User = require('../models/userModel');
@@ -164,16 +165,29 @@ function parseCanonicalAuthMessage(text) {
   // Normalize the Wallet: token to lowercase unprefixed hex, matching
   // walletVerifiers' `identity.hex`, so the binding check below is one
   // comparison regardless of chain. EVM addresses arrive 0x-prefixed and
-  // checksummed; Sui arrives 0x-prefixed and 32 bytes wide; Solana arrives
-  // base58 (current clients) or hex (legacy ones).
+  // checksummed; Sui arrives 0x-prefixed and 32 bytes wide; Tron arrives as a
+  // base58check "T…" address; Solana arrives base58 (current clients) or hex
+  // (legacy ones).
   //
   // A Sui address and a legacy Solana pubkey normalize to the same 64 hex
-  // chars, which is safe only because the `Chain:` line is checked separately
-  // against the namespace being verified — the hex alone never picks the
-  // account.
+  // chars, and a Tron address normalizes to the same 40 as its EVM twin, which
+  // is safe only because the `Chain:` line is checked separately against the
+  // namespace being verified — the hex alone never picks the account.
+  const chain = hasChainLine ? mc[1] : 'solana';
   const walletToken = m2[1];
   let walletHex;
-  if (/^0x[0-9a-fA-F]{40}$/.test(walletToken) || /^0x[0-9a-fA-F]{64}$/.test(walletToken)) {
+  if (chain === 'tron') {
+    // Tron shares Solana's base58 alphabet but decodes to 25 bytes (version ‖
+    // address ‖ checksum), so it must be decoded by its own rules — the Solana
+    // branch below would left-pad it into a value that is nobody's account.
+    // Keyed off the declared chain rather than sniffed from the string: the
+    // signature is verified under that same namespace either way.
+    try {
+      walletHex = tronAddressToHex(walletToken);
+    } catch {
+      return null;
+    }
+  } else if (/^0x[0-9a-fA-F]{40}$/.test(walletToken) || /^0x[0-9a-fA-F]{64}$/.test(walletToken)) {
     walletHex = walletToken.slice(2).toLowerCase();
   } else if (/^[0-9a-fA-F]{64}$/.test(walletToken)) {
     walletHex = walletToken.toLowerCase();
@@ -193,7 +207,7 @@ function parseCanonicalAuthMessage(text) {
     name:   m0[1],
     domain: m1[1],
     wallet: walletHex,
-    chain:  hasChainLine ? mc[1] : 'solana',
+    chain,
     nonce:  m3[1],
     issuedMs,
   };
