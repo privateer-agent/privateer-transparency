@@ -23,9 +23,14 @@
 /**
  * Shared OpenAI-compatible chat-completions handler.
  *
- * One billed, ZDR-pinned, streaming proxy body used by two auth surfaces:
+ * One billed, ZDR-pinned, streaming proxy body used by three surfaces:
  *   - routes/agentInference.js  → JWT-authed internal Agent CLI (kind 'agent_cli')
  *   - routes/v1.js              → sk-priv-… developer API keys   (kind 'api')
+ *   - routes/appTools.js        → in-app connector turns         (kind 'app_tools')
+ *
+ * The third exists because the app's own chat stream reshapes everything to text
+ * for the UI, and a connector turn needs `tool_calls` intact. Same body, app
+ * billing rates, its own concurrency pool.
  *
  * Auth-agnostic: reads only req.userId and req.body (both auth middlewares set
  * req.userId). Speaks the raw OpenAI wire format both ways via
@@ -72,19 +77,28 @@ async function billCompletion(userId, modelId, usage, ctx = {}) {
     );
     // Developer API (sk-priv-…) bills at its own flat rate (API_MARKUP_FACTOR);
     // the internal Agent CLI keeps its cost-plus rate (AGENT_CLI_MARKUP_FACTOR),
-    // falling back to the app rate when that's unset.
+    // falling back to the app rate when that's unset. 'app_tools' is an in-app
+    // connector turn — it is an app chat turn that happens to need the raw
+    // tool_calls wire format, so it bills at APP rates (costUsd, no CLI factor)
+    // and must never be repriced as terminal usage.
     const billedUsd = kind === 'api'
       ? billingService.apiBilledCost({ costUsd, providerCostUsd })
-      : billingService.agentCliBilledCost({ costUsd, providerCostUsd });
+      : kind === 'app_tools'
+        ? costUsd
+        : billingService.agentCliBilledCost({ costUsd, providerCostUsd });
     // Attribute the spend to its surface for the usage summary: developer API
-    // → 'api', internal Agent CLI → 'cli'.
-    const origin = kind === 'api' ? 'api' : 'cli';
+    // → 'api', internal Agent CLI → 'cli', in-app connector turn → 'app'.
+    const origin = kind === 'api' ? 'api' : kind === 'app_tools' ? 'app' : 'cli';
+    // A connector turn lands in the same UsageEvent bucket as any other app
+    // chat turn ('inference'); 'app_tools' is a billing-policy selector here,
+    // not a new spend kind, so usageEventModel's enum is untouched.
+    const usageKind = kind === 'app_tools' ? 'inference' : kind;
     await billingService.chargeUsd(userId, billedUsd, {
       model: modelId,
       tokensPrompt: inputTokens,
       tokensCompletion: outputTokens,
       providerCostUsd,
-      kind,
+      kind: usageKind,
       origin,
     });
   } catch (err) {
@@ -103,7 +117,8 @@ async function billCompletion(userId, modelId, usage, ctx = {}) {
 
 /**
  * Handle POST .../chat/completions. Expects req.userId set by an auth
- * middleware. opts.kind selects the UsageEvent kind ('agent_cli' | 'api').
+ * middleware. opts.kind selects the billing policy and surface attribution
+ * ('agent_cli' | 'api' | 'app_tools').
  */
 async function handleChatCompletion(req, res, opts = {}) {
   const kind = opts.kind || 'agent_cli';

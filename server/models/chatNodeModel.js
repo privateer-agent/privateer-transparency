@@ -43,8 +43,12 @@ const chatNodeSchema = new mongoose.Schema(
       ref: 'ChatEdge'
     }],
     nodeType: {
+      // 'drawing' is the canvas ink layer, not a card: one per graph, holding
+      // every freehand stroke as an encrypted JSON blob on encryptedNoteBody.
+      // The client renders it above the cards and keeps it out of the node
+      // array entirely (see InkLayer), so it never lays out, drags, or counts.
       type: String,
-      enum: ['entry', 'standard', 'note', 'file'],
+      enum: ['entry', 'standard', 'note', 'file', 'drawing'],
       default: 'standard',
       required: true
     },
@@ -445,7 +449,9 @@ chatNodeSchema.statics.createGraphNode = async function(data) {
     entry: '#10B981',
     standard: '#4F46E5',
     note: '#F59E0B',
-    file: '#6366F1'
+    file: '#6366F1',
+    // Never rendered as a card — each stroke carries its own colour.
+    drawing: '#64748B'
   };
 
   const node = await this.create({

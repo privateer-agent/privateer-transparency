@@ -315,6 +315,62 @@ plaintext exists in memory on the server only for the duration of the request �
 and the client disconnects mid-stream, the finished reply is stashed in short-TTL
 Redis (never Mongo) for pickup on reopen. See the carve-out in the threat model.
 
+### Connectors (MCP) — deliberately **not** a carve-out
+
+A connector lets the model call a third-party service (Linear, Sentry,
+Jira/Confluence, Stripe, Asana, Notion) mid-conversation. It is the kind of
+feature that usually forces a privacy concession, and it did not, so it is worth
+being precise about what does and does not happen.
+
+**What stays on the device:**
+
+- **The credential.** The OAuth flow runs on the phone
+  (`client/services/connectors/authStore.ts`), and the tokens live in
+  `EncryptedStorage` under `@privateer/connector_auth_<sha256(url)>`. Our servers
+  never receive one.
+- **The tool call itself.** `client/services/connectors/mcpClient.ts` talks
+  straight from the device to the connector host. No request to a connector is
+  ever proxied by us, and the raw tool result does not touch our infrastructure.
+- **The agent loop.** `toolLoop.ts` decides what to call and when, on-device.
+
+**What the server holds:** one ciphertext blob per connector
+(`server/models/connectorModel.js`), so a second device can pick the connector up.
+The *entire* config is encrypted — not just the token but the catalog id, label
+and URL too, because a readable list of which services a user connected is
+metadata we decline to accumulate. `server/routes/connectors.js` stores and
+returns it and contains no decrypt path.
+
+**What we can see, stated plainly:** a tool result becomes part of the prompt for
+the next round, and on the normal (non-Sealed) path a prompt transits our server
+for inference — under exactly the same ZDR/TEE routing as any other message
+(`POST /api/app-tools/v1/chat/completions`, `server/routes/appTools.js`). So a
+connector does not weaken the guarantee, but it does mean *more* content flows
+through the existing inference path. Do not describe a connector turn as
+end-to-end encrypted; describe it as "your credential and the service call stay on
+your device, and the answer is inferred under our normal ZDR/TEE routing."
+
+**Why connectors are unavailable in Sealed mode.** A sealed turn reaches the
+enclave through a blind relay whose `InferFn` contract carries text, not
+`tool_calls`. Supporting connectors there would mean quietly routing the turn
+around the relay — downgrading someone who explicitly chose the strongest
+guarantee in the product. `connectorChatService.connectorTurnAvailable()` refuses
+instead, and the UI says why. If the sealed transport ever carries tool calls,
+this restriction can lift.
+
+**Two safety properties, both pinned by
+`client/services/connectors/toolLoop.test.ts`:**
+
+1. A tool runs unattended only if the server annotated it `readOnlyHint: true`.
+   Anything unannotated is treated as a write and needs a tap.
+2. Tool results are fenced as untrusted before entering the prompt, and the
+   approval gate reads the tool's annotation rather than the conversation — so
+   text returned by a connector cannot talk its way into an unreviewed write.
+
+Contrast with **hosted agents**, where the same feature *is* blocked: a Harbor
+tenant is woken by a scheduler with no device online, so there is nothing to seal
+a durable credential to. See `docs/HARBOR_CONNECTORS_PLAN.md` §2. The app can
+afford the honest version precisely because a device is always present.
+
 ### Deep Research background jobs
 
 Deep Research is a multi-minute, detached server-side job (so a run survives the
