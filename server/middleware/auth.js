@@ -37,9 +37,10 @@ async function authenticate(req, res, next) {
   try {
     const decoded = verifyAccessToken(token);
 
-    // jti revocation check
-    const revoked = await UserSession.isRevoked(decoded.jti);
-    if (revoked) {
+    // jti revocation check (same predicate as isRevoked; keeps the row so we can
+    // tag which client minted the session — see req.sessionClient below).
+    const session = await UserSession.findIfLive(decoded.jti);
+    if (!session) {
       return res.status(401).json({ message: 'Session has been revoked', code: 'SESSION_REVOKED' });
     }
 
@@ -66,6 +67,12 @@ async function authenticate(req, res, next) {
     req.user = user;
     req.jti = decoded.jti;
     req.authMethod = decoded.authMethod;
+    // Which surface minted this session ('mobile' | 'web' | 'desktop' | 'cli';
+    // undefined on legacy rows / older app builds). Routes shared by more than one
+    // surface use it to attribute usage — the sealed relay is one route serving both
+    // the app and a linked terminal, so it cannot infer the caller from the path the
+    // way agentInference/v1/appTools do.
+    req.sessionClient = session.client;
     next();
   } catch (err) {
     if (err.name === 'TokenExpiredError') {
@@ -84,8 +91,8 @@ async function lightAuthenticate(req, res, next) {
 
   try {
     const decoded = verifyAccessToken(token);
-    const revoked = await UserSession.isRevoked(decoded.jti);
-    if (revoked) return next();
+    const session = await UserSession.findIfLive(decoded.jti);
+    if (!session) return next();
 
     const user = await User.findById(decoded.sub);
     // Match authenticate()'s account-status gating: a deleted or pending-
@@ -95,6 +102,7 @@ async function lightAuthenticate(req, res, next) {
       req.user = user;
       req.jti = decoded.jti;
       req.authMethod = decoded.authMethod;
+      req.sessionClient = session.client;
     }
   } catch (_) {
     // Invalid token — continue without user
