@@ -129,9 +129,9 @@ async function control(path, body) {
 const sevsnpBackend = {
   name: 'sevsnp',
 
-  async start({ userId, agentId, termId, credentials, accountSignPub, routines, webAccess }) {
-    logger.info(`[harbor:sevsnp] start tenant user=${userId} agent=${agentId} term=${termId} routines=${(routines || []).length} web=${webAccess === false ? 'off' : 'on'}`);
-    const out = await control('/tenants/start', { userId, agentId, termId, credentials, accountSignPub, routines, webAccess });
+  async start({ userId, agentId, termId, credentials, accountSignPub, routines, webAccess, mediaAccess }) {
+    logger.info(`[harbor:sevsnp] start tenant user=${userId} agent=${agentId} term=${termId} routines=${(routines || []).length} web=${webAccess === false ? 'off' : 'on'} media=${mediaAccess === true ? 'on' : 'off'}`);
+    const out = await control('/tenants/start', { userId, agentId, termId, credentials, accountSignPub, routines, webAccess, mediaAccess });
     return {
       hostId: out.hostId || null,
       region: out.region || null,

@@ -135,21 +135,26 @@ router.put('/:agentId/routines', authenticate, async (req, res) => {
 });
 
 // PATCH /api/harbor/:agentId — update the agent's own settings.
-// Body: { label?, webAccess? }. `webAccess` governs whether the daemon gets
-// web_search/web_fetch (served by our /api/rag/* with the agent's own credential, so
-// no provider key reaches the tenant — but the derived query does leave the enclave).
-// It lands in the tenant env, which is read only at container start, so flipping it on
-// a running agent restarts it; see harborProvisionService.updateAgent.
+// Body: { label?, webAccess?, mediaAccess? }. `webAccess` governs whether the daemon
+// gets web_search/web_fetch (served by our /api/rag/* with the agent's own credential,
+// so no provider key reaches the tenant — but the derived query does leave the enclave).
+// `mediaAccess` governs the media-generation tools (real spend + prompt/input egress out
+// of the enclave), off by default. Both land in the tenant env, which is read only at
+// container start, so flipping either on a running agent restarts it; see
+// harborProvisionService.updateAgent.
 router.patch('/:agentId', authenticate, async (req, res) => {
   try {
-    const { label, webAccess } = req.body || {};
+    const { label, webAccess, mediaAccess } = req.body || {};
     if (webAccess !== undefined && typeof webAccess !== 'boolean') {
       return res.status(400).json({ success: false, message: 'webAccess must be a boolean' });
+    }
+    if (mediaAccess !== undefined && typeof mediaAccess !== 'boolean') {
+      return res.status(400).json({ success: false, message: 'mediaAccess must be a boolean' });
     }
     if (label !== undefined && typeof label !== 'string') {
       return res.status(400).json({ success: false, message: 'label must be a string' });
     }
-    const agent = await harbor.updateAgent(req.user._id, req.params.agentId, { label, webAccess });
+    const agent = await harbor.updateAgent(req.user._id, req.params.agentId, { label, webAccess, mediaAccess });
     res.json({ success: true, agent });
   } catch (err) { fail(res, err, 'update'); }
 });

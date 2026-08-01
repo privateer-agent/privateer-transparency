@@ -751,7 +751,10 @@ router.patch('/sessions/:id', authenticate, async (req, res) => {
 router.post('/verify-email', async (req, res) => {
   try {
     const { token } = req.body;
-    if (!token) {
+    // Must be a string: a non-string (e.g. `{"$ne":null}`) would reach Mongoose as a
+    // query operator and match an arbitrary account's token, bypassing email
+    // ownership. There is no global query sanitizer, so guard the type here.
+    if (!token || typeof token !== 'string') {
       return res.status(400).json({ message: 'Invalid or expired verification token' });
     }
 
