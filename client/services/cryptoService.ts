@@ -23,6 +23,7 @@ import './internal/randomPolyfill';
 // crypto.subtle on web, @noble/ciphers as the universal fallback. All three
 // share one wire format (12-byte IV, ct ‖ 16-byte tag) — see internal/aesGcm.
 import { gcmEncrypt, gcmDecrypt, gcmEncryptAsync, gcmDecryptAsync } from './internal/aesGcm';
+import { Buffer } from 'buffer';
 import { hkdf } from '@noble/hashes/hkdf';
 import { sha256 } from '@noble/hashes/sha256';
 import { deriveArgon2idHash } from './internal/argon2';
@@ -64,21 +65,19 @@ export const DEFAULT_KDF_PARAMS: KdfParams = {
 // Encoding helpers
 // ---------------------------------------------------------------------------
 
+// Buffer's table-driven codec rather than btoa/atob + char loops: these two
+// run on every E2EE payload, including multi-MB media, and on native the atob
+// polyfill is itself Buffer-backed (polyfills.js) — the old path decoded to a
+// binary string only to walk it back out byte by byte. Output is standard
+// padded base64 either way, so nothing on the wire or on disk changes.
 export function toBase64(bytes: ArrayBuffer | Uint8Array): string {
   const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-  let binary = '';
-  const chunkSize = 8192;
-  for (let i = 0; i < arr.length; i += chunkSize) {
-    binary += String.fromCharCode(...arr.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
+  return Buffer.from(arr.buffer, arr.byteOffset, arr.byteLength).toString('base64');
 }
 
 export function fromBase64(b64: string): Uint8Array {
-  const binary = atob(b64);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
-  return out;
+  const buf = Buffer.from(b64, 'base64');
+  return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
 }
 
 // ---------------------------------------------------------------------------
