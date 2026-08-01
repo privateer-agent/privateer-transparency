@@ -421,23 +421,56 @@ class AuthService {
     }
   }
 
+  /** POST /auth/refresh with one specific token. Non-2xx returns its status. */
+  private async _postRefresh(
+    refreshToken: string,
+  ): Promise<{ ok: true; data: { accessToken: string; refreshToken: string } } | { ok: false; status: number }> {
+    const response = await fetch(`${API_BASE_URL}/auth/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken })
+    });
+    if (!response.ok) return { ok: false, status: response.status };
+    return { ok: true, data: await response.json() };
+  }
+
   private async _doRefresh(): Promise<boolean> {
     try {
-      const response = await fetch(`${API_BASE_URL}/auth/refresh`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refreshToken: this.refreshToken })
-      });
+      // Rotate the freshest token on disk, not whichever one this instance
+      // booted with. The store is shared but each instance caches its own copy
+      // in memory — web runs several tabs against one IndexedDB, and each holds
+      // the token it read at init. Once any tab rotates, every other tab's copy
+      // is spent, and replaying a spent token outside the server's 30s grace
+      // window reads as theft: rotateRefreshToken revokes the whole device
+      // family, so the next request from ANY tab 401s and the session dies with
+      // no message (on web, straight out to the marketing landing).
+      const stored = await secureKv.getItem('refreshToken').catch(() => null);
+      if (stored && stored !== this.refreshToken) this.refreshToken = stored;
 
-      if (!response.ok) {
-        if (response.status === 401) {
+      const sent = this.refreshToken;
+      if (!sent) return false;
+      let result = await this._postRefresh(sent);
+
+      if (!result.ok && result.status === 401) {
+        // Another tab may have rotated between our read above and this reply —
+        // that leaves us holding a spent token through no fault of the session.
+        // Retry once with whatever is on disk now; only a 401 on the CURRENT
+        // stored token means the session is genuinely gone.
+        const latest = await secureKv.getItem('refreshToken').catch(() => null);
+        if (latest && latest !== sent) {
+          this.refreshToken = latest;
+          result = await this._postRefresh(latest);
+        }
+      }
+
+      if (!result.ok) {
+        if (result.status === 401) {
           await this.handleTokenExpiration();
         }
         return false;
       }
 
-      const data = await response.json();
-      await this.storeAuthData(data.accessToken, data.refreshToken, this.user!);
+      await this.storeAuthData(result.data.accessToken, result.data.refreshToken, this.user!);
       return true;
     } catch (err) {
       Sentry.captureException(err, { level: 'warning', tags: { op: 'refresh_token' } });
