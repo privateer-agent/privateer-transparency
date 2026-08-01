@@ -1145,6 +1145,28 @@ async function generateImage(parts, options = {}) {
 }
 
 /**
+ * Runtime duration/aspect-ratio lists for a video model, from the cached
+ * `/videos/models` catalog (same source the model picker serves). Null lists
+ * when the catalog is unavailable or omits the field — callers fall back to
+ * the static table in data/videoModelCapabilities.
+ */
+async function getVideoModelRuntimeCaps(modelId) {
+  try {
+    const { fetchCatalog } = require('../data/openrouterCatalog');
+    const data = await fetchCatalog(`${OPENROUTER_BASE}/videos/models`, orHeaders());
+    const v = (data?.data || []).find(m => m.id === modelId);
+    return {
+      aspectRatios: Array.isArray(v?.supported_aspect_ratios) && v.supported_aspect_ratios.length
+        ? v.supported_aspect_ratios : null,
+      durations: Array.isArray(v?.supported_durations) && v.supported_durations.length
+        ? v.supported_durations.map(Number) : null,
+    };
+  } catch {
+    return { aspectRatios: null, durations: null };
+  }
+}
+
+/**
  * Submit a video generation job to OpenRouter.
  *
  * @param {string} prompt
@@ -2103,7 +2125,7 @@ async function extractMemoryCandidates({ userMessage, aiResponse, existingMemori
   }
 }
 
-module.exports = { generateText, generateTextStream, proxyChatCompletion, calcOpenRouterCost, calcInferenceCost, calcImageGenCost, generateImage, submitVideoGeneration, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, listSubscriptionCatalog, formatImageGenErrorForUser, formatVideoGenErrorForUser, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
+module.exports = { generateText, generateTextStream, proxyChatCompletion, calcOpenRouterCost, calcInferenceCost, calcImageGenCost, generateImage, submitVideoGeneration, getVideoModelRuntimeCaps, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, listSubscriptionCatalog, formatImageGenErrorForUser, formatVideoGenErrorForUser, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
   // Shared formatting helpers reused by nearAiService (OpenAI-compatible NEAR path).
   NO_TABLES_DIRECTIVE, withNoTables, convertTablesToBullets, createStreamingTableConverter,
   // og:image enrichment for source cards — also applied to the Brave web-search path.
