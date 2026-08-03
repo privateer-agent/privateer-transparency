@@ -615,19 +615,13 @@ async function openRouterChat(messages, modelId, options = {}) {
 // preferredImageGenModelId.
 const RETIRED_MODEL_ALIASES = {
   'google/gemini-3.1-flash-image-preview': 'google/gemini-3.1-flash-image',
-  // Tinfoil is deprecating Kimi K2.6: it's gone from /v1/models as of
-  // 2026-07-28, but /v1/chat/completions still answers on it — delisted first,
-  // switched off later, with no announced date. So this alias is defensive: the
-  // picker (catalog-driven) can no longer offer the id, and a persisted pref
-  // that still works today would start 404ing without warning.
-  //
-  // Gemma 4 31B is the replacement because it's the only Tinfoil model left
-  // with image input — the one substitution that keeps BOTH properties this
-  // pick implied: confidential compute and vision. Tinfoil serves no Kimi K3
-  // (every plausible slug 404s on the enclave; K3's open weights only landed
-  // 2026-07-27), so there is no in-family upgrade to point at. If a Kimi lands
-  // on the enclave fleet later, retarget this line.
-  'tinfoil/kimi-k2-6': 'tinfoil/gemma4-31b',
+  // `tinfoil/kimi-k2-6 → tinfoil/gemma4-31b` lived here 2026-07-28 → 2026-08-03:
+  // Tinfoil delisted the slug from /v1/models and this alias kept persisted
+  // prefs from 404ing. Tinfoil RELISTED it (confirmed live in /v1/models,
+  // 2026-08-03, ctx 256k), so the alias was removed — leaving it would silently
+  // rewrite a live confidential-vision pick to Gemma. If Tinfoil delists it
+  // again, restore the mapping (Gemma 4 31B is the substitution that keeps both
+  // implied properties: enclave compute and image input).
 };
 
 /**

@@ -69,7 +69,8 @@ function tinfoilBase() {
 // Entries for slugs Tinfoil no longer serves are kept, not deleted: this map is
 // pure metadata (a delisted slug simply never comes back from /v1/models), and
 // keeping it means a re-listing renders with its real name instead of a
-// title-cased slug. Delisted as of 2026-07-28: `kimi-k2-6`, `deepseek-v4-pro`,
+// title-cased slug — exactly what happened to `kimi-k2-6` (delisted 2026-07-28,
+// relisted by 2026-08-03). Delisted as of 2026-08-03: `deepseek-v4-pro`,
 // `qwen3-vl-30b`. A delisted id a user may have *persisted* is a different
 // problem — that heals in inferenceService.RETIRED_MODEL_ALIASES.
 const MODEL_INFO = {
