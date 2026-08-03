@@ -84,6 +84,7 @@ why it re-checks AMD's chain on your device instead of taking our word for it.
 | **Reply-hold carve-out** | [`server/services/pendingReplyStore.js`](server/services/pendingReplyStore.js), [`client/services/pendingReplyService.ts`](client/services/pendingReplyService.ts) | the opt-in exception, and the bounds that keep it narrow: Redis-only, short TTL, tenant-scoped, deleted on pickup |
 | **Harbor attestation** | [`client/services/harborChainVerify.ts`](client/services/harborChainVerify.ts), [`harborAttestation.ts`](client/services/harborAttestation.ts), [`server/services/harborOrchestrator/attest.js`](server/services/harborOrchestrator/attest.js), [`harborHostSevSnp.js`](server/services/harborHostSevSnp.js) | how a hosted agent's SEV-SNP report is bound to its key + measurement, and why the chain is re-verified on your device against a pinned AMD root |
 | **Specs** | [`docs/E2EE_ARCHITECTURE.md`](docs/E2EE_ARCHITECTURE.md), [`docs/CONTENT_ENCRYPTION.md`](docs/CONTENT_ENCRYPTION.md) | threat model, KEK derivation, wire format `{"iv":…,"ct":…}` |
+| **Supply chain** | [`docs/SUPPLY_CHAIN.md`](docs/SUPPLY_CHAIN.md) | that the code you install is the code we published: npm provenance + trusted publishing, no install scripts, pinned deps, upgrade cooldown — and which of those claims you can verify yourself |
 
 **Recommended reading order:** `docs/E2EE_ARCHITECTURE.md` → `client/services/cryptoService.ts`
 → a server content model (e.g. `server/models/messageModel.js`) → `server/services/inferenceService.js`.
