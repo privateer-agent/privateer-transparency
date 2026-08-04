@@ -51,6 +51,8 @@ const {
   resolveImageGenModelId,
   generateVideo,
   getVideoStatus,
+  getHeldVideo,
+  ackHeldVideo,
   updateVideoAttachmentMetadata,
   updateVideoAttachmentStorageRef,
   uploadGeneratedVideo,
@@ -204,6 +206,12 @@ router.post('/upload-video', requireCloudBackend(), checkCreditBalance(0), uploa
 router.patch('/video-attachment/:jobId/metadata', updateVideoAttachmentMetadata);
 // Record a local-storage fileId after the client writes the video to disk
 router.patch('/video-attachment/:jobId/storage-ref', updateVideoAttachmentStorageRef);
+// Opt-in plaintext video hold (server/services/pendingVideoStore.js). GET collects
+// a video whose bytes never reached the client; DELETE is the "stored it, you can
+// drop the plaintext" ack. Both tenant-scoped by the Redis key, so a caller can
+// only ever address their own holds.
+router.get('/video-hold/:jobId', getHeldVideo);
+router.delete('/video-hold/:jobId', ackHeldVideo);
 
 // Health check
 router.get('/health', (req, res) => {

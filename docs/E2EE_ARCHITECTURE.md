@@ -8,9 +8,10 @@
 
 Privateer is end-to-end encrypted: the server stores ciphertext only, and the
 encryption key never leaves the user's device. Even a full server compromise
-yields no readable user content. (Two opt-in exceptions scope this: **Harbor**
+yields no readable user content. (Three opt-in exceptions scope this: **Harbor**
 hosted agents, which are **live** and process content inside an attested enclave on
-our infrastructure, and **"Finish replies in the cloud"** — both below.)
+our infrastructure, **"Finish replies in the cloud"**, and **"Keep finished videos
+briefly in the cloud"** — all below.)
 
 What this protects against:
 - Server compromise (DB dump, S3 access, server-side code execution).
@@ -31,6 +32,10 @@ What this does **not** protect against:
   below.** When a user enables it, a chat reply the client didn't finish receiving
   (app killed mid-stream) is held briefly in plaintext in our Redis so it can be
   recovered on reopen. This one ships **today**, unlike Harbor.
+- **"Keep finished videos briefly in the cloud" (opt-in, off by default) — see the
+  carve-out below.** Same posture, for a generated video whose delivery response
+  the client never received: held briefly in plaintext in our Redis so a device can
+  still collect and encrypt it, instead of the user paying for bytes that vanished.
 
 ### Harbor (hosted agents) — a gated carve-out, opt-in, LIVE
 
@@ -122,6 +127,75 @@ kept so it isn't lost. There, and only there:
 Note: the composer-**draft** persistence that ships alongside this is **fully
 on-device** (EncryptedStorage only, `services/draftService.ts`) — no server, no
 carve-out.
+
+### "Keep finished videos briefly in the cloud" — the second carve-out, opt-in
+
+Same shape, same honesty requirements, different failure it exists to fix.
+`holdVideoInCloud` (Security screen; `UserStoragePrefs.holdVideoInCloud` for
+cloud accounts, EncryptedStorage + a `?hold=1` request flag for local — a local
+account never syncs prefs to us, so its consent has to ride on the request).
+
+**The failure.** `GET /api/chat/video-status/:jobId` does four things in one
+breath: polls the provider, downloads the finished video, **settles the charge**,
+marks the attachment `completed`, and returns the bytes in that single HTTP
+response. If the client dies while it is in flight — backgrounded and killed,
+network drop, dead battery — the bytes are gone and **nothing retries**: the
+resume pass only re-polls `pending` attachments, and this one is already
+`completed`. The user has paid for a video they can never see. Unlike the reply
+hold, the server genuinely *cannot* finish the job on their behalf, because the
+last step is encrypt-then-store and only the client holds the master key
+(`/upload-video` accepts ciphertext only).
+
+- Held **only when the user opted in**. Anything unreadable, missing, or
+  malformed resolves to "don't hold" — the failure direction is always toward
+  less plaintext.
+- Lives in **short-TTL Redis** (`pendingVideo:<userId>:<jobId>`, TTL default
+  **1 hour**, `PENDING_VIDEO_TTL_MS`) — **never Mongo, never S3**. That choice is
+  load-bearing: expiry is a property of the key, so deletion is *guaranteed*
+  rather than *scheduled*. An S3 hold would depend on a bucket lifecycle rule
+  being right in every environment and would orphan objects wherever it wasn't.
+- A **hard byte cap** (`PENDING_VIDEO_MAX_BYTES`, default 25 MB) means an
+  oversized video degrades to "not held" — i.e. today's behaviour — rather than
+  to unbounded memory growth.
+- **Removal is layered**, so no single missed call leaves plaintext behind:
+  1. the Redis TTL, unconditional;
+  2. an automatic drop wherever a `storageRef` lands — the definitive "this is
+     encrypted and stored client-side" signal — across the chat, graph-node, and
+     Message paths, regardless of which device finished the job or whether it
+     acked;
+  3. the explicit client ack, `DELETE /api/chat/video-hold/:jobId`.
+  Recovery is `GET /api/chat/video-hold/:jobId`; a 404 is the ordinary answer
+  (expired, never enabled, already collected) and clients treat it as "nothing to
+  recover". Both are tenant-scoped by the Redis key, so a caller can only ever
+  address their own holds. Implementation: `server/services/pendingVideoStore.js`,
+  `client/services/videoHoldService.ts`, recovery in `ChatScreen` on chat load
+  for attachments that are `completed` with no `storageRef`.
+- **While a video is held, plaintext video bytes rest on Privateer-operated
+  infrastructure.** Bounded, consented, and short-lived — but not end-to-end
+  encrypted, and no UI copy may imply otherwise. The in-app copy says plainly
+  that a finished video may rest on our servers in plaintext for up to an hour.
+  Off (default) = the absolute "ciphertext only" guarantee holds unchanged.
+
+**The money backstop, for everyone who leaves the hold off.** The hold makes a
+lost video *recoverable*; it does not make the charge fair when it isn't
+recovered. Two sweeps cover that, and they handle different orphans:
+
+- `sweepStaleReservations` (existing, every 15 min) releases reservations still
+  `held` past their 30-minute TTL — the job that was never settled at all.
+- `sweepUndeliveredVideos` (hourly) covers the case the first one structurally
+  cannot: a charge that was **settled** and then lost with the response. It
+  refunds `settledActualUsd` as top-up credit, ≥24h after settlement.
+
+  It refunds **only on positive evidence of non-delivery**: an attachment for
+  that job exists server-side and carries no `storageRef`. Where the server has
+  no record it returns `unknown` and does nothing — a **local-backend chat
+  writes its storageRef on-device and never tells us**, so treating absence as
+  non-delivery would refund videos users actually received. Refunds land in
+  top-up credit (which doesn't expire) rather than reconstructing the original
+  sub/top-up split, which isn't recoverable after settlement — for a refund owed
+  because our own delivery failed, erring generous is the right direction.
+  Idempotent: the refund and the `undeliveredCheckedAt` stamp share one
+  transaction, so concurrent instances can't double-refund.
 
 ### Music generation — a ZDR carve-out, **not** opt-in, live today
 
@@ -398,6 +472,52 @@ grows from a single request to a few minutes, held in Privateer-operated Redis
 Key files: `server/services/deepResearchService.js` (the loop + detached
 runner), `server/services/deepResearchJobStore.js` (Redis snapshot + pub/sub +
 per-user concurrency + stale-job watchdog).
+
+### Cross-device "in progress" listing
+
+Build/Cargo jobs use the structurally identical `buildJobStore.js`, and both
+stores keep a per-user index of running jobs (`build:active:<userId>` /
+`dr:active:<userId>`, same TTL) so `GET /api/jobs/active` can tell a SECOND
+device signed into the same account what work is already underway. The same
+route also reports Harbor agents that are awake and video generations still
+pending, both read from Mongo.
+
+Video needs no index and no `chatId` plumbing: a video job is submitted to the
+provider and the client writes a durable `pending` videoAttachment (jobId,
+status — plaintext; only `fileName`/`mimeType` are encrypted) into the chat, so
+the chat id is the containing document's own `_id`. Two consequences worth
+stating plainly:
+
+- Because that attachment is the only liveness signal — a video job has no
+  heartbeat and no stale watchdog — an abandoned job stays `pending` forever.
+  The listing therefore applies a **display cutoff** (`VIDEO_JOB_ACTIVE_MAX_AGE_MS`,
+  6h): it hides the row, it does not fail the job or release its reservation.
+- Video's final step is encrypt-then-store, which needs the master key, so only
+  a client can complete it (`/upload-video` accepts ciphertext only). The server
+  cannot finish an abandoned video job on the user's behalf without a new
+  plaintext carve-out, which is why recovery still depends on a client polling
+  `/video-status/:jobId` — that endpoint is idempotent and re-entrant precisely
+  so any device, at any later time, can settle it.
+
+This adds **no plaintext** to what the job store already holds:
+
+- The listing returns **identifiers only** — jobId, an optional `chatId`, a
+  hosted-agent id and its user-given label. Never prompts, answers, or titles.
+- Row **titles are resolved on-device** from the requesting client's own
+  decrypted side-nav cache. The server is never told what any of this work is
+  called, and does not need to be.
+- `chatId` is an identifier already stored against `userId` on the Chat model,
+  so tagging a job with it reveals nothing the server cannot already see. It is
+  validated as a 24-hex ObjectId on the way in (`sanitizeJobChatId`), which both
+  rejects malformed input and prevents the field being used to smuggle content
+  into a snapshot.
+- Clients on the **local backend never send it**: those chats exist on one
+  device, so there is nothing cross-device to attribute (client-side gate in
+  `buildJobService.startBuild` / `deepResearchService.startDeepResearch`).
+
+The index is a candidate list, not the source of truth — entries are read back
+through `getSnapshot`, so the stale-job watchdog applies and a dead runner's job
+is pruned rather than left spinning on the other device.
 
 ## Auth endpoints
 
