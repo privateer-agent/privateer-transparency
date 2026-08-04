@@ -8,5 +8,10 @@ import EncryptedStorage from 'react-native-encrypted-storage';
 export const secureKv = {
   getItem: (key: string): Promise<string | null> => EncryptedStorage.getItem(key),
   setItem: (key: string, value: string): Promise<void> => EncryptedStorage.setItem(key, value),
-  removeItem: (key: string): Promise<void> => EncryptedStorage.removeItem(key),
+  // EncryptedStorage.removeItem rejects when the key was never set (Keychain/
+  // Keystore surface "not found" as an error instead of a no-op). Callers here
+  // always mean "ensure this is gone", so swallow that case to keep the
+  // contract idempotent, matching the web IndexedDB shim.
+  removeItem: (key: string): Promise<void> =>
+    EncryptedStorage.removeItem(key).catch(() => undefined),
 };
