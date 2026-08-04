@@ -18,21 +18,33 @@
  * `HTMLAudioElement` (expo-av's Sound isn't implemented there) — the same split
  * useVoiceChat and AudioPlayer already document.
  *
+ * Read-aloud is also the one audio source with no control of its own once you
+ * scroll past it, so this module publishes whether it is engaged — see
+ * `useIsSpeaking` / `useSpeakingId` below. Every surface that can start speech
+ * therefore has a reachable stop, including the nav rail's global one.
+ *
  * E2EE (CLAUDE.md §5): the message text transits the authenticated proxy for
  * inference exactly like the chat request that produced it, and is never
  * persisted server-side.
  */
+import { useSyncExternalStore } from 'react';
 import { Platform } from 'react-native';
 import { Audio } from 'expo-av';
 import * as Speech from 'expo-speech';
 import { isGuestSession } from './sessionMode';
 import { synthesizeSpeechBytes, audioBytesToUri } from './voiceChatService';
 
-interface SpeakHandlers {
+interface SpeakOptions {
   /** Playback finished on its own. Not called when interrupted by stop(). */
   onDone?: () => void;
   /** Both engines failed — nothing is playing. */
   onError?: () => void;
+  /**
+   * Opaque caller id for whatever is being read (a message id). Published as
+   * `useSpeakingId()` so the button that started it renders its speaking state
+   * from the engine rather than from local state a global stop can't reach.
+   */
+  id?: string;
 }
 
 let activeSound: Audio.Sound | null = null;
@@ -41,6 +53,41 @@ let activeWebAudio: HTMLAudioElement | null = null;
 // compares the token it captured against this before playing, so a request the
 // user has already moved on from can never start talking over the new one.
 let generation = 0;
+
+// ── Activity store ───────────────────────────────────────────────────────────
+// "Engaged" spans synthesis *and* playback, not just audible sound: a user who
+// taps read-aloud and then wants out shouldn't have to wait for the clip to
+// arrive before a stop control appears.
+let engaged = false;
+let activeId: string | null = null;
+const listeners = new Set<() => void>();
+
+function subscribe(l: () => void): () => void {
+  listeners.add(l);
+  return () => { listeners.delete(l); };
+}
+function setActivity(nextEngaged: boolean, nextId: string | null): void {
+  if (engaged === nextEngaged && activeId === nextId) return;
+  engaged = nextEngaged;
+  activeId = nextId;
+  listeners.forEach(l => l());
+}
+
+const getEngaged = () => engaged;
+const getActiveId = () => activeId;
+
+/** True from the moment read-aloud is asked for until it stops or finishes. */
+export function useIsSpeaking(): boolean {
+  return useSyncExternalStore(subscribe, getEngaged, getEngaged);
+}
+/** The `id` passed to the live `speakText`, or null. */
+export function useSpeakingId(): string | null {
+  return useSyncExternalStore(subscribe, getActiveId, getActiveId);
+}
+/** Non-reactive read, for callers outside React. */
+export function isSpeechEngaged(): boolean {
+  return engaged;
+}
 
 function teardownPlayers(): void {
   const sound = activeSound;
@@ -61,12 +108,13 @@ function teardownPlayers(): void {
 /** Stop whatever is currently speaking, on either engine. Safe to call twice. */
 export async function stopSpeech(): Promise<void> {
   generation += 1;
+  setActivity(false, null);
   teardownPlayers();
   await Speech.stop().catch(() => {});
 }
 
 /** Device/browser engine. Used for guests and as the synthesis fallback. */
-function speakOnDevice(text: string, handlers: SpeakHandlers): void {
+function speakOnDevice(text: string, handlers: SpeakOptions): void {
   Speech.speak(text, {
     onDone: () => handlers.onDone?.(),
     onStopped: () => handlers.onDone?.(),
@@ -74,7 +122,7 @@ function speakOnDevice(text: string, handlers: SpeakHandlers): void {
   });
 }
 
-async function playUri(uri: string, mine: number, handlers: SpeakHandlers): Promise<void> {
+async function playUri(uri: string, mine: number, handlers: SpeakOptions): Promise<void> {
   const finish = () => {
     if (generation !== mine) return; // superseded — the newer speak owns state now
     teardownPlayers();
@@ -106,6 +154,19 @@ async function playUri(uri: string, mine: number, handlers: SpeakHandlers): Prom
 }
 
 /**
+ * Wrap a caller's handlers so the activity flag is released when this utterance
+ * ends — unless a newer speak has already taken it over, in which case that one
+ * owns the flag and this one must not clear it.
+ */
+function withActivity(mine: number, handlers: SpeakOptions): SpeakOptions {
+  const release = () => { if (generation === mine) setActivity(false, null); };
+  return {
+    onDone: () => { release(); handlers.onDone?.(); },
+    onError: () => { release(); handlers.onError?.(); },
+  };
+}
+
+/**
  * Audition one specific model + voice, ignoring the saved preference.
  *
  * Separate from `speakText` because the intent is inverted: read-aloud speaks
@@ -126,12 +187,18 @@ export async function previewVoice(
 
   await stopSpeech();
   const mine = generation;
+  setActivity(true, null);
 
-  const { audioBase64, mimeType } = await synthesizeSpeechBytes(trimmed, opts);
-  if (generation !== mine) return; // user moved on mid-synthesis
-  const uri = await audioBytesToUri(audioBase64, mimeType);
-  if (generation !== mine) return;
-  await playUri(uri, mine, {});
+  try {
+    const { audioBase64, mimeType } = await synthesizeSpeechBytes(trimmed, opts);
+    if (generation !== mine) return; // user moved on mid-synthesis
+    const uri = await audioBytesToUri(audioBase64, mimeType);
+    if (generation !== mine) return;
+    await playUri(uri, mine, withActivity(mine, {}));
+  } catch (err) {
+    if (generation === mine) setActivity(false, null);
+    throw err;
+  }
 }
 
 /**
@@ -142,12 +209,16 @@ export async function previewVoice(
  * engine used so the caller can distinguish "synthesizing" latency from the
  * device engine's instant start.
  */
-export async function speakText(text: string, handlers: SpeakHandlers = {}): Promise<'server' | 'device'> {
+export async function speakText(text: string, options: SpeakOptions = {}): Promise<'server' | 'device'> {
   const trimmed = (text || '').trim();
-  if (!trimmed) { handlers.onDone?.(); return 'device'; }
+  if (!trimmed) { options.onDone?.(); return 'device'; }
 
   await stopSpeech();
   const mine = generation;
+  // Engage before synthesis, not after: the seconds spent waiting for the clip
+  // are seconds the user may want to back out of.
+  setActivity(true, options.id ?? null);
+  const handlers = withActivity(mine, options);
 
   if (isGuestSession()) {
     speakOnDevice(trimmed, handlers);
