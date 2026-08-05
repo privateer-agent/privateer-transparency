@@ -357,7 +357,10 @@ async function enrichWithImages(sources) {
   if (!Array.isArray(sources) || sources.length === 0) return sources;
   const targets = sources
     .slice(0, OG_MAX_SOURCES)
-    .filter((s) => typeof s.url === 'string' && /^https?:\/\//i.test(s.url));
+    // Brave hands us a thumbnail on most web results (braveSearchService maps it
+    // straight onto `image`), so this now only fills the gaps — a source that
+    // already has a hero needs no page fetch at all.
+    .filter((s) => !s.image && typeof s.url === 'string' && /^https?:\/\//i.test(s.url));
   if (targets.length === 0) return sources;
 
   const work = Promise.allSettled(

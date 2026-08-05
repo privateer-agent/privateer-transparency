@@ -80,6 +80,14 @@ const messageSchema = new mongoose.Schema(
       type: String,
       default: null
     },
+    // E2EE: encrypted Visual-mode media ({images:[],videos:[]}) backing the
+    // answer's Images / Videos sections. Its own field, not folded into
+    // encryptedSources — see chatModel for why. Include in any projection that
+    // returns message content.
+    encryptedMedia: {
+      type: String,
+      default: null
+    },
     // Image attachments and generated images
     imageAttachments: [{
       type: {

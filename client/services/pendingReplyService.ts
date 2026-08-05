@@ -124,6 +124,7 @@ async function persistRecoveredReply(marker: PendingReplyMarker, reply: any): Pr
     tokensUsed: typeof reply.tokensUsed === 'number' ? reply.tokensUsed : 0,
     ...(reply.modelUsed ? { modelUsed: reply.modelUsed } : {}),
     ...(Array.isArray(reply.sources) && reply.sources.length ? { sources: reply.sources } : {}),
+    ...(reply.media ? { media: reply.media } : {}),
   });
 }
 

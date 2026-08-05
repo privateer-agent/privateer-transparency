@@ -220,7 +220,7 @@ chatGraphSchema.methods.getFullStructure = async function() {
   const ChatEdge = mongoose.model('ChatEdge');
   
   const nodes = await ChatNode.find({ graphId: this._id, isActive: true })
-    .select('messageCount nodeType visualMetadata connectedEdgeIds lastActivity prompt aiResponse encryptedPrompt encryptedAiResponse encryptedSources encryptedResearchTrail encryptedNoteBody imageUrl imageAttachments videoAttachments fileAttachments modelId')
+    .select('messageCount nodeType visualMetadata connectedEdgeIds lastActivity prompt aiResponse encryptedPrompt encryptedAiResponse encryptedSources encryptedResearchTrail encryptedMedia encryptedNoteBody imageUrl imageAttachments videoAttachments fileAttachments modelId')
     .exec();
     
   const edges = await ChatEdge.find({ graphId: this._id, isActive: true })

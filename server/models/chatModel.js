@@ -79,6 +79,13 @@ const chatSchema = new mongoose.Schema(
       encryptedContextRefs: { type: String, default: null },
       // E2EE: encrypted Deep Research step trail (JSON array of {stage,label,query?,sources?,gap?,at}).
       encryptedResearchTrail: { type: String, default: null },
+      // E2EE: encrypted Visual-mode media ({images:[],videos:[]}) for the answer's
+      // Images / Videos sections. The URLs are public search results, but WHICH
+      // ones an answer surfaced is as revealing as the answer, so it's encrypted
+      // client-side like sources. Deliberately its own field rather than folded
+      // into encryptedSources: that blob decrypts to a bare array and an older
+      // client would lose its sources row if the shape changed underneath it.
+      encryptedMedia: { type: String, default: null },
       // E2EE: encrypted live weather snapshot (open-meteo) attached to assistant responses.
       // Decrypts to the WeatherData JSON shape consumed by WeatherCard.
       encryptedWeatherData: { type: String, default: null },

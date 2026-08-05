@@ -71,6 +71,8 @@ const chatNodeSchema = new mongoose.Schema(
     // Plaintext contains user queries and lines of inquiry, so it's encrypted client-side
     // alongside the AI response. Include in any projection that returns node content.
     encryptedResearchTrail: { type: String, default: null },
+    // E2EE: encrypted Visual-mode media ({images:[],videos:[]}) — see chatModel.
+    encryptedMedia: { type: String, default: null },
     // E2EE: encrypted live weather snapshot (open-meteo) attached to weather-intent
     // assistant responses. Decrypts to the WeatherData JSON shape consumed by WeatherCard.
     encryptedWeatherData: { type: String, default: null },
@@ -434,6 +436,7 @@ chatNodeSchema.statics.createGraphNode = async function(data) {
     encryptedAiResponse = null,
     encryptedSources = null,
     encryptedResearchTrail = null,
+    encryptedMedia = null,
     encryptedWeatherData = null,
     encryptedNoteBody = null,
     imageUrl = null,
@@ -462,6 +465,7 @@ chatNodeSchema.statics.createGraphNode = async function(data) {
     encryptedAiResponse,
     encryptedSources,
     encryptedResearchTrail,
+    encryptedMedia,
     encryptedWeatherData,
     encryptedNoteBody,
     imageUrl,

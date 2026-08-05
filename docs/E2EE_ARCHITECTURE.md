@@ -375,6 +375,29 @@ Wire format: a JSON string `{"iv":"<base64 12B>","ct":"<base64 ct ‖ tag>"}`.
 Plaintext fields on the server schemas (`content`, `aiResponse`, `title`,
 `prompt`) are kept optional only for legacy data that predates E2EE.
 
+### Visual mode media — encrypted, and not a carve-out
+
+Visual mode answers with an Images / Videos section built from the web-search
+results the server already fetched for that turn (`braveSearchService` —
+thumbnails and the `videos` block that response has always carried). None of it
+is user content: the URLs are public search results, and no extra provider call
+is made. It is nonetheless encrypted client-side into its own `encryptedMedia`
+blob before being persisted, because **which** images an answer surfaced is as
+revealing as the answer itself, and the answer is encrypted.
+
+Two deliberate details:
+
+- **Its own field, not folded into `encryptedSources`.** That blob decrypts to a
+  bare array; reshaping it into an object would blank the sources row on every
+  client older than the change. An unknown sibling field is simply ignored.
+- **Thumbnails render from Brave's own resized proxy** (`imgs.search.brave.com`,
+  ~5-7KB), never the publisher's original (routinely 1-2MB). That is the private
+  choice as well as the fast one: one host, which already saw the query, instead
+  of every publisher in the result set learning the user's IP and read-time. The
+  publisher's original is fetched only when the user explicitly opens an image —
+  the same exposure as following the link. This is the same hotlinking posture
+  the existing source-card hero images have, narrowed rather than widened.
+
 ## AI inference flow
 
 1. Client decrypts conversation history locally.
