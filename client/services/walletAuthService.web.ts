@@ -33,7 +33,8 @@ import { connectBrowserWallet } from './browserWalletProvider.web';
 import { connectEvmWallet } from './evmWalletProvider.web';
 import { connectSuiWallet } from './suiWalletProvider.web';
 import { connectTronWallet } from './tronWalletProvider.web';
-import { canLinkWalletViaBrowser, linkWalletViaBrowser } from './desktopWalletLink';
+import { canLinkWalletViaBrowser, linkWalletViaBrowser, LinkedSignatures } from './desktopWalletLink';
+import { ChainNamespace, WalletAccount } from './wallets/chains';
 
 // Re-export the platform-agnostic surface so existing imports from
 // '../services/walletAuthService' keep working unchanged on web.
@@ -43,6 +44,58 @@ export {
 } from './walletAuthShared';
 export type { WalletUser, WalletAuthResult } from './walletAuthShared';
 
+// ---------------------------------------------------------------------------
+// Desktop browser hand-off
+//
+// Electron loads no extensions, so there is no injected wallet of any kind in
+// the desktop renderer. Signing happens in the user's real browser and only the
+// signatures come back; everything after that — verify, enroll/unwrap, session
+// — still runs on this side. See ./desktopWalletLink.ts.
+// ---------------------------------------------------------------------------
+
+/** Rebuild the connected account from what the browser handed back. */
+function accountFromLink(linked: LinkedSignatures): WalletAccount {
+  // Solana is the one chain whose canonical address is derivable from the hex
+  // identity, which is all a pre-multi-chain page sends back.
+  if (linked.namespace === 'solana' && !linked.address) return solanaAccountFromHex(linked.idHex);
+  return { namespace: linked.namespace, address: linked.address!, idHex: linked.idHex };
+}
+
+/**
+ * Full sign-in through the browser hand-off, for any chain.
+ *
+ * Identical for all four because the chain-specific parts — which provider to
+ * connect, which vault message to sign, how the identity is encoded — all
+ * happen on the browser side and arrive here already normalized.
+ */
+async function handoffLogin(
+  chain: ChainNamespace,
+  nonce: string,
+  nonceId: string,
+  opts?: { recover?: boolean },
+): Promise<WalletAuthResult> {
+  const linked = await linkWalletViaBrowser('login', nonce, chain);
+  return completeWalletLogin({
+    account: accountFromLink(linked),
+    authSignature: linked.authSignature!,
+    authMessage: linked.authMessage!,
+    vaultSignature: linked.vaultSignature,
+    nonceId,
+  }, {
+    ...opts,
+    // Enrollment only: a second hand-off to the same browser. 'unlock' mode
+    // re-signs just the vault message, and we re-check the identity because a
+    // fresh hand-off is a fresh wallet session the user could switch accounts in.
+    resignVault: async () => {
+      const again = await linkWalletViaBrowser('unlock', '', chain);
+      if (again.idHex !== linked.idHex) {
+        throw new Error('A different wallet account signed the second time. Use the same account to finish setting up.');
+      }
+      return again.vaultSignature;
+    },
+  });
+}
+
 /**
  * Sign in via a browser Solana wallet. After this resolves, the in-memory
  * master key is loaded and the user is authenticated.
@@ -50,31 +103,7 @@ export type { WalletUser, WalletAuthResult } from './walletAuthShared';
 export async function solanaLogin(opts?: { recover?: boolean }): Promise<WalletAuthResult> {
   const { nonce, nonceId } = await fetchNonce();
 
-  // Electron desktop: no extension is injected here, so the signing happens in
-  // the user's real browser and only the signatures come back. Everything after
-  // that — verify, enroll/unwrap, session — still runs on this side.
-  if (canLinkWalletViaBrowser()) {
-    const linked = await linkWalletViaBrowser('login', nonce);
-    return completeWalletLogin({
-      account: solanaAccountFromHex(linked.pubkeyHex),
-      authSignature: linked.authSignature!,
-      authMessage: linked.authMessage!,
-      vaultSignature: linked.vaultSignature,
-      nonceId,
-    }, {
-      ...opts,
-      // Enrollment only: a second hand-off to the same browser. 'unlock' mode
-      // re-signs just the vault message, and we re-check the pubkey because a
-      // fresh hand-off is a fresh wallet session the user could switch accounts in.
-      resignVault: async () => {
-        const again = await linkWalletViaBrowser('unlock', '');
-        if (again.pubkeyHex !== linked.pubkeyHex) {
-          throw new Error('A different wallet account signed the second time. Use the same account to finish setting up.');
-        }
-        return again.vaultSignature;
-      },
-    });
-  }
+  if (canLinkWalletViaBrowser()) return handoffLogin('solana', nonce, nonceId, opts);
 
   const wallet = await connectBrowserWallet();
   const account = solanaAccount(wallet.pubkeyBytes);
@@ -105,6 +134,8 @@ export async function solanaLogin(opts?: { recover?: boolean }): Promise<WalletA
 export async function evmLogin(opts?: { recover?: boolean }): Promise<WalletAuthResult> {
   const { nonce, nonceId } = await fetchNonce();
 
+  if (canLinkWalletViaBrowser()) return handoffLogin('eip155', nonce, nonceId, opts);
+
   const wallet = await connectEvmWallet();
   const { account } = wallet;
   const { authMessage, vaultMessage } = buildWalletMessages(account, nonce);
@@ -132,6 +163,8 @@ export async function evmLogin(opts?: { recover?: boolean }): Promise<WalletAuth
  */
 export async function suiLogin(opts?: { recover?: boolean }): Promise<WalletAuthResult> {
   const { nonce, nonceId } = await fetchNonce();
+
+  if (canLinkWalletViaBrowser()) return handoffLogin('sui', nonce, nonceId, opts);
 
   const wallet = await connectSuiWallet();
   const { account } = wallet;
@@ -162,6 +195,8 @@ export async function suiLogin(opts?: { recover?: boolean }): Promise<WalletAuth
 export async function tronLogin(opts?: { recover?: boolean }): Promise<WalletAuthResult> {
   const { nonce, nonceId } = await fetchNonce();
 
+  if (canLinkWalletViaBrowser()) return handoffLogin('tron', nonce, nonceId, opts);
+
   const wallet = await connectTronWallet();
   const { account } = wallet;
   const { authMessage, vaultMessage } = buildWalletMessages(account, nonce);
@@ -185,9 +220,12 @@ export async function loadDerivedKey(): Promise<void> {
 
   // Desktop: same browser hand-off as sign-in, but only the vault signature is
   // needed — there's no nonce-bound auth message to re-sign for an already
-  // authenticated user.
+  // authenticated user. The chain has to be the one the account enrolled on for
+  // the same reason it does on the branches below: the vault message is
+  // namespace-scoped, so the wrong chain derives a KEK that cannot unwrap.
   if (canLinkWalletViaBrowser()) {
-    const linked = await linkWalletViaBrowser('unlock', '');
+    const chain: ChainNamespace = vault.walletChain ?? 'solana';
+    const linked = await linkWalletViaBrowser('unlock', '', chain);
     await completeLoadDerivedKey(vault, linked.vaultSignature);
     return;
   }
