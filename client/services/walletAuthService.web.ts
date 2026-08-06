@@ -33,7 +33,12 @@ import { connectBrowserWallet } from './browserWalletProvider.web';
 import { connectEvmWallet } from './evmWalletProvider.web';
 import { connectSuiWallet } from './suiWalletProvider.web';
 import { connectTronWallet } from './tronWalletProvider.web';
-import { canLinkWalletViaBrowser, linkWalletViaBrowser, LinkedSignatures } from './desktopWalletLink';
+import {
+  canLinkWalletViaBrowser,
+  linkWalletViaBrowser,
+  finishWalletLink,
+  LinkedSignatures,
+} from './desktopWalletLink';
 import { ChainNamespace, WalletAccount } from './wallets/chains';
 
 // Re-export the platform-agnostic surface so existing imports from
@@ -75,25 +80,40 @@ async function handoffLogin(
   opts?: { recover?: boolean },
 ): Promise<WalletAuthResult> {
   const linked = await linkWalletViaBrowser('login', nonce, chain);
-  return completeWalletLogin({
-    account: accountFromLink(linked),
-    authSignature: linked.authSignature!,
-    authMessage: linked.authMessage!,
-    vaultSignature: linked.vaultSignature,
-    nonceId,
-  }, {
-    ...opts,
-    // Enrollment only: a second hand-off to the same browser. 'unlock' mode
-    // re-signs just the vault message, and we re-check the identity because a
-    // fresh hand-off is a fresh wallet session the user could switch accounts in.
-    resignVault: async () => {
-      const again = await linkWalletViaBrowser('unlock', '', chain);
-      if (again.idHex !== linked.idHex) {
-        throw new Error('A different wallet account signed the second time. Use the same account to finish setting up.');
-      }
-      return again.vaultSignature;
-    },
-  });
+  try {
+    return await completeWalletLogin({
+      account: accountFromLink(linked),
+      authSignature: linked.authSignature!,
+      authMessage: linked.authMessage!,
+      vaultSignature: linked.vaultSignature,
+      nonceId,
+    }, {
+      ...opts,
+      // Enrollment only, and once in an account's lifetime. Ask the tab that
+      // just signed — it is still open and still holds the connected wallet, so
+      // the user sees one more wallet prompt rather than a whole second browser
+      // trip (new tab, reconnect, wallet picker).
+      resignVault: async () => {
+        const same = await linked.resign();
+        if (same) return same;
+
+        // The tab can't be asked: an older web build doesn't park the poll, an
+        // older desktop shell has no channel for it, or the user closed it. Fall
+        // back to the original second hand-off. 'unlock' mode re-signs just the
+        // vault message, and the identity is re-checked because a fresh hand-off
+        // is a fresh wallet session the user could switch accounts in.
+        const again = await linkWalletViaBrowser('unlock', '', chain);
+        if (again.idHex !== linked.idHex) {
+          throw new Error('A different wallet account signed the second time. Use the same account to finish setting up.');
+        }
+        return again.vaultSignature;
+      },
+    });
+  } finally {
+    // Whatever happened, the browser has nothing left to do — drop the listener
+    // rather than leaving the tab parked on a poll until it times out.
+    await finishWalletLink();
+  }
 }
 
 /**
@@ -226,7 +246,13 @@ export async function loadDerivedKey(): Promise<void> {
   if (canLinkWalletViaBrowser()) {
     const chain: ChainNamespace = vault.walletChain ?? 'solana';
     const linked = await linkWalletViaBrowser('unlock', '', chain);
-    await completeLoadDerivedKey(vault, linked.vaultSignature);
+    try {
+      await completeLoadDerivedKey(vault, linked.vaultSignature);
+    } finally {
+      // No enrollment here, so nothing will ever ask that tab for a second
+      // signature — let go of the listener immediately.
+      await finishWalletLink();
+    }
     return;
   }
 
