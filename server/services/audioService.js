@@ -21,17 +21,20 @@
  */
 
 /**
- * Shared speech-to-text / text-to-speech / music-generation logic.
+ * Shared speech-to-text / text-to-speech / music / sound-effect logic.
  *
  * Extracted from routes/audio.js so both the app voice path and the developer
  * /v1 audio endpoints (routes/v1.js) go through one provider-branched
  * implementation: NEAR AI / Tinfoil confidential enclaves, else OpenRouter's
- * dedicated /audio/transcriptions and /audio/speech endpoints. Billing is done
- * here (kinds 'stt' / 'tts' / 'musicGen'); callers just shape the HTTP response.
+ * dedicated /audio/transcriptions and /audio/speech endpoints, plus fal for the
+ * one thing neither can do (see generateSfx). Billing is done here (kinds
+ * 'stt' / 'tts' / 'musicGen' / 'sfxGen'); callers just shape the HTTP response.
  *
  * E2EE note (CLAUDE.md §5): recorded audio (STT) and reply text (TTS) transit
  * to the provider exactly like chat inference — forwarded, never persisted.
  * Music generation carries a wider, deliberate carve-out — see generateMusic.
+ * Sound effects deliberately do NOT reuse that carve-out: they sit behind the
+ * ordinary non-ZDR media gate, enforced by the route — see generateSfx.
  */
 const logger = require('../utils/logger');
 const Sentry = require('../instrument');
@@ -39,6 +42,11 @@ const billingService = require('./billingService');
 const inferenceService = require('./inferenceService');
 const nearAiService = require('./nearAiService');
 const tinfoilService = require('./tinfoilService');
+const falService = require('./falService');
+const {
+  isFalAudioModel, falAudioModel, falModelIdsFor, falResolveVoice,
+  falAudioCostUsd, falClampDuration, buildFalInput, falOutputUrl, falAudioMime,
+} = require('../data/falModels');
 const { tinfoilVoicesFor } = require('../data/tinfoilModels');
 const UserStoragePrefs = require('../models/userStoragePrefsModel');
 
@@ -78,6 +86,17 @@ const DEFAULT_TTS_MODEL = process.env.DEFAULT_TTS_MODEL || 'tinfoil/qwen3-tts';
 // Tinfoil models never use this — see resolveVoice.
 const DEFAULT_TTS_VOICE = process.env.DEFAULT_TTS_VOICE || 'Zephyr';
 
+// The input cap every speech backend has always been given, named now that a
+// second one reads it (the fal path bills on exactly these characters, so the
+// number the user is charged for and the number we send have to be the same
+// expression).
+const TTS_INPUT_MAX = 8000;
+
+// A fal speech job is a synchronous round trip plus a CDN fetch, on models that
+// synthesize a paragraph in a few seconds. Shorter than the SFX bound because
+// speech is usually in front of someone waiting to hear it.
+const FAL_TTS_TIMEOUT_MS = Number(process.env.FAL_TTS_TIMEOUT_MS) || 60_000;
+
 // OpenAI-compatible clients always send an OpenAI voice name (`alloy`, `nova`,
 // …), which no backend we route to accepts. Gemini's are named differently
 // (`Zephyr`, `Puck`, …) and passing `alloy` to it 502s, so map the OpenAI names
@@ -98,6 +117,11 @@ const OPENAI_TO_GEMINI_VOICE = {
 // the Gemini mapping below and a bare passthrough 400 there. Fall back to the
 // model's own first speaker rather than the global Gemini default.
 function resolveVoice(voice, model) {
+  // fal's voice models are the same story as Tinfoil's, one provider along:
+  // each endpoint accepts only its own speakers (Kokoro's `af_bella`,
+  // ElevenLabs' `Rachel`, Orpheus' `tara`), and the table in data/falModels.js
+  // is the only place those sets exist.
+  if (isFalAudioModel(model)) return falResolveVoice(model, voice) || '';
   if (tinfoilService.isTinfoilModel(model)) {
     const presets = tinfoilVoicesFor(model);
     if (voice && presets.includes(voice)) return voice;
@@ -223,6 +247,37 @@ function pcmToWav(pcm, sampleRate, channels, bitsPerSample) {
   return Buffer.concat([header, pcm]);
 }
 
+// ── fal generations ──────────────────────────────────────────────────────────
+
+/**
+ * Run one fal audio generation and hand back finished bytes.
+ *
+ * Shared by all three fal surfaces (speech, music, effects) because the shape is
+ * identical and the differences are all in the table: build the request from
+ * data/falModels.js, run it, pull the output URL out of wherever that endpoint
+ * puts it, and fetch the bytes **in this process**. The last step is not an
+ * optimisation to skip — fal's output URL is public and unauthenticated for as
+ * long as it lives, so it must die here rather than travel to a client (see the
+ * falService header).
+ *
+ * `emptyCode` is the caller's own "a 200 with no audio" code. That case is
+ * almost always the safety checker declining a prompt, and each surface has copy
+ * for it; a shared code would make all three say "the network failed".
+ */
+async function runFalAudio(modelId, { prompt, voice, seconds, promptMax, timeoutMs, emptyCode }) {
+  const input = buildFalInput(modelId, { prompt, voice, seconds, promptMax });
+  const result = await falService.run(modelId, input, { timeoutMs });
+  const url = falOutputUrl(modelId, result);
+  if (!url) {
+    throw Object.assign(new Error('no audio was returned'), { statusCode: 502, code: emptyCode });
+  }
+  const { buffer, mimeType } = await falService.fetchOutput(url, { timeoutMs });
+  // Not the CDN's word for it. Some endpoints serve audio as
+  // application/octet-stream, and that label reaches the client, which picks a
+  // file extension from it — see falAudioMime.
+  return { buffer, mimeType: falAudioMime(modelId, url, mimeType) };
+}
+
 /**
  * Transcribe audio → { text, model }. Bills 'stt'. Throws {statusCode,code} on
  * bad input / provider failure / ZDR-key / insufficient funds.
@@ -280,18 +335,39 @@ async function synthesizeSpeech({ userId, text, voice, format, modelId, requireZ
   const model = resolveAudioModel(modelId, DEFAULT_TTS_MODEL);
   const responseFormat = resolveResponseFormat(model, format);
   const wireVoice = resolveVoice(voice, model);
+  const input = text.slice(0, TTS_INPUT_MAX);
+
+  // fal voices. Not an /audio/speech backend at all — a job that answers with a
+  // URL — so this returns finished bytes here rather than joining the
+  // Response-shaped path below. Callers MUST have cleared assertMediaModelAllowed
+  // first: fal has no ZDR endpoint, and speech is gated exactly like image and
+  // video generation (see data/falModels.js). This function doesn't gate itself,
+  // for the same reason generateSfx doesn't — the gate needs the request's
+  // requireZdr/allowNonZdrMedia, which is route-shaped.
+  if (isFalAudioModel(model)) {
+    const { buffer, mimeType } = await runFalAudio(model, {
+      prompt: input, voice: wireVoice, promptMax: TTS_INPUT_MAX,
+      timeoutMs: FAL_TTS_TIMEOUT_MS, emptyCode: 'TTS_FAILED',
+    });
+    // Billed on characters submitted, which is exactly what fal meters — so
+    // unlike the OpenRouter path there is nothing to look up afterwards.
+    chargeAudio(userId, falAudioCostUsd(model, { chars: input.length }), {
+      model, kind: 'tts', markup: billingMarkup, origin,
+    }).catch(() => {});
+    return { buffer, mimeType, model };
+  }
 
   let r;
   let tinfoilCostUsd = null;
   if (tinfoilService.isTinfoilModel(model)) {
-    const out = await tinfoilService.speechRequest({ text: text.slice(0, 8000), voice: wireVoice, responseFormat, modelId: model });
+    const out = await tinfoilService.speechRequest({ text: input, voice: wireVoice, responseFormat, modelId: model });
     r = out.response;
     tinfoilCostUsd = out.providerCostUsd;
   } else {
     r = await fetch(`${OPENROUTER_BASE}/audio/speech`, {
       method: 'POST',
       headers: { ...inferenceService.orHeaders(requireZdr), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, input: text.slice(0, 8000), voice: wireVoice, response_format: responseFormat }),
+      body: JSON.stringify({ model, input, voice: wireVoice, response_format: responseFormat }),
     });
   }
   if (!r.ok) {
@@ -357,7 +433,10 @@ async function synthesizeSpeechStream({ userId, text, voice, format, modelId, re
     throw Object.assign(new Error('text is required'), { statusCode: 400, code: 'TEXT_REQUIRED' });
   }
   const model = resolveAudioModel(modelId, DEFAULT_TTS_MODEL);
-  if (PCM_ONLY_TTS_MODEL.test(model)) {
+  // Same "not a failure, just not streamable" answer for the fal voices: fal
+  // renders the whole clip and answers with a URL, so there is no byte stream to
+  // pipe. The client falls back to the buffered endpoint.
+  if (PCM_ONLY_TTS_MODEL.test(model) || isFalAudioModel(model)) {
     // Not a failure — just not streamable. A distinct code so the client falls
     // back to the buffered endpoint instead of surfacing an error.
     throw Object.assign(new Error('model cannot stream'), { statusCode: 409, code: 'TTS_STREAM_UNSUPPORTED' });
@@ -434,6 +513,12 @@ async function synthesizeSpeechStream({ userId, text, voice, format, modelId, re
 const MUSIC_MODELS = {
   'google/lyria-3-clip-preview': { approxCostUsd: 0.04 },  // 30s clip
   'google/lyria-3-pro-preview':  { approxCostUsd: 0.08 },  // full song
+  // Everything fal hosts for music, priced from data/falModels.js so there is
+  // one table of fal prices rather than two that can disagree. These are ALSO
+  // non-ZDR — adding them widens the choice inside the carve-out, it does not
+  // narrow the carve-out. If a zero-retention music model ever ships anywhere,
+  // that is the moment to collapse this back into the ordinary media gate.
+  ...Object.fromEntries(falModelIdsFor('audioGen').map(id => [id, { approxCostUsd: falAudioModel(id).typicalUsd }])),
 };
 // Env-overridable like the TTS/STT defaults, but validated against the table
 // above: an override outside it would otherwise be returned unchecked by
@@ -471,8 +556,17 @@ function resolveMusicModel(modelId) {
   );
 }
 
-/** Provider-side price of one generation, before markup. */
-function musicCostEstimateUsd(modelId) {
+/**
+ * Provider-side price of one generation, before markup.
+ *
+ * `duration` matters only for the fal models billed by length (ElevenLabs by the
+ * minute, CassetteAI by the minute); a Lyria SKU and a flat-priced fal model
+ * ignore it, which is why it's optional rather than required.
+ */
+function musicCostEstimateUsd(modelId, duration) {
+  if (isFalAudioModel(modelId)) {
+    return falAudioCostUsd(modelId, { seconds: falClampDuration(modelId, duration) ?? 0 });
+  }
   return MUSIC_MODELS[modelId]?.approxCostUsd ?? MUSIC_MODELS[FALLBACK_MUSIC_MODEL].approxCostUsd;
 }
 
@@ -480,20 +574,45 @@ function musicCostEstimateUsd(modelId) {
  * What the user is actually charged for one generation. Music is fixed-price
  * per call, so unlike chat/image the balance gate can be exact instead of the
  * bare $0.01 minimum — a user with $0.05 shouldn't start a $0.10 generation.
+ * With a length-priced model that exactness now depends on the requested
+ * duration, so the gate has to be given the same one the generation will use.
  */
-function musicChargeEstimateUsd(modelId) {
-  return musicCostEstimateUsd(modelId) * MARKUP;
+function musicChargeEstimateUsd(modelId, duration) {
+  return musicCostEstimateUsd(modelId, duration) * MARKUP;
 }
 
 /**
  * Generate music from a text prompt → { buffer, mimeType, model, costUsd }.
  * Bills 'musicGen'. Throws {statusCode,code} on bad input / provider failure.
  */
-async function generateMusic({ userId, prompt, modelId, billingMarkup, origin = 'app' }) {
+async function generateMusic({ userId, prompt, modelId, duration, billingMarkup, origin = 'app' }) {
   if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
     throw Object.assign(new Error('prompt is required'), { statusCode: 400, code: 'PROMPT_REQUIRED' });
   }
   const model = resolveMusicModel(modelId);
+
+  // fal's music models. Same carve-out, same posture: falService.run sends no
+  // user field, no account id and no history either, so the prompt reaches the
+  // provider attributable to our API key and nothing finer — and fal is asked to
+  // store neither the request nor the output (X-Fal-Store-IO, see falService).
+  // Unlike Lyria, most of these take a length, so the price follows it.
+  if (isFalAudioModel(model)) {
+    const seconds = falClampDuration(model, duration);
+    const { buffer, mimeType } = await runFalAudio(model, {
+      prompt, seconds, promptMax: MUSIC_PROMPT_MAX,
+      timeoutMs: MUSIC_TIMEOUT_MS, emptyCode: 'MUSIC_EMPTY',
+    });
+    const costUsd = falAudioCostUsd(model, { seconds: seconds ?? 0 });
+    // Billed after the fact and never fatal, as on the Lyria path below: fal has
+    // charged us and the user has the track, so a billing hiccup must not
+    // withhold it. The route's balance gate is what stops an empty wallet.
+    try {
+      await chargeAudio(userId, costUsd, { model, kind: 'musicGen', markup: billingMarkup, origin });
+    } catch (err) {
+      Sentry.captureException(err, { level: 'warning', tags: { op: 'audio_charge_musicGen' } });
+    }
+    return { buffer, mimeType, model, costUsd, durationSeconds: seconds };
+  }
 
   // Exactly the body the endpoint accepts. Note what is absent: no `user`
   // field. OpenRouter forwards it to the provider as an end-user identifier,
@@ -629,11 +748,157 @@ async function readMusicStream(response) {
   return { audioParts, costUsd };
 }
 
+// ── Sound-effect generation (fal / Stable Audio 3 Small SFX) ─────────────────
+//
+// The one path in this file that leaves both OpenRouter and our TEE providers:
+// neither has an SFX model at all (see the falService header). Everything below
+// is shaped after generateMusic — fixed price per call, whole clip buffered,
+// bytes handed back for the client to encrypt — with one deliberate difference.
+//
+// PRIVACY — NOT a carve-out, and it must stay that way. Music is exempt from
+// assertMediaModelAllowed because gating it would leave a default account with
+// an empty picker and no alternative anywhere in the catalog (CLAUDE.md §5).
+// SFX is not in that position: a user who wants zero-retention audio can simply
+// not generate sound effects, exactly as they can decline any other non-ZDR
+// media model. So SFX goes through the ordinary gate, and the route — not this
+// function — is where that gate lives, mirroring image and video generation.
+// Do not reuse music's exemption here, and do not add a privacy note in its
+// place: the gate is the disclosure, and a note beside it would imply the gate
+// is insufficient.
+// Every sound-effect model we serve, priced from the one fal table (see
+// data/falModels.js). fal returns no inline cost with the response — unlike
+// OpenRouter, which hands back usage.cost — so that table is what we actually
+// bill against and it can only be kept honest by reconciling against the fal
+// invoice. If fal repriced and nobody updated it, we would bill the stale number
+// forever and silently, which is exactly the failure generateMusic logs a
+// warning about. There is no runtime signal to warn on here, so the check is
+// manual — and now covers three models rather than one.
+//
+// `approxCostUsd` is the *typical* generation (a 5-second effect), which is what
+// the balance gate needs; the charge is computed from the actual length for the
+// models fal meters by the second.
+const SFX_MODELS = Object.fromEntries(
+  falModelIdsFor('sfxGen').map(id => [id, { approxCostUsd: falAudioModel(id).typicalUsd }])
+);
+const FALLBACK_SFX_MODEL = 'fal-ai/stable-audio-3/small/sfx/text-to-audio';
+const DEFAULT_SFX_MODEL = Object.hasOwn(SFX_MODELS, process.env.DEFAULT_SFX_MODEL || '')
+  ? process.env.DEFAULT_SFX_MODEL
+  : FALLBACK_SFX_MODEL;
+
+// A description of one sound, not a scene. Shorter than MUSIC_PROMPT_MAX
+// because the model is 459M parameters and a paragraph makes its output worse,
+// not longer — the cap is a nudge as much as a guard.
+const SFX_PROMPT_MAX = 500;
+
+// What the model will actually render, in seconds. The ceiling is the model's
+// own; the floor is where a request stops being worth a round trip.
+const SFX_MIN_DURATION = 1;
+const SFX_MAX_DURATION = 30;
+const SFX_DEFAULT_DURATION = 5;
+
+// Generation is a few seconds on this model. The bound is loose enough to
+// absorb a cold start without being loose enough to hold a request open past
+// the point the user has given up.
+const SFX_TIMEOUT_MS = Number(process.env.SFX_TIMEOUT_MS) || 90_000;
+
+/** Resolve + validate the SFX model against the allowlist. */
+function resolveSfxModel(modelId) {
+  if (!modelId) return DEFAULT_SFX_MODEL;
+  // hasOwn, not truthiness — same prototype-key trap resolveMusicModel documents.
+  if (Object.hasOwn(SFX_MODELS, modelId)) return modelId;
+  throw Object.assign(
+    new Error(`${modelId} is not a sound-effect model`),
+    { statusCode: 400, code: 'SFX_MODEL_UNSUPPORTED', modelId }
+  );
+}
+
+/**
+ * Clamp a requested duration into what the chosen model will render.
+ *
+ * Bounds are per model now (data/falModels.js) rather than global, so the model
+ * id is part of the question — though every effect model we offer happens to
+ * agree on 1-30s, which is why the exported SFX_MIN/MAX/DEFAULT constants the
+ * client mirrors are still meaningful.
+ *
+ * "Unspecified" is checked before the numeric coercion, not after: `Number(null)`
+ * and `Number('')` are both 0, which is finite, so a caller that omitted the
+ * field by sending null would fall through the clamp and get a 1-second effect
+ * instead of the default. Absent means default; present-but-out-of-range means
+ * clamp. Those are different answers and the coercion erases the difference.
+ * (falClampDuration is where that rule now lives — it is the same rule.)
+ */
+function resolveSfxDuration(duration, modelId = DEFAULT_SFX_MODEL) {
+  return falClampDuration(modelId, duration) ?? SFX_DEFAULT_DURATION;
+}
+
+/**
+ * Provider-side price of one generation, before markup. `seconds` is only read
+ * by the models fal meters by length (ElevenLabs); it falls back to that model's
+ * default duration, which is what the balance gate wants.
+ */
+function sfxCostEstimateUsd(modelId, seconds) {
+  if (isFalAudioModel(modelId)) return falAudioCostUsd(modelId, { seconds });
+  return SFX_MODELS[modelId]?.approxCostUsd ?? SFX_MODELS[FALLBACK_SFX_MODEL].approxCostUsd;
+}
+
+/** What the user is charged — fixed price per call, so the gate can be exact. */
+function sfxChargeEstimateUsd(modelId, seconds) {
+  return sfxCostEstimateUsd(modelId, seconds) * MARKUP;
+}
+
+/**
+ * Generate a sound effect → { buffer, mimeType, model, durationSeconds }.
+ * Bills 'sfxGen'. Throws {statusCode,code} on bad input / provider failure.
+ *
+ * Callers MUST have cleared assertMediaModelAllowed first — see the block
+ * comment above. This function does not gate itself, for the same reason
+ * generateImage doesn't: the gate needs the request's requireZdr /
+ * allowNonZdrMedia, which is route-shaped, not service-shaped.
+ */
+async function generateSfx({ userId, prompt, modelId, duration, billingMarkup, origin = 'app' }) {
+  if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
+    throw Object.assign(new Error('prompt is required'), { statusCode: 400, code: 'PROMPT_REQUIRED' });
+  }
+  const model = resolveSfxModel(modelId);
+  const durationSeconds = resolveSfxDuration(duration, model);
+
+  // The request shape is per model — text field, duration field, output format
+  // and safety flag all differ between the three (see data/falModels.js). Every
+  // fixed field there is restated rather than inherited, so a silent flip of a
+  // provider default can't change what our users can generate without a change
+  // here to explain it. A 200 with no audio object is SFX_EMPTY — most often the
+  // safety checker declining a prompt, so it gets a distinct code rather than
+  // reading to the user as a network failure.
+  const { buffer, mimeType } = await runFalAudio(model, {
+    prompt, seconds: durationSeconds, promptMax: SFX_PROMPT_MAX,
+    timeoutMs: SFX_TIMEOUT_MS, emptyCode: 'SFX_EMPTY',
+  });
+
+  // Billed after the fact and never fatal, exactly as in generateMusic: fal has
+  // already charged us and the user already has the audio, so a billing hiccup
+  // must not withhold it. The route's balance gate is what keeps an empty
+  // wallet from starting a generation in the first place.
+  try {
+    await chargeAudio(userId, sfxCostEstimateUsd(model, durationSeconds), {
+      model, kind: 'sfxGen', markup: billingMarkup, origin,
+    });
+  } catch (err) {
+    Sentry.captureException(err, { level: 'warning', tags: { op: 'audio_charge_sfxGen' } });
+  }
+
+  return { buffer, mimeType, model, durationSeconds };
+}
+
 module.exports = {
   transcribe,
   synthesizeSpeech,
   synthesizeSpeechStream,
   generateMusic,
+  generateSfx,
+  resolveSfxModel,
+  resolveSfxDuration,
+  sfxCostEstimateUsd,
+  sfxChargeEstimateUsd,
   resolveMusicModel,
   musicCostEstimateUsd,
   musicChargeEstimateUsd,
@@ -643,6 +908,10 @@ module.exports = {
   // response headers, asserted without touching a provider.
   resolveAudioModel,
   resolveResponseFormat,
+  // Also used by routes/audio.js → /voice-preview: the shared preview cache has
+  // to key on the SAME (model, voice, format) triple synthesis will actually
+  // run, or two spellings of one clip get two cache entries.
+  resolveVoice,
   parsePcmParams,
   RETIRED_AUDIO_MODELS,
   DEFAULT_STT_MODEL,
@@ -651,4 +920,10 @@ module.exports = {
   DEFAULT_MUSIC_MODEL,
   MUSIC_MODELS,
   MUSIC_PROMPT_MAX,
+  DEFAULT_SFX_MODEL,
+  SFX_MODELS,
+  SFX_PROMPT_MAX,
+  SFX_MIN_DURATION,
+  SFX_MAX_DURATION,
+  SFX_DEFAULT_DURATION,
 };

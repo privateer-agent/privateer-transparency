@@ -39,8 +39,8 @@ const req = (endpoint: string, options: RequestInit = {}): Promise<Response> =>
 export type ShareSourceType = 'chat' | 'graph' | 'cargo' | 'audio';
 export type ShareSourceBackend = 'cloud' | 'local';
 
-/** What produced a shared clip — the viewer labels speech and music apart. */
-export type ShareAudioKind = 'speech' | 'music';
+/** What produced a shared clip — the viewer labels the three modes apart. */
+export type ShareAudioKind = 'speech' | 'music' | 'sfx';
 
 /**
  * Audio only: everything a clip share needs, all of it already in the caller's

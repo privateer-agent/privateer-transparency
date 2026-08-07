@@ -50,6 +50,9 @@ const { requireDailyCap, requireConcurrencySlot, requireFeature } = require('../
 const { handleChatCompletion } = require('../services/openaiProxyHandler');
 const { handleImageGeneration, handleVideoSubmit, handleVideoStatus } = require('../services/openaiMediaHandler');
 const audioService = require('../services/audioService');
+// The non-ZDR media gate, shared with the app and agent paths — /audio/sfx is
+// the only /v1 audio route that needs it.
+const { assertMediaModelAllowed, resolveAllowNonZdrMedia } = require('../controllers/chatController');
 const billingService = require('../services/billingService');
 const { listEnabledModels } = require('../services/inferenceService');
 
@@ -173,7 +176,65 @@ router.post(
   }
 });
 
+// ── Audio: sound effects (returns raw audio bytes) ────────────────────────────
+//
+// Shaped like /audio/speech — bytes back, not JSON — because the caller wants a
+// file, and OpenAI's own audio endpoints set that precedent.
+//
+// The one difference worth knowing about: this is the only /v1 audio route
+// behind the non-ZDR media gate. Sound effects run on fal, which has no
+// zero-data-retention endpoint, so a key whose account requires ZDR gets a 403
+// `ZDR_MEDIA_BLOCKED` until non-ZDR media generation is enabled. That is the
+// same rule the app enforces (CLAUDE.md §5) — not an API-only restriction — and
+// it is deliberately NOT the exemption music takes.
+router.post(
+  '/audio/sfx',
+  apiRateLimiter,
+  requireDailyCap('sfxGen'),
+  // Fixed price per call, so the gate can be exact rather than the bare $0.01
+  // floor the speech route uses.
+  (req, res, next) => {
+    let estimate;
+    try {
+      estimate = audioService.sfxChargeEstimateUsd(audioService.resolveSfxModel(req.body?.model));
+    } catch (err) {
+      return sendMediaError(res, err, 'audio_sfx');
+    }
+    return checkCreditBalance(estimate)(req, res, next);
+  },
+  requireConcurrencySlot({ keyPrefix: 'apikey', cap: API_CONCURRENCY_CAP }),
+  async (req, res) => {
+    try {
+      const body = req.body || {};
+      const prompt = typeof body.input === 'string' ? body.input : body.prompt;
+      if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
+        return oaError(res, 400, '`input` text is required.', 'PROMPT_REQUIRED');
+      }
+
+      const modelId = audioService.resolveSfxModel(body.model);
+      const requireZdr = await audioService.resolveRequireZdr(req.userId, body.requireZdr);
+      const allowNonZdrMedia = await resolveAllowNonZdrMedia(req.userId, body.allowNonZdrMedia);
+      await assertMediaModelAllowed({ userId: req.userId, modelId, requireZdr, allowNonZdrMedia });
+
+      const { buffer, mimeType, durationSeconds } = await audioService.generateSfx({
+        userId: req.userId, prompt, modelId, duration: body.duration,
+        billingMarkup: billingService.apiMarkupFactor(), origin: 'api',
+      });
+      res.setHeader('Content-Type', mimeType || 'audio/mpeg');
+      res.setHeader('Content-Length', buffer.length);
+      // The rendered length, so a caller that clamped its request can tell
+      // without decoding the file.
+      res.setHeader('X-Privateer-Duration-Seconds', String(durationSeconds));
+      return res.send(buffer);
+    } catch (err) {
+      return sendMediaError(res, err, 'audio_sfx');
+    }
+  });
+
 function sendMediaError(res, err, op) {
+  // ZDR_MEDIA_BLOCKED already carries statusCode 403 from assertMediaModelAllowed,
+  // so it flows through as a 403 with its own actionable message rather than
+  // being flattened into a 500.
   const status = err.statusCode || (err.code === 'INSUFFICIENT_FUNDS' ? 402 : err.code === 'ZDR_KEY_UNAVAILABLE' ? 503 : 500);
   const code = err.code || 'INFERENCE_ERROR';
   if (status >= 500) logger.error(`[v1 ${op}]`, err.message, err.upstreamStatus || '', err.upstreamDetail || '');

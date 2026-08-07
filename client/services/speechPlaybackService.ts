@@ -32,7 +32,7 @@ import { Platform } from 'react-native';
 import { Audio } from 'expo-av';
 import * as Speech from 'expo-speech';
 import { isGuestSession } from './sessionMode';
-import { synthesizeSpeechBytes, audioBytesToUri } from './voiceChatService';
+import { synthesizeSpeechBytes, fetchVoicePreview, audioBytesToUri } from './voiceChatService';
 
 interface SpeakOptions {
   /** Playback finished on its own. Not called when interrupted by stop(). */
@@ -166,6 +166,27 @@ function withActivity(mine: number, handlers: SpeakOptions): SpeakOptions {
   };
 }
 
+// ── Preview clip memo ────────────────────────────────────────────────────────
+// Playable URIs for voices auditioned this session, keyed by model|voice|locale.
+// The server already serves these from a cache shared across accounts, so this
+// only saves the round trip and (on native) a second identical file write — but
+// tapping back and forth between two voices is exactly how people choose one,
+// and that comparison should be instant rather than a network wait each way.
+//
+// Bounded because each native entry owns a file in the cache directory. FIFO
+// eviction: with ~90 voices in the largest catalog, the cap is "the handful you
+// are actually comparing", not "everything you clicked".
+const PREVIEW_MEMO_MAX = 24;
+const previewMemo = new Map<string, string>();
+
+const previewMemoKey = (o: { modelId: string; voice: string; locale?: string }) =>
+  `${o.modelId}|${o.voice}|${o.locale || ''}`;
+
+/** Clear the session's preview URIs (the sheet does this on close). */
+export function clearVoicePreviewCache(): void {
+  previewMemo.clear();
+}
+
 /**
  * Audition one specific model + voice, ignoring the saved preference.
  *
@@ -175,24 +196,37 @@ function withActivity(mine: number, handlers: SpeakOptions): SpeakOptions {
  * engine — a preview that silently plays the system voice would be telling the
  * user this is what the voice they're auditioning sounds like, which is a lie.
  *
+ * The clip comes from /api/audio/voice-preview rather than /api/audio/speech:
+ * same synthesis, but the sentence is the server's own and the result is cached
+ * globally, so a given voice is paid for once across all accounts instead of
+ * once per tap. That is also why there is no `text` parameter — see
+ * `fetchVoicePreview`.
+ *
  * Resolves when playback has started; rejects if synthesis failed, so the
  * caller can drop its spinner either way.
  */
 export async function previewVoice(
-  text: string,
-  opts: { modelId: string; voice: string },
+  opts: { modelId: string; voice: string; locale?: string },
 ): Promise<void> {
-  const trimmed = (text || '').trim();
-  if (!trimmed) return;
+  if (!opts?.modelId || !opts?.voice) return;
 
   await stopSpeech();
   const mine = generation;
   setActivity(true, null);
 
   try {
-    const { audioBase64, mimeType } = await synthesizeSpeechBytes(trimmed, opts);
-    if (generation !== mine) return; // user moved on mid-synthesis
-    const uri = await audioBytesToUri(audioBase64, mimeType);
+    const key = previewMemoKey(opts);
+    let uri = previewMemo.get(key);
+    if (!uri) {
+      const { audioBase64, mimeType } = await fetchVoicePreview(opts);
+      if (generation !== mine) return; // user moved on mid-fetch
+      uri = await audioBytesToUri(audioBase64, mimeType);
+      if (previewMemo.size >= PREVIEW_MEMO_MAX) {
+        const oldest = previewMemo.keys().next().value;
+        if (oldest !== undefined) previewMemo.delete(oldest);
+      }
+      previewMemo.set(key, uri);
+    }
     if (generation !== mine) return;
     await playUri(uri, mine, withActivity(mine, {}));
   } catch (err) {

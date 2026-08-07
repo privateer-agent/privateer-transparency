@@ -69,11 +69,12 @@ const libraryAudioSchema = new mongoose.Schema(
     // field that doesn't exist and under-refunds by the AES-GCM overhead.)
     encryptedSize: { type: Number, default: null },
 
-    // Provenance. 'tts' and 'music' are the Audio studio's two modes (spoken
-    // text and generated music). 'upload' is reserved for a future chatless
-    // audio import; audio that arrives via a chat keeps living in
-    // Chat.messages[].fileAttachments[] and is shaped with source: 'chat'.
-    source: { type: String, enum: ['tts', 'music', 'upload'], default: 'tts', index: true },
+    // Provenance. 'tts', 'music' and 'sfx' are the Audio studio's three modes
+    // (spoken text, generated music, generated sound effects). 'upload' is
+    // reserved for a future chatless audio import; audio that arrives via a
+    // chat keeps living in Chat.messages[].fileAttachments[] and is shaped with
+    // source: 'chat'.
+    source: { type: String, enum: ['tts', 'music', 'sfx', 'upload'], default: 'tts', index: true },
 
     // Render hint only — not content, not identifying.
     durationMs: { type: Number, default: null },

@@ -1,7 +1,7 @@
 import { Platform } from 'react-native';
 import * as FileSystem from 'expo-file-system/legacy';
 import authService from './authService';
-import { getActionModel, resolveTtsVoice } from './modelService';
+import { getActionModel, resolveTtsVoice, getRequireZdr, getAllowNonZdrMedia } from './modelService';
 import i18n from '../i18n';
 
 /**
@@ -104,15 +104,28 @@ export async function synthesizeSpeechBytes(
   // model's supported voices (carrying an old/foreign voice would error upstream).
   const modelId = opts.modelId || (await getActionModel('tts')).modelId;
   const voice = opts.voice || (await resolveTtsVoice(modelId));
+  // The voice catalog now spans confidential-compute models and non-ZDR ones
+  // (fal). Which of those an account may use is a *device* fact on the local
+  // backend — the prefs never leave it (CLAUDE.md §2) — so they travel with the
+  // request exactly as sfxService sends them, rather than being read server-side.
+  const [requireZdr, allowNonZdrMedia] = await Promise.all([
+    getRequireZdr(),
+    getAllowNonZdrMedia(),
+  ]);
 
   const res = await authService.makeAuthenticatedRequest('/api/audio/speech', {
     method: 'POST',
-    body: JSON.stringify({ text: trimmed, ttsModelId: modelId, voice }),
+    body: JSON.stringify({ text: trimmed, ttsModelId: modelId, voice, requireZdr, allowNonZdrMedia }),
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({} as any));
     if (data?.code === 'FEATURE_LOCKED') {
       throw new VoiceChatError(data?.message || 'Voice chat requires a higher plan.', 'FEATURE_LOCKED');
+    }
+    // A non-ZDR voice with the opt-in off. A setting, not a failure — callers
+    // branch on this code to offer the toggle, as they do for sound effects.
+    if (res.status === 403 || data?.code === 'ZDR_MEDIA_BLOCKED') {
+      throw new VoiceChatError(i18n.t('voice.errors.zdrBlocked'), 'ZDR_MEDIA_BLOCKED');
     }
     if (res.status === 402 || data?.code === 'INSUFFICIENT_FUNDS') {
       throw new VoiceChatError(i18n.t('voice.errors.creditsTts'), 'INSUFFICIENT_FUNDS');
@@ -125,6 +138,47 @@ export async function synthesizeSpeechBytes(
   if (!audioBase64) throw new VoiceChatError(i18n.t('voice.errors.ttsEmpty'), 'TTS_EMPTY');
 
   return { audioBase64, mimeType, modelId, voice };
+}
+
+/**
+ * Fetch the audition clip for one model + voice → { audioBase64, mimeType }.
+ *
+ * Not `synthesizeSpeechBytes` with a sample string, deliberately. The clip this
+ * returns is served from a cache shared by every account (server-side
+ * voicePreviewStore), and the price of that sharing is that the caller doesn't
+ * get to choose the words: we send a locale, the server reads the sample
+ * sentence out of its own catalog, and the first account to audition a given
+ * voice is the last one to pay for it. Passing text here would turn a cache of
+ * app assets into a cross-account store of user content — hence no text param.
+ *
+ * `cached` comes back for diagnostics only; nothing branches on it today.
+ */
+export async function fetchVoicePreview(
+  opts: { modelId: string; voice: string; locale?: string },
+): Promise<{ audioBase64: string; mimeType: string; cached: boolean }> {
+  const res = await authService.makeAuthenticatedRequest('/api/audio/voice-preview', {
+    method: 'POST',
+    body: JSON.stringify({
+      ttsModelId: opts.modelId,
+      voice: opts.voice,
+      locale: opts.locale || i18n.language,
+    }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({} as any));
+    if (data?.code === 'FEATURE_LOCKED') {
+      throw new VoiceChatError(data?.message || i18n.t('voice.errors.featureLocked'), 'FEATURE_LOCKED');
+    }
+    if (res.status === 402 || data?.code === 'INSUFFICIENT_FUNDS') {
+      throw new VoiceChatError(i18n.t('voice.errors.creditsTts'), 'INSUFFICIENT_FUNDS');
+    }
+    throw new VoiceChatError(i18n.t('voice.errors.ttsFailed'), 'TTS_FAILED');
+  }
+  const data = await res.json();
+  const audioBase64: string = data?.audioBase64 || '';
+  const mimeType: string = data?.mimeType || 'audio/mpeg';
+  if (!audioBase64) throw new VoiceChatError(i18n.t('voice.errors.ttsEmpty'), 'TTS_EMPTY');
+  return { audioBase64, mimeType, cached: !!data?.cached };
 }
 
 /**

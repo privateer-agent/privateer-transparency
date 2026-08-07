@@ -1,6 +1,6 @@
 import { Platform } from 'react-native';
 import authService from './authService';
-import { getActionModel, resolveTtsVoice } from './modelService';
+import { getActionModel, resolveTtsVoice, getRequireZdr, getAllowNonZdrMedia } from './modelService';
 
 /**
  * Progressive playback of a spoken sentence, web only.
@@ -59,13 +59,21 @@ export async function streamSpeech(
 
   const modelId = opts.modelId || (await getActionModel('tts')).modelId;
   const voice = opts.voice || (await resolveTtsVoice(modelId));
+  // Sent for the same reason the buffered path sends them: on the local backend
+  // these prefs exist only on this device, and a non-ZDR voice is gated on them.
+  // A blocked voice 403s here, which this function reports as `null` like any
+  // other non-OK — the buffered path then produces the one user-facing error.
+  const [requireZdr, allowNonZdrMedia] = await Promise.all([
+    getRequireZdr(),
+    getAllowNonZdrMedia(),
+  ]);
 
   const controller = new AbortController();
   let res: Response;
   try {
     res = await authService.makeAuthenticatedRequest(
       '/api/audio/speech/stream',
-      { method: 'POST', body: JSON.stringify({ text: trimmed, ttsModelId: modelId, voice }) },
+      { method: 'POST', body: JSON.stringify({ text: trimmed, ttsModelId: modelId, voice, requireZdr, allowNonZdrMedia }) },
       controller.signal,
     );
   } catch {

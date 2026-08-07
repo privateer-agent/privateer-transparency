@@ -211,6 +211,12 @@ The facts (measured 2026-07-27 against the live catalog):
   `google/lyria-3-clip-preview` and `google/lyria-3-pro-preview`. **Neither has a
   ZDR endpoint**, and there is no confidential-compute (TEE) music model
   anywhere. Unlike image generation, there is nothing to fall back to.
+- Widening the catalog (2026-08-07) did not change that. The music picker now
+  also offers fal's generators — ElevenLabs Music, MiniMax Music, CassetteAI,
+  Stable Audio 3 Medium (`server/data/falModels.js`) — and **fal has no ZDR
+  contract either**, so the choice is between non-ZDR models, not between a
+  non-ZDR one and a safe one. The exemption still buys the user a picker that
+  isn't empty; it does not now conceal an alternative that exists.
 - Every other non-ZDR media model is gated by `assertMediaModelAllowed` behind
   the `allowNonZdrMedia` opt-in. **Music is deliberately exempt.** Applying the
   gate here would not protect anyone — with no ZDR model in the catalog it can
@@ -221,6 +227,38 @@ The facts (measured 2026-07-27 against the live catalog):
   exactly (they 404 on both keys). Lyria is a `/chat/completions` media model and
   **is** served on the standard key — verified end-to-end, 30.8s 44.1kHz stereo
   MP3, $0.04 inline `usage.cost`.
+
+### Voices and sound effects on fal — gated, not exempt
+
+The catalog widening above also brought the first **non-ZDR speech models**
+(ElevenLabs, Kokoro, on fal). They are the mirror image of the music decision and
+the distinction is the whole point:
+
+- Speech had been ZDR-or-nothing — `server.js` filters the `stt`/`tts` catalogs
+  on `hasZdrCoverage`, so every voice the app offered was contractually ZDR or
+  ran in an attested enclave. fal's voices are neither, but unlike music they
+  have alternatives: the confidential default (`tinfoil/qwen3-tts`) still works
+  and is still the default.
+- So they go through the **ordinary** `assertMediaModelAllowed` gate, exactly
+  like a non-ZDR image or video model. A default account (Require ZDR on,
+  `allowNonZdrMedia` off) does not see them in the picker and cannot use one:
+  `/audio/speech`, `/audio/speech/stream` and `/audio/voice-preview` each call
+  `ttsZdrBlocked` **before** synthesizing and answer `403 ZDR_MEDIA_BLOCKED`.
+  Sound effects, which have been gated since they shipped, are unchanged.
+- **The gate is the disclosure.** There is no privacy note beside it, and there
+  must not be — a note next to a gate the user has already cleared teaches them
+  to read past both. The `allowNonZdrMedia` copy names audio explicitly
+  (`settings.zdr.allowMediaDesc`), so what the toggle covers is stated where it
+  is turned on.
+- fal's own retention knobs are turned down on **every** request regardless
+  (`X-Fal-Store-IO: 0`, a short object lifecycle), and the generated object's
+  public CDN URL never reaches the client — the server fetches the bytes and
+  returns base64. Neither is a substitute for ZDR; both are why fal is
+  acceptable behind an opt-in at all.
+
+Pinned by `server/test/mediaZdrEnforcement.test.js` (the gate runs before
+synthesis, delegates to the shared `assertMediaModelAllowed`, and every fal row
+is declared `isZdr: false`) and `server/test/falAudioCatalog.test.js`.
 
 What is offered in place of the gate, and what the user is told:
 
@@ -397,6 +435,38 @@ Two deliberate details:
   publisher's original is fetched only when the user explicitly opens an image —
   the same exposure as following the link. This is the same hotlinking posture
   the existing source-card hero images have, narrowed rather than widened.
+
+### Voice preview clips — a shared cache, and not a carve-out
+
+The ▶ button beside each voice in the voice picker plays an audition clip served
+from `server/services/voicePreviewStore.js`: a Redis cache that is **global, not
+tenant-scoped** — one synthesis of a given voice is replayed to every account
+thereafter. It is the only cache in the system deliberately shared across users,
+so it is worth being precise about why that is not a hole.
+
+The clip contains no user content and cannot be made to. `POST
+/api/audio/voice-preview` takes `{ ttsModelId, voice, locale }` and **no text**:
+the sentence is read out of the server's own i18n catalog
+(`audio.voicePreviewSample`), the same way an error message is. What is cached is
+therefore an app asset that happens to be minted lazily — the audio equivalent of
+a bundled sound effect — and a user auditioning a voice reveals nothing to the
+next user who hears the same clip, because it was never theirs. Free text has its
+own endpoint, `/api/audio/speech`, which caches nothing.
+
+That division is the whole design, and it is what a future edit must not blur:
+the moment the caller can choose the words, a shared cache stops being an asset
+store and becomes cross-account plaintext user content at rest, which no amount
+of TTL or byte-capping would redeem (contrast the two opt-in holds above, both
+tenant-scoped, consented, and short-lived — none of which would be sufficient
+here). The store's key covers `(model, voice, format, text)` so a catalog edit
+mints a new entry rather than serving a stale clip, entries carry a sliding
+30-day TTL, and both the `voice` entitlement gate and the non-ZDR speech gate run
+*before* the cache is consulted — a cache hit is never a way around a gate.
+
+Billing follows the same logic: the account that takes the cache miss pays the
+provider once, everyone after it plays for free. Previously every tap of ▶ was a
+fresh paid synthesis, so auditioning a 90-voice catalog cost 90 TTS calls per
+user, every time.
 
 ## AI inference flow
 
