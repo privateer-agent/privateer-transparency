@@ -46,6 +46,7 @@ const {
   uploadFile,
   generateImage,
   editImage,
+  planImageVariations,
   analyzeImage,
   generateOrEditImage,
   resolveImageGenModelId,
@@ -58,6 +59,7 @@ const {
   uploadGeneratedVideo,
 } = require('../controllers/chatController');
 const { analyzeIntent, chargeIntentAnalysis } = require('../services/intentService');
+const { clampImageCount, normalizeAxis } = require('../services/imageVariationService');
 const { uploadImageWithThumb, handleUploadError, uploadFileSingle, handleFileUploadError } = require('../services/ImageUpload');
 const { authenticate } = require('../middleware/auth');
 const { checkCreditBalance } = require('../middleware/checkBalance');
@@ -122,7 +124,7 @@ router.post('/compact', limitTextInput, checkCreditBalance(0), compactContext);
 router.post('/title', limitTextInput, checkCreditBalance(0), generateChatTitle);
 
 // Generate or edit image based on intent
-router.post('/generate-or-edit-image', limitTextInput, requireCloudBackend(), requireDailyCap('imageGen'), checkCreditBalance(0), requireConcurrencySlot(), async (req, res) => {
+router.post('/generate-or-edit-image', limitTextInput, requireCloudBackend(), requireDailyCap('imageGen', (req) => clampImageCount(req.body?.count)), checkCreditBalance(0), requireConcurrencySlot(), async (req, res) => {
   try {
     const { prompt, imageAttachments = [] } = req.body;
     const userId = req.userId;
@@ -142,7 +144,12 @@ router.post('/generate-or-edit-image', limitTextInput, requireCloudBackend(), re
       intentAnalysis.intent,
       userId,
       req,
-      imageGenModelId
+      imageGenModelId,
+      null, null, false, false, null, {},
+      // Fan-out: `count` images varying along one axis (resolved from the prompt
+      // when `variation` is absent). The cap middleware above already charged
+      // this many units, so it must clamp identically.
+      { count: clampImageCount(req.body?.count), variation: normalizeAxis(req.body?.variation) },
     );
 
     res.json({
@@ -150,7 +157,8 @@ router.post('/generate-or-edit-image', limitTextInput, requireCloudBackend(), re
       responseText: result.responseText,
       generatedImages: result.generatedImages,
       tokensUsed: result.tokensUsed,
-      intent: intentAnalysis.intent
+      intent: intentAnalysis.intent,
+      variation: result.variation || null
     });
   } catch (error) {
     logger.error('Generate or edit image error:', error);
@@ -182,11 +190,21 @@ router.post('/upload-file',
   uploadFile
 );
 
+// How much of the daily imageGen cap one request spends. A request that fans out
+// to N images IS N images against the cap — otherwise `count: 8` would buy eight
+// images for the price of one cap slot, and the throttle would mean nothing.
+const imageGenUnits = (req) => clampImageCount(req.body?.count);
+
 // Generate image from text prompt
-router.post('/generate-image', limitTextInput, requireCloudBackend(), requireDailyCap('imageGen'), requireStorage(() => 0), checkCreditBalance(0), requireConcurrencySlot(), generateImage);
+router.post('/generate-image', limitTextInput, requireCloudBackend(), requireDailyCap('imageGen', imageGenUnits), requireStorage(() => 0), checkCreditBalance(0), requireConcurrencySlot(), generateImage);
 
 // Edit an existing image via AI — returns raw buffer (client encrypts + uploads)
-router.post('/edit-image', limitTextInput, requireCloudBackend(), requireDailyCap('imageGen'), requireStorage(() => 0), checkCreditBalance(0), requireConcurrencySlot(), editImage);
+router.post('/edit-image', limitTextInput, requireCloudBackend(), requireDailyCap('imageGen', imageGenUnits), requireStorage(() => 0), checkCreditBalance(0), requireConcurrencySlot(), editImage);
+
+// Name what a multi-image request would vary, for the composer's Vary chip.
+// Cheap-utility gating (cf. /title, /compact): it fires while the user is still
+// choosing, so it must not consume the image cap or a concurrency slot.
+router.post('/image-variations', limitTextInput, checkCreditBalance(0), planImageVariations);
 
 // Analyze an existing image — vision feature, gated to Sailor and up.
 router.post('/analyze-image', requireFeature('vision'), checkCreditBalance(0), analyzeImage);
