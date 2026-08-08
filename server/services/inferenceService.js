@@ -514,6 +514,11 @@ async function openRouterChat(messages, modelId, options = {}) {
   // PDF plugin for file parsing
   if (options.plugins) body.plugins = options.plugins;
 
+  // Model "thinking" control (see generateTextStream for why Build turns want
+  // it off). A model with no reasoning to configure ignores it; an endpoint
+  // that reasons MANDATORILY rejects it outright — handled below.
+  if (options.reasoning) body.reasoning = options.reasoning;
+
   // OpenRouter `web` plugin — model self-invokes web search and returns
   // `url_citation` annotations on the assistant message. Composes with the
   // PDF plugin (the array is appended to, never replaced).
@@ -574,6 +579,17 @@ async function openRouterChat(messages, modelId, options = {}) {
     }
 
     const errText = await res.text();
+
+    // An always-thinking endpoint 400s the request that asks it not to think
+    // ("Reasoning is mandatory for this endpoint and cannot be disabled")
+    // rather than ignoring the field. Drop the hint and retry with no backoff
+    // (nothing upstream is wrong, so there is nothing to wait out). It spends
+    // one of the MAX_RETRIES attempts, and can't loop — the field is gone.
+    if (res.status === 400 && body.reasoning && /reasoning/i.test(errText) && attempt < MAX_RETRIES) {
+      logger.debug(`[openrouter] ${modelId} requires reasoning — retrying without the hint`);
+      delete body.reasoning;
+      continue;
+    }
 
     // Retry transient upstream failures: 429 (rate limit) and any 5xx incl. 503
     // (provider overloaded or briefly down — common for busy image backends).
@@ -1564,6 +1580,17 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
   };
   if (options.plugins) baseBody.plugins = options.plugins;
 
+  // Model "thinking" control. A hybrid reasoning model (Kimi K3, GLM, Qwen
+  // thinking variants…) reasons by DEFAULT, and those tokens are billed at the
+  // completion rate, count against `max_tokens`, and — since only
+  // `delta.content` is rendered below — never reach the user. On a Build turn
+  // that trade is all cost and no benefit, so callers pass
+  // `{ enabled: false }`; see ARTIFACT_REASONING in chatController.
+  // A model that CAN'T stop thinking (o-series, kimi-k2-thinking) rejects the
+  // request rather than ignoring the field — the 400 is caught below and the
+  // hint dropped — and then thinks anyway, which is why `onReasoning` exists.
+  if (options.reasoning) baseBody.reasoning = options.reasoning;
+
   if (options.webPlugin) {
     const webEntry = { id: 'web', ...(typeof options.webPlugin === 'object' ? options.webPlugin : {}) };
     baseBody.plugins = [...(baseBody.plugins || []), webEntry];
@@ -1633,6 +1660,19 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
 
     if (!res.ok) {
       const errText = await res.text();
+      // Not every endpoint that ignores an unsupported parameter ignores THIS
+      // one: an always-thinking endpoint answers `reasoning: {enabled:false}`
+      // with a hard 400 ("Reasoning is mandatory for this endpoint and cannot
+      // be disabled") instead of quietly reasoning anyway. Drop the hint and
+      // retry — mutating baseBody, so a continuation doesn't re-buy the round
+      // trip, and so the retry can't recurse (the field is gone). Not counted
+      // against provider health: the request was malformed for this endpoint,
+      // which says nothing about whether the provider is up.
+      if (res.status === 400 && baseBody.reasoning && /reasoning/i.test(errText)) {
+        logger.debug('[generateTextStream] endpoint requires reasoning — retrying without the hint', { modelId: effectiveModelId });
+        delete baseBody.reasoning;
+        return streamOnce(reqMessages);
+      }
       providerHealth.recordFailure(useZdrKey ? 'openrouter_zdr' : 'openrouter', {
         status: res.status, message: errText, kind: 'inference'
       });
@@ -1714,6 +1754,17 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
           const choice = parsed.choices?.[0];
           const delta = choice?.delta?.content;
           if (delta) { fullText += delta; tableConverter.push(delta); }
+          // Thinking tokens, when the model reasons anyway (see baseBody.reasoning
+          // above). NEVER folded into `fullText` — that text is the artifact, and
+          // a continuation replays it back to the model as its own prior turn.
+          // Callers opt in to be told the model is alive during a reasoning pause
+          // that emits no content for minutes. `reasoning_content` is the
+          // alternate spelling some providers stream.
+          const reasoningDelta = choice?.delta?.reasoning ?? choice?.delta?.reasoning_content;
+          if (reasoningDelta && options.onReasoning) {
+            // Isolated: a throwing callback must not skip the rest of this frame.
+            try { options.onReasoning(reasoningDelta); } catch { /* ignore */ }
+          }
           if (choice?.finish_reason) finishReason = choice.finish_reason;
           collectAnnotations(choice?.delta?.annotations);
           collectAnnotations(choice?.message?.annotations);
