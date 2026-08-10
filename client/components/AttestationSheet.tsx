@@ -33,7 +33,7 @@ interface Props {
  * inspection; full on-device cryptographic verification is a follow-up.
  */
 const AttestationSheet: React.FC<Props> = ({ visible, model, onClose }) => {
-  const { theme, ambientSurface, ambientAccent, ambientOnAccent } = useTheme();
+  const { theme, ambientScrim, ambientSurface, ambientAccent, ambientOnAccent } = useTheme();
   const { t } = useTranslation();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -72,7 +72,7 @@ const AttestationSheet: React.FC<Props> = ({ visible, model, onClose }) => {
     </View>
   );
 
-  const s = styles(theme, ambientSurface);
+  const s = styles(theme, ambientSurface, ambientScrim);
 
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
@@ -162,11 +162,11 @@ const AttestationSheet: React.FC<Props> = ({ visible, model, onClose }) => {
   );
 };
 
-const styles = (theme: any, ambientSurface: string) =>
+const styles = (theme: any, ambientSurface: string, ambientScrim: string) =>
   StyleSheet.create({
     backdrop: {
       flex: 1,
-      backgroundColor: theme.overlay,
+      backgroundColor: ambientScrim,
       justifyContent: 'center',
       alignItems: 'center',
       padding: 20,

@@ -538,6 +538,39 @@ tenant is woken by a scheduler with no device online, so there is nothing to sea
 a durable credential to. See `docs/HARBOR_CONNECTORS_PLAN.md` §2. The app can
 afford the honest version precisely because a device is always present.
 
+**The companion's command mode rides the same loop** (`client/services/
+agentControl/`). Switched on, the companion gets a second tool surface whose
+tools are not an MCP server but the app's own relay session — it can list the
+user's agents, read the driven session, send prompts, and start or run work on a
+harbor. Both safety properties above hold unchanged, and the registry adds a
+third: `answerApproval('allow')` and every routine/workflow/skill/connector
+*authoring* call are deliberately absent from it, so the companion can refuse an
+approval but never grant one, and can run what the user already wrote but never
+write something new that later executes on their machine.
+`client/services/agentControl/tools.test.ts` pins each absence.
+
+Unattended mode ("no quarter") is the one that is neither granted nor withheld
+but **asked**. There is no tool that sets it; `suggest_no_quarter` routes to the
+flag's own dialog, in the flag's own words, with the companion's reason as an
+introduction — the user's tap is what flips it
+(`client/services/agentControl/approval.ts`). A decline is durable
+(`noQuarterConsent.ts`): the refusal is stored, later suggestions are refused
+*before* a dialog can be raised, and it is also written to the user's memories
+where they can read it. So the model cannot ask twice, and nothing said in the
+conversation can reach the user a second time. The standing no lifts when the
+user raises the flag themselves. Switching it **off** needs none of this and is
+an ordinary tool — that direction is always safe.
+
+**Why this cannot become a hosted MCP server.** Control frames to a terminal are
+signed with an Ed25519 key derived from the account master key
+(`client/services/accountSign.ts`) and secrets are sealed to the terminal's
+pinned key; our servers hold neither. A server-side MCP endpoint that commanded
+agents would have to be handed that signing capability, which is precisely the
+property the linkage design exists to deny. If this surface is ever exposed to
+outside clients, it must be a **local** MCP server (the desktop shell already
+hosts an agent over loopback IPC) wrapping the same registry — never a hosted
+one, and never a second copy of the tool definitions.
+
 ### Deep Research background jobs
 
 Deep Research is a multi-minute, detached server-side job (so a run survives the
