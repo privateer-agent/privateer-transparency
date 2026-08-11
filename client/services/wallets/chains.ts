@@ -136,6 +136,23 @@ export function walletAddressOf(
 }
 
 /**
+ * Is `address` — a canonical address in its own chain's encoding, as the server
+ * stores and serves it — the same account as `account`?
+ *
+ * The comparison is per-encoding, not per-string. EIP-55 carries its checksum
+ * in the letter case of an otherwise case-insensitive hex address, so an
+ * all-lowercase spelling of an EVM (or Sui) address is the SAME account and must
+ * match. Base58 is not case-insensitive — 'a' and 'A' are distinct characters —
+ * so Solana and Tron compare exactly.
+ */
+export function isSameAccountAddress(address: string, account: WalletAccount): boolean {
+  const hexEncoded = account.namespace === 'eip155' || account.namespace === 'sui';
+  return hexEncoded
+    ? address.toLowerCase() === account.address.toLowerCase()
+    : address === account.address;
+}
+
+/**
  * Truncated address for display — enough to recognize which account you are
  * signed into, which is all any of these surfaces need.
  *

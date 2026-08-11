@@ -26,6 +26,8 @@ import {
   Web3MobileWallet,
 } from '@solana-mobile/mobile-wallet-adapter-protocol-web3js';
 import { brand } from '../config/brand';
+import { signatureFromSignedPayload } from './wallets/mwaSignedPayload';
+import { WalletAccount } from './wallets/chains';
 import {
   WalletAuthResult,
   buildWalletMessages,
@@ -33,6 +35,7 @@ import {
   completeWalletLogin,
   fetchWalletVault,
   completeLoadDerivedKey,
+  assertVaultAccount,
   solanaAccount,
   base64ToBytes,
 } from './walletAuthShared';
@@ -124,11 +127,13 @@ export async function solanaLogin(opts?: { recover?: boolean }): Promise<WalletA
       payloads: [vaultMessage],
     });
 
+    // signMessages answers with signed *payloads* — the message with the
+    // signature appended — not with signatures. See wallets/mwaSignedPayload.
     return {
       account,
-      authSignature: authSigResult[0],
+      authSignature: signatureFromSignedPayload(authSigResult[0], authMessage),
       authMessage,
-      vaultSignature: vaultSigResult[0],
+      vaultSignature: signatureFromSignedPayload(vaultSigResult[0], vaultMessage),
     };
   });
 
@@ -136,17 +141,28 @@ export async function solanaLogin(opts?: { recover?: boolean }): Promise<WalletA
     ...opts,
     // Enrollment only: a second MWA session, because the one above is closed by
     // the time the server tells us this sign-in is creating the vault.
-    resignVault: () => signVaultMessage(account.idHex),
+    resignVault: () => signVaultMessage((signer) => {
+      if (signer.idHex !== account.idHex) {
+        throw new Error('A different wallet account signed the second time. Use the same account to finish setting up.');
+      }
+    }),
   });
 }
 
 /**
- * Open an MWA session and sign the vault message. `expectedPubkeyHex` binds the
- * result to a known account — authorize() reconnects whatever the wallet has
- * authorized, and on the enrollment re-sign we must be comparing signatures
- * from the same account or an honest wallet would fail the determinism gate.
+ * Open an MWA session and sign the vault message.
+ *
+ * `check` binds the result to the account the caller means, because authorize()
+ * reconnects whatever the wallet has authorized, which need not be that one:
+ *
+ *   - enrolling, we must be comparing two signatures from the *same* account or
+ *     an honest wallet would fail the determinism gate;
+ *   - unlocking, a signature from the wrong account derives a KEK that cannot
+ *     unwrap this vault (see walletAuthShared.assertVaultAccount).
+ *
+ * It runs before signMessages so a wrong pick costs no prompt.
  */
-async function signVaultMessage(expectedPubkeyHex?: string): Promise<Uint8Array> {
+async function signVaultMessage(check?: (account: WalletAccount) => void): Promise<Uint8Array> {
   return transact(async (wallet: Web3MobileWallet) => {
     const authResult = await wallet.authorize({
       identity: IDENTITY,
@@ -155,14 +171,12 @@ async function signVaultMessage(expectedPubkeyHex?: string): Promise<Uint8Array>
     const address = authResult.accounts[0].address;
     const account = solanaAccount(base64ToBytes(address));
     const { vaultMessage } = buildWalletMessages(account, '');
-    if (expectedPubkeyHex && account.idHex !== expectedPubkeyHex) {
-      throw new Error('A different wallet account signed the second time. Use the same account to finish setting up.');
-    }
+    check?.(account);
     const results = await wallet.signMessages({
       addresses: [address],
       payloads: [vaultMessage],
     });
-    return results[0];
+    return signatureFromSignedPayload(results[0], vaultMessage);
   });
 }
 
@@ -185,5 +199,8 @@ export async function loadDerivedKey(): Promise<void> {
     throw new Error('This account signs in with a wallet on another chain. Use the web app to unlock it on this device.');
   }
 
-  await completeLoadDerivedKey(vault, await signVaultMessage());
+  // Bound to the enrolled account, for the same reason enrollment binds to the
+  // first signature: the wallet picker can offer several accounts and only one
+  // of them derives the KEK that unwraps this vault.
+  await completeLoadDerivedKey(vault, await signVaultMessage((signer) => assertVaultAccount(vault, signer)));
 }

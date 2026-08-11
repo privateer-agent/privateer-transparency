@@ -32,7 +32,14 @@ import {
   unwrapMasterKey,
   clearMasterKeyAsync,
 } from './cryptoService';
-import { WalletAccount, ChainNamespace, getChain, chainScope } from './wallets/chains';
+import {
+  WalletAccount,
+  ChainNamespace,
+  getChain,
+  chainScope,
+  walletAddressOf,
+  isSameAccountAddress,
+} from './wallets/chains';
 import { buildAuthMessageText } from './wallets/authMessage';
 import authService, { VaultPayload } from './authService';
 import { assertDeterministicVaultSignature, WALLET_NON_DETERMINISTIC } from './walletDeterminism';
@@ -345,18 +352,54 @@ export async function completeWalletLogin(
   return { accessToken: result.accessToken, refreshToken: result.refreshToken, user: result.user };
 }
 
+export interface WalletVault extends VaultPayload {
+  /**
+   * Canonical address of the account this vault was enrolled on, in the form
+   * the server stores: base58 on Solana and Tron, EIP-55 hex on EVM, 0x-hex on
+   * Sui. Null only from a server older than multi-chain sign-in.
+   */
+  walletAddress?: string | null;
+}
+
 /**
  * Fetch the authenticated wallet user's vault so its wrapped master key can be
  * unwrapped. Used by `loadDerivedKey` when the on-device cache is empty.
  */
-export async function fetchWalletVault(): Promise<VaultPayload> {
+export async function fetchWalletVault(): Promise<WalletVault> {
   const meRes = await authService.makeAuthenticatedRequest('/auth/me');
   if (!meRes.ok) throw new Error('Failed to fetch vault from server');
-  const meData = await meRes.json() as { vault: VaultPayload | null };
+  const meData = await meRes.json() as {
+    vault: VaultPayload | null;
+    user?: { walletAddress?: string | null; solanaPublicKey?: string | null };
+  };
   if (!meData.vault || meData.vault.kekSource !== 'wallet') {
     throw new Error('Account is missing a wallet vault.');
   }
-  return meData.vault;
+  // walletAddressOf falls back to the legacy field, so an account made before
+  // multi-chain sign-in still binds rather than silently skipping the check.
+  return { ...meData.vault, walletAddress: walletAddressOf(meData.user) };
+}
+
+/**
+ * Refuse to derive a KEK from an account that is not the one this vault was
+ * enrolled on.
+ *
+ * Every unlock re-prompts a wallet that may hold several accounts, and nothing
+ * in that prompt says which one is wanted. Signing with the wrong one derives a
+ * key that cannot unwrap, and the failure surfaces as "could not unlock your
+ * data" — the wording for a lost vault, on an account that is perfectly fine.
+ * Worse, it is reported as a broken vault rather than as a wrong pick.
+ *
+ * A server that doesn't say which account was enrolled leaves the check off
+ * rather than blocking the unlock. This is a diagnosis, not a gate: the unwrap
+ * itself is what actually decides.
+ */
+export function assertVaultAccount(vault: WalletVault, account: WalletAccount): void {
+  const enrolled = vault.walletAddress;
+  if (!enrolled) return;
+  if (!isSameAccountAddress(enrolled, account)) {
+    throw new Error('A different wallet account signed. Choose the account this Privateer account was created with, then try again.');
+  }
 }
 
 /**

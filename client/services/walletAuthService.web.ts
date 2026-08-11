@@ -28,6 +28,7 @@ import {
   completeWalletLogin,
   fetchWalletVault,
   completeLoadDerivedKey,
+  assertVaultAccount,
 } from './walletAuthShared';
 import { connectBrowserWallet } from './browserWalletProvider.web';
 import { connectEvmWallet } from './evmWalletProvider.web';
@@ -247,6 +248,9 @@ export async function loadDerivedKey(): Promise<void> {
     const chain: ChainNamespace = vault.walletChain ?? 'solana';
     const linked = await linkWalletViaBrowser('unlock', '', chain);
     try {
+      // The only branch that can't check before signing: the hand-off returns a
+      // signature and the identity that made it in one answer.
+      assertVaultAccount(vault, accountFromLink(linked));
       await completeLoadDerivedKey(vault, linked.vaultSignature);
     } finally {
       // No enrollment here, so nothing will ever ask that tab for a second
@@ -261,8 +265,13 @@ export async function loadDerivedKey(): Promise<void> {
   // Solana provider here would derive a different KEK and surface as "could not
   // unlock your data" on an account that is perfectly healthy. Accounts that
   // predate multi-chain have no walletChain, and Solana is correct for them.
+  //
+  // The right chain is not enough on its own: an extension holds several
+  // accounts and connect() answers with whichever is selected, so each branch
+  // also checks the account before spending a prompt on it.
   if (vault.walletChain === 'eip155') {
     const evm = await connectEvmWallet();
+    assertVaultAccount(vault, evm.account);
     const { vaultMessage } = buildWalletMessages(evm.account, '');
     await completeLoadDerivedKey(vault, await evm.signMessage(vaultMessage));
     return;
@@ -270,6 +279,7 @@ export async function loadDerivedKey(): Promise<void> {
 
   if (vault.walletChain === 'sui') {
     const sui = await connectSuiWallet();
+    assertVaultAccount(vault, sui.account);
     const { vaultMessage } = buildWalletMessages(sui.account, '');
     await completeLoadDerivedKey(vault, await sui.signMessage(vaultMessage));
     return;
@@ -277,13 +287,16 @@ export async function loadDerivedKey(): Promise<void> {
 
   if (vault.walletChain === 'tron') {
     const tron = await connectTronWallet();
+    assertVaultAccount(vault, tron.account);
     const { vaultMessage } = buildWalletMessages(tron.account, '');
     await completeLoadDerivedKey(vault, await tron.signMessage(vaultMessage));
     return;
   }
 
   const wallet = await connectBrowserWallet();
-  const { vaultMessage } = buildWalletMessages(solanaAccount(wallet.pubkeyBytes), '');
+  const account = solanaAccount(wallet.pubkeyBytes);
+  assertVaultAccount(vault, account);
+  const { vaultMessage } = buildWalletMessages(account, '');
   const vaultSignature = await wallet.signMessage(vaultMessage);
 
   await completeLoadDerivedKey(vault, vaultSignature);
