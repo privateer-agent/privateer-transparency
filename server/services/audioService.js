@@ -47,6 +47,9 @@ const {
   isFalAudioModel, falAudioModel, falModelIdsFor, falResolveVoice,
   falAudioCostUsd, falClampDuration, buildFalInput, falOutputUrl, falAudioMime,
 } = require('../data/falModels');
+const {
+  ttsFloorUsd, sttFloorUsd, TTS_USD_PER_CHAR, STT_USD_PER_MINUTE,
+} = require('../data/openrouterAudioModels');
 const { tinfoilVoicesFor } = require('../data/tinfoilModels');
 const UserStoragePrefs = require('../models/userStoragePrefsModel');
 
@@ -316,11 +319,27 @@ async function transcribe({ userId, audioBase64, format, language, modelId, requ
   }
   const data = await r.json();
   const text = typeof data?.text === 'string' ? data.text : '';
-  let costUsd = Number(data?.usage?.cost);
-  if (!Number.isFinite(costUsd) || costUsd <= 0) {
-    costUsd = await fetchGenerationCost(r.headers.get('x-generation-id'), requireZdr);
+  const settleArgs = {
+    userId, generationId: r.headers.get('x-generation-id'), requireZdr,
+    model, kind: 'stt', markup: billingMarkup, origin,
+    // Bounded from below — see estimateAudioSecondsFromBase64. Only consulted
+    // if the provider never tells us what the call actually cost.
+    fallbackSeconds: estimateAudioSecondsFromBase64(audioBase64, format),
+  };
+  const inlineCostUsd = Number(data?.usage?.cost);
+  if (Number.isFinite(inlineCostUsd) && inlineCostUsd > 0) {
+    // The usual case: the cost came back with the transcript, so there is
+    // nothing to poll and nothing to wait for. Kept inline so an exhausted
+    // balance still surfaces as a 402 the way it always has.
+    await settleOpenRouterAudioCharge({ ...settleArgs, inlineCostUsd });
+  } else {
+    // No inline cost — settling now means polling the generation record, which
+    // can take seconds. That wait belongs nowhere near a voice turn, so it moves
+    // to the background. The charge (and the alert if it can't be priced) still
+    // happens; only the 402 is traded away, and the drained balance blocks the
+    // NEXT request at the route gate.
+    settleOpenRouterAudioCharge(settleArgs).catch(() => { /* alerted inside */ });
   }
-  await chargeAudio(userId, costUsd, { model, kind: 'stt', markup: billingMarkup, origin });
   return { text, model };
 }
 
@@ -405,9 +424,10 @@ async function synthesizeSpeech({ userId, text, voice, format, modelId, requireZ
   if (tinfoilCostUsd !== null) {
     chargeAudio(userId, tinfoilCostUsd, { model, kind: 'tts', markup: billingMarkup, origin }).catch(() => {});
   } else {
-    fetchGenerationCost(generationId, requireZdr)
-      .then(cost => chargeAudio(userId, cost, { model, kind: 'tts', markup: billingMarkup, origin }))
-      .catch(() => {});
+    settleOpenRouterAudioCharge({
+      userId, generationId, requireZdr, model, kind: 'tts',
+      markup: billingMarkup, origin, fallbackChars: input.length,
+    }).catch(() => { /* alerted inside */ });
   }
   return { buffer, mimeType, model };
 }
@@ -443,18 +463,22 @@ async function synthesizeSpeechStream({ userId, text, voice, format, modelId, re
   }
   const responseFormat = resolveResponseFormat(model, format);
   const wireVoice = resolveVoice(voice, model);
+  // Named rather than sliced twice inline: this is also what the fallback price
+  // is metered on when the generation record never arrives (see settle below),
+  // and billing the pre-truncation length would overcharge.
+  const wireText = text.slice(0, 8000);
 
   let r;
   let tinfoilCostUsd = null;
   if (tinfoilService.isTinfoilModel(model)) {
-    const out = await tinfoilService.speechRequest({ text: text.slice(0, 8000), voice: wireVoice, responseFormat, modelId: model });
+    const out = await tinfoilService.speechRequest({ text: wireText, voice: wireVoice, responseFormat, modelId: model });
     r = out.response;
     tinfoilCostUsd = out.providerCostUsd;
   } else {
     r = await fetch(`${OPENROUTER_BASE}/audio/speech`, {
       method: 'POST',
       headers: { ...inferenceService.orHeaders(requireZdr), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, input: text.slice(0, 8000), voice: wireVoice, response_format: responseFormat }),
+      body: JSON.stringify({ model, input: wireText, voice: wireVoice, response_format: responseFormat }),
     });
   }
   if (!r.ok) {
@@ -481,9 +505,10 @@ async function synthesizeSpeechStream({ userId, text, voice, format, modelId, re
       chargeAudio(userId, tinfoilCostUsd, { model, kind: 'tts', markup: billingMarkup, origin }).catch(() => {});
       return;
     }
-    fetchGenerationCost(generationId, requireZdr)
-      .then(cost => chargeAudio(userId, cost, { model, kind: 'tts', markup: billingMarkup, origin }))
-      .catch(() => {});
+    settleOpenRouterAudioCharge({
+      userId, generationId, requireZdr, model, kind: 'tts',
+      markup: billingMarkup, origin, fallbackChars: wireText.length,
+    }).catch(() => { /* alerted inside */ });
   };
 
   return { response: r, mimeType: 'audio/mpeg', model, generationId, settle };
@@ -913,6 +938,11 @@ module.exports = {
   // run, or two spellings of one clip get two cache entries.
   resolveVoice,
   parsePcmParams,
+  // Exported for test/audioCostFloor.test.js — the invariant worth pinning is
+  // that neither ever over-reports what the audio holds.
+  estimateAudioSeconds,
+  estimateAudioSecondsFromBase64,
+  base64Bytes,
   RETIRED_AUDIO_MODELS,
   DEFAULT_STT_MODEL,
   DEFAULT_TTS_MODEL,

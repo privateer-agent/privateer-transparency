@@ -1,4 +1,4 @@
-# End-to-End Encryption Architecture — Privateer
+# Encryption Architecture — Privateer
 
 > Version: 3.0 | Date: 2026-05-06
 
@@ -6,7 +6,7 @@
 
 ## Threat model
 
-Privateer is end-to-end encrypted: the server stores ciphertext only, and the
+Privateer encrypts your content: the server stores ciphertext only, and the
 encryption key never leaves the user's device. Even a full server compromise
 yields no readable user content. (Three opt-in exceptions scope this: **Harbor**
 hosted agents, which are **live** and process content inside an attested enclave on
@@ -77,7 +77,7 @@ the user's own machine. There, and only there:
   (`HostedAgent.webAccess` → `HARBOR_WEB` in the tenant env) surfaced on the agent card
   with the disclosure attached, and it is re-stated in the routine editor whenever a
   drafted routine will actually use it (`routineIssues.webOn`). Never describe a
-  routine that searches the web as private end-to-end.
+  routine that searches the web as fully private.
 
 **Status (2026-07-28): LIVE.** Production runs `HARBOR_HOST_BACKEND=sevsnp` — set as
 a Render dashboard variable, so it appears in neither `render.yaml` nor
@@ -171,7 +171,7 @@ last step is encrypt-then-store and only the client holds the master key
   `client/services/videoHoldService.ts`, recovery in `ChatScreen` on chat load
   for attachments that are `completed` with no `storageRef`.
 - **While a video is held, plaintext video bytes rest on Privateer-operated
-  infrastructure.** Bounded, consented, and short-lived — but not end-to-end
+  infrastructure.** Bounded, consented, and short-lived — but not
   encrypted, and no UI copy may imply otherwise. The in-app copy says plainly
   that a finished video may rest on our servers in plaintext for up to an hour.
   Off (default) = the absolute "ciphertext only" guarantee holds unchanged.
@@ -225,7 +225,7 @@ The facts (measured 2026-07-27 against the live catalog):
 - Note this differs from **speech** models: for the `/audio/speech` and
   `/audio/transcriptions` collections, non-ZDR membership predicts unservability
   exactly (they 404 on both keys). Lyria is a `/chat/completions` media model and
-  **is** served on the standard key — verified end-to-end, 30.8s 44.1kHz stereo
+  **is** served on the standard key — verified in full, 30.8s 44.1kHz stereo
   MP3, $0.04 inline `usage.cost`.
 
 ### Voices and sound effects on fal — gated, not exempt
@@ -436,6 +436,48 @@ Two deliberate details:
   the same exposure as following the link. This is the same hotlinking posture
   the existing source-card hero images have, narrowed rather than widened.
 
+### Inbox attachments — sealed to the account, and not a carve-out
+
+An unattended agent run can hand back files as well as prose: the still a routine
+generated at 6am, the clip it composed, the document it produced
+(`privateer-agent` → `attach_to_result`, `src/routines/resultMedia.ts`). They travel
+the cloud outbox, which is a **sealed box to the account's published X25519 key**
+(`client/services/outboxSeal.ts` and its CLI mirror) — the terminal is write-only and
+cannot open what it wrote, and neither can the server.
+
+The message envelope is capped at 128KB of base64, so the split is by size, not by
+kind:
+
+- **Small enough to inline** (≤24KB): the bytes ride inside the message envelope.
+- **Anything larger**: sealed on its own and stored as an `OutboxBlob`
+  (`POST /api/outbox/blob`), with the envelope carrying only the blob id plus
+  metadata the app needs to render it (name, media type, size, caption). The app
+  collects the bytes on the same sync that opens the message, writes them into the
+  on-device encrypted file store (`localStorageService`, per-file AES-256-GCM), then
+  acks — which deletes the server copy.
+
+Three properties are load-bearing and pinned by the ceilings in
+`server/services/outboxBlobLimits.js` (tested in `server/test/outboxBlob.test.js`):
+
+- **Ciphertext only, both halves.** The blob collection stores `Buffer`s the server
+  has no key for. Everything content-shaped — filename, media type, caption — stays
+  inside the sealed *message*, not on the blob row, which knows only whose it is, how
+  big it is, and when to expire.
+- **Ack deletes; the TTL is a backstop, not the plan.** A blob is acked only once its
+  bytes are safely written to the device — acking on fetch would delete the only copy
+  of a file the device then failed to store. An uncollected blob dies on a 7-day Mongo
+  TTL index (expiry as a property of the row, the same reasoning the Redis-only holds
+  use), well inside the 30-day message backstop.
+- **A refusal, never an eviction.** Over the per-blob (8MB), pending-count (64) or
+  pending-byte (128MB) ceiling the write is refused; the terminal still holds the file
+  and names it in the result body ("still on `<machine>`"). Evicting something already
+  parked would silently drop media the user had been told was on its way.
+
+This is not a new carve-out: nothing rests in plaintext anywhere on our servers, and
+deleting a result on the device deletes its bytes with it (`releaseMedia`). The
+honest limits are the ordinary ones — the account's own devices can read these files,
+and losing the master key loses them, like everything else.
+
 ### Voice preview clips — a shared cache, and not a carve-out
 
 The ▶ button beside each voice in the voice picker plays an audition clip served
@@ -513,7 +555,7 @@ for inference — under exactly the same ZDR/TEE routing as any other message
 (`POST /api/app-tools/v1/chat/completions`, `server/routes/appTools.js`). So a
 connector does not weaken the guarantee, but it does mean *more* content flows
 through the existing inference path. Do not describe a connector turn as
-end-to-end encrypted; describe it as "your credential and the service call stay on
+encrypted; describe it as "your credential and the service call stay on
 your device, and the answer is inferred under our normal ZDR/TEE routing."
 
 **Why connectors are unavailable in Sealed mode.** A sealed turn reaches the

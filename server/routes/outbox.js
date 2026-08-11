@@ -36,6 +36,18 @@
  *   GET  /api/outbox         (authed) → the caller's pending items, newest first.
  *   POST /api/outbox/ack     (authed) → delete acked items by id.
  *
+ *   POST /api/outbox/blob     (authed, rate-limited) → one sealed attachment.
+ *   GET  /api/outbox/blob/:id (authed) → that attachment's ciphertext.
+ *   POST /api/outbox/blob/ack (authed) → delete collected attachments by id.
+ *
+ * The blob routes carry the media an unattended run produced — the still a
+ * routine generated, the clip it composed. Same sealed-box posture as an item
+ * (the server holds ciphertext and can't open it) but a separate collection,
+ * because a message is kilobytes and a still is megabytes; the message envelope
+ * carries the metadata plus a `blobId` per attachment, and the client collects
+ * the bytes on the same sync that decrypts the message. See
+ * models/outboxBlobModel.js and services/outboxBlobLimits.js.
+ *
  * Terminals hold NO account key material, so they can only write. The immutable
  * pubkey guarantees a compromised terminal can't substitute a key it controls;
  * clients additionally verify the published key matches their locally-derived
@@ -48,8 +60,10 @@ const logger = require('../utils/logger');
 const Sentry = require('@sentry/node');
 const User = require('../models/userModel');
 const OutboxItem = require('../models/outboxItemModel');
+const OutboxBlob = require('../models/outboxBlobModel');
 const { authenticate } = require('../middleware/auth');
-const { outboxPostLimiter } = require('../middleware/rateLimiter');
+const { outboxPostLimiter, outboxBlobLimiter } = require('../middleware/rateLimiter');
+const { checkBlobAccepted, BLOB_TTL_MS } = require('../services/outboxBlobLimits');
 
 // A sealed item is epk(32)+iv(12)+tag(16) overhead over a summary capped at
 // ~64KiB plaintext. Cap the base64 payload generously above that; the mailbox
@@ -213,6 +227,95 @@ router.post('/ack', authenticate, async (req, res) => {
     Sentry.captureException(error, { tags: { op: 'outbox_ack' } });
     logger.error('Outbox ack error:', error);
     res.status(500).json({ message: 'Error acking outbox items' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Attachment blobs
+// ---------------------------------------------------------------------------
+
+router.post('/blob', authenticate, outboxBlobLimiter, async (req, res) => {
+  try {
+    const { sealed } = req.body || {};
+    if (typeof sealed !== 'string' || sealed.length === 0) {
+      return res.status(400).json({ message: 'sealed is required (base64)', code: 'NO_SEALED' });
+    }
+    // Cheap length gate BEFORE decoding — a 20MB base64 string should be refused
+    // on its length, not after allocating the buffer it decodes to.
+    const early = checkBlobAccepted({ size: Math.floor((sealed.length * 3) / 4) });
+    if (!early.ok && early.code === 'OUTBOX_BLOB_TOO_LARGE') {
+      return res.status(early.status).json({ message: early.message, code: early.code });
+    }
+    const buf = decodeBase64(sealed);
+    if (!buf) {
+      return res.status(400).json({ message: 'sealed must be valid base64', code: 'BAD_SEALED' });
+    }
+
+    // What this account already has parked, unacked. Two numbers, one pass.
+    const [usage] = await OutboxBlob.aggregate([
+      { $match: { userId: req.user._id } },
+      { $group: { _id: null, count: { $sum: 1 }, bytes: { $sum: '$size' } } },
+    ]);
+    const verdict = checkBlobAccepted({
+      size: buf.length,
+      pendingCount: usage?.count || 0,
+      pendingBytes: usage?.bytes || 0,
+    });
+    if (!verdict.ok) {
+      return res.status(verdict.status).json({ message: verdict.message, code: verdict.code });
+    }
+
+    const blob = await OutboxBlob.create({
+      userId: req.user._id,
+      data: buf,
+      size: buf.length,
+      expiresAt: new Date(Date.now() + BLOB_TTL_MS),
+    });
+
+    res.status(201).json({ id: blob._id, size: blob.size });
+  } catch (error) {
+    Sentry.captureException(error, { tags: { op: 'outbox_blob_post' } });
+    logger.error('Outbox blob post error:', error);
+    res.status(500).json({ message: 'Error storing outbox attachment' });
+  }
+});
+
+router.get('/blob/:id', authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ message: 'invalid id', code: 'BAD_ID' });
+    }
+    // Scoped to userId, so one account can never read another's ciphertext —
+    // opaque as it is, it is still not theirs to hold.
+    const blob = await OutboxBlob.findOne({ _id: id, userId: req.user._id }).select('data size').lean();
+    if (!blob) {
+      // A blob whose message was read on another device is already acked and
+      // gone. 404 is the honest answer and the client treats it as "collected
+      // elsewhere" rather than an error worth retrying.
+      return res.status(404).json({ message: 'Attachment not found', code: 'OUTBOX_BLOB_GONE' });
+    }
+    res.json({ id: blob._id, sealed: blob.data.toString('base64'), size: blob.size });
+  } catch (error) {
+    Sentry.captureException(error, { tags: { op: 'outbox_blob_get' } });
+    logger.error('Outbox blob get error:', error);
+    res.status(500).json({ message: 'Error fetching outbox attachment' });
+  }
+});
+
+router.post('/blob/ack', authenticate, async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    const valid = ids.filter((id) => mongoose.Types.ObjectId.isValid(id)).slice(0, MAX_FETCH);
+    if (valid.length === 0) {
+      return res.status(400).json({ message: 'ids must be a non-empty array of blob ids', code: 'NO_IDS' });
+    }
+    const result = await OutboxBlob.deleteMany({ userId: req.user._id, _id: { $in: valid } });
+    res.json({ deleted: result.deletedCount || 0 });
+  } catch (error) {
+    Sentry.captureException(error, { tags: { op: 'outbox_blob_ack' } });
+    logger.error('Outbox blob ack error:', error);
+    res.status(500).json({ message: 'Error acking outbox attachments' });
   }
 });
 

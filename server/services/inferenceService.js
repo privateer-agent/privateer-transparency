@@ -460,6 +460,110 @@ function applyPromptCacheHints(messages, modelId) {
   }
 }
 
+// Models where an explicit breakpoint is REQUIRED for prompt caching to happen
+// at all. OpenAI/DeepSeek/xAI auto-cache and Gemini caches implicitly, so
+// tagging them buys nothing and only rewrites a caller's wire format.
+const EXPLICIT_CACHE_BREAKPOINT_MODEL = /^anthropic\//i;
+
+function hasCacheControl(msg) {
+  return Array.isArray(msg?.content)
+    && msg.content.some((p) => p && typeof p === 'object' && p.cache_control);
+}
+
+/**
+ * Return a COPY of `msg` carrying a cache breakpoint on its last content block,
+ * or null when there is nothing to tag.
+ *
+ * Copies rather than mutates because on the proxy path `messages` is the
+ * caller's request body, which we are otherwise passing through untouched.
+ *
+ * `promoteString` converts a plain string `content` into single-element block
+ * form (the only way to attach a breakpoint to it). That is safe and routine for
+ * system/user/tool turns, but callers pass `false` for assistant turns: an
+ * assistant string is the one place the rewrite could change how a provider
+ * reads the turn, and it is never the anchor we actually need — an agent
+ * transcript ends on a tool result, not on an assistant message.
+ */
+function taggedCacheCopy(msg, { promoteString = true } = {}) {
+  if (!msg) return null;
+  const mark = { type: 'ephemeral' };
+
+  if (typeof msg.content === 'string') {
+    if (!promoteString || !msg.content) return null;
+    return { ...msg, content: [{ type: 'text', text: msg.content, cache_control: mark }] };
+  }
+
+  if (Array.isArray(msg.content) && msg.content.length > 0) {
+    const parts = msg.content.slice();
+    const last = parts[parts.length - 1];
+    if (!last || typeof last !== 'object') return null;
+    parts[parts.length - 1] = { ...last, cache_control: mark };
+    return { ...msg, content: parts };
+  }
+
+  // Assistant turns that are pure `tool_calls` carry `content: null` — nothing
+  // to hang a breakpoint on. Not an error; the caller walks further back.
+  return null;
+}
+
+/**
+ * Prompt-cache breakpoints for the OpenAI-compatible PROXY surfaces (Agent CLI,
+ * developer /v1, in-app connector turns).
+ *
+ * Separate from applyPromptCacheHints, which anchors its rolling breakpoint on
+ * the last *assistant* turn. That is right for app chat and wrong here: an agent
+ * transcript ends on a tool result and its assistant turns routinely carry
+ * `content: null` with `tool_calls`, so the assistant anchor lands on a message
+ * with nothing to tag and the growing transcript goes entirely uncached.
+ *
+ * That is not hypothetical — it is what this function was written for. On
+ * 2026-08-11 a single routine ran 39 CLI turns on claude-opus-5 in under eight
+ * minutes; prompt tokens climbed 3,858 → 123,852 because every turn re-billed
+ * the whole transcript at full input price. 2,697,087 prompt tokens against
+ * 23,653 completion — 99.1% of the spend was re-sent context, and it tied out
+ * to list price to the cent, i.e. not one cache read.
+ *
+ * Two of the four allowed breakpoints:
+ *   1. the system prompt. Anthropic renders tools → system → messages, so one
+ *      breakpoint here covers the tool definitions too;
+ *   2. the newest taggable message, whatever its role — the standard
+ *      incremental pattern. Each turn reads the prefix it matches and writes
+ *      only the delta, so cost tracks new tokens instead of total context.
+ *
+ * Verified live against OpenRouter before shipping: turn 1 wrote 8,142 tokens,
+ * turns 2 and 3 read 8,142 from cache.
+ *
+ * Deliberately does NOT touch provider routing. Anthropic caches are per
+ * provider, so in principle `OPENROUTER_PROVIDER_SORT=latency` could bounce a
+ * conversation between Anthropic/Bedrock/Vertex and lose the cache — but pinning
+ * `provider.order` measured *worse*, not better (see PROMPT_CACHE_NOTES in the
+ * test), and latency routing held one provider across a run. Leave it alone.
+ */
+function withProxyPromptCacheHints(messages, modelId) {
+  if (String(process.env.PROXY_PROMPT_CACHE || '').toLowerCase() === 'false') return messages;
+  if (!Array.isArray(messages) || messages.length === 0) return messages;
+  if (!EXPLICIT_CACHE_BREAKPOINT_MODEL.test(String(modelId || ''))) return messages;
+
+  // The caller already placed breakpoints. Respect their placement rather than
+  // adding a second pair — the ceiling is 4 and they may be using the others.
+  if (messages.some(hasCacheControl)) return messages;
+
+  const out = messages.slice();
+  const firstIdx = out[0]?.role === 'system' ? 1 : 0;
+
+  if (firstIdx === 1) {
+    const tagged = taggedCacheCopy(out[0]);
+    if (tagged) out[0] = tagged;
+  }
+
+  for (let i = out.length - 1; i >= firstIdx; i--) {
+    const tagged = taggedCacheCopy(out[i], { promoteString: out[i]?.role !== 'assistant' });
+    if (tagged) { out[i] = tagged; break; }
+  }
+
+  return out;
+}
+
 // Latency-based provider routing (env-gated). When OPENROUTER_PROVIDER_SORT is
 // set (e.g. "latency" | "throughput" | "price"), OpenRouter routes each request
 // to the best provider on a trailing 5-min average; gateway overhead is only
@@ -1836,10 +1940,61 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
   };
 }
 
+// ── Proxy request bounds ─────────────────────────────────────────────────────
+//
+// The proxy surfaces (/v1, the agent CLI, in-app connector turns) pass the
+// client's body through essentially unchanged — that faithfulness is the point.
+// It also meant a single request had no bounded cost: no completion ceiling, no
+// input ceiling, under a 20MB JSON body limit. Combined with a pre-flight gate
+// that only ever checked a flat $0.05 floor, one request could be worth orders
+// of magnitude more than the balance that was allowed to start it.
+//
+// These two ceilings make the worst case of a proxied turn computable, which is
+// what lets the caller size its balance check to the actual request instead of a
+// constant. Both are generous by default — this is a backstop against unbounded
+// cost, not a product limit — and both are env-tunable.
+const PROXY_MAX_COMPLETION_TOKENS = Number(process.env.PROXY_MAX_COMPLETION_TOKENS) || 32_000;
+const PROXY_MAX_INPUT_TOKENS = Number(process.env.PROXY_MAX_INPUT_TOKENS) || 400_000;
+
+/**
+ * Worst-case token bounds for a proxied OpenAI-shaped request.
+ *
+ * `inputTokens` is the rough chars/4 estimate `estimateTokens` uses elsewhere —
+ * exactness doesn't matter, this sizes a gate, not a bill. Note it does not
+ * count image/audio parts, so a heavily multimodal request is under-estimated;
+ * the ceilings below are the real backstop, not this number.
+ *
+ * `completionTokens` is what the caller asked for, clamped — or the ceiling when
+ * they asked for nothing, since "unspecified" means the model's own maximum and
+ * that is exactly the unbounded case.
+ */
+function proxyRequestBounds(openaiBody) {
+  const messages = Array.isArray(openaiBody?.messages) ? openaiBody.messages : [];
+  let inputTokens = 0;
+  for (const m of messages) inputTokens += estimateTokens(m?.content);
+
+  // `max_completion_tokens` is OpenAI's newer spelling; reasoning models take
+  // only that one. Honour whichever the caller used.
+  const field = openaiBody?.max_completion_tokens != null ? 'max_completion_tokens' : 'max_tokens';
+  const asked = Number(openaiBody?.[field]);
+  const completionTokens = Number.isFinite(asked) && asked > 0
+    ? Math.min(asked, PROXY_MAX_COMPLETION_TOKENS)
+    : PROXY_MAX_COMPLETION_TOKENS;
+
+  return {
+    inputTokens,
+    completionTokens,
+    field,
+    inputOverLimit: inputTokens > PROXY_MAX_INPUT_TOKENS,
+    maxInputTokens: PROXY_MAX_INPUT_TOKENS,
+    maxCompletionTokens: PROXY_MAX_COMPLETION_TOKENS,
+  };
+}
+
 /**
  * Faithful OpenAI-compatible chat-completions proxy for the Privateer Agent
  * CLI. Unlike generateTextStream (text-only, reshaped for the mobile/graph UI),
- * this preserves the upstream wire format end to end — tool_calls, multi-part
+ * this preserves the upstream wire format intact — tool_calls, multi-part
  * content, finish_reason — so an agentic client can function-call against the
  * user's account. It only (a) pins the request to the right model + ZDR
  * key/provider routing and (b) asks for usage so the caller can bill, then
@@ -1866,11 +2021,24 @@ async function proxyChatCompletion(openaiBody, { requireZdr = true } = {}) {
   const effectiveModelId = await resolveModelId(openaiBody?.model);
 
   // Pass the client body through unchanged except for the fields we own: the
-  // resolved model, and (when streaming) usage accounting so we can bill.
+  // resolved model, (when streaming) usage accounting so we can bill, and the
+  // completion ceiling that keeps a single turn's cost bounded.
   const body = { ...openaiBody, model: effectiveModelId };
   if (body.stream) {
     body.stream_options = { ...(body.stream_options || {}), include_usage: true };
   }
+
+  // Clamped here rather than only at the route, so the ceiling holds for every
+  // caller of this function — a new surface cannot forget it. Writing back to
+  // whichever field the caller used avoids sending both spellings, which some
+  // providers reject.
+  const bounds = proxyRequestBounds(openaiBody);
+  body[bounds.field] = bounds.completionTokens;
+
+  // Cache breakpoints belong here, beside the ceiling, and for the same reason:
+  // every proxy surface goes through this function, so a new one cannot forget
+  // them. Without this an agent loop re-bills its whole transcript every turn.
+  body.messages = withProxyPromptCacheHints(body.messages, effectiveModelId);
 
   const useZdrKey = await resolveUseZdrKey({ requireZdr, modelId: effectiveModelId });
   await applyZdrRouting(body, effectiveModelId, { useZdrKey });
@@ -2173,7 +2341,7 @@ async function extractMemoryCandidates({ userMessage, aiResponse, existingMemori
   }
 }
 
-module.exports = { generateText, generateTextStream, proxyChatCompletion, calcOpenRouterCost, calcInferenceCost, calcImageGenCost, generateImage, submitVideoGeneration, getVideoModelRuntimeCaps, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, listSubscriptionCatalog, formatImageGenErrorForUser, formatVideoGenErrorForUser, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
+module.exports = { generateText, generateTextStream, proxyChatCompletion, proxyRequestBounds, withProxyPromptCacheHints, estimateTokens, calcOpenRouterCost, calcInferenceCost, calcImageGenCost, generateImage, submitVideoGeneration, getVideoModelRuntimeCaps, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, listSubscriptionCatalog, formatImageGenErrorForUser, formatVideoGenErrorForUser, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
   // Shared formatting helpers reused by nearAiService (OpenAI-compatible NEAR path).
   NO_TABLES_DIRECTIVE, withNoTables, convertTablesToBullets, createStreamingTableConverter,
   // og:image enrichment for source cards — also applied to the Brave web-search path.
