@@ -397,6 +397,10 @@ class AuthService {
     // Wipe caught-up outbox results — they're decrypted plaintext tied to the
     // account and must not survive sign-out on a shared device.
     void clearOutboxResults();
+    // …and the briefs written over them, which are the same plaintext condensed.
+    // Imported lazily: inboxBriefService reaches inference, which reaches back
+    // here, and this module must not sit in that cycle at load time.
+    void import('./inboxBriefService').then((m) => m.clearInboxBriefs()).catch(() => {});
     // Drop pinned terminal keys — they belong to this account's terminals; a
     // different account signing in on this device must not inherit their trust.
     void clearTrustedTerminalKeys();
@@ -719,6 +723,7 @@ class AuthService {
       this.user = null;
       resetOutboxKeyState();
       void clearOutboxResults();
+      void import('./inboxBriefService').then((m) => m.clearInboxBriefs()).catch(() => {});
       this.tokenExpirationCallbacks.forEach(cb => {
         try { cb(); } catch (_) {}
       });
