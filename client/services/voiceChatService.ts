@@ -156,18 +156,38 @@ export async function synthesizeSpeechBytes(
 export async function fetchVoicePreview(
   opts: { modelId: string; voice: string; locale?: string },
 ): Promise<{ audioBase64: string; mimeType: string; cached: boolean }> {
+  // The same two prefs the synthesis routes are sent, and for the same reason:
+  // /voice-preview runs the ZDR gate before the cache read, so a preview of a
+  // non-ZDR (fal) voice is blocked unless this request carries the opt-in. On
+  // the local backend those prefs exist ONLY on this device (CLAUDE.md §2), so
+  // omitting them made the server fall back to a preference it cannot see and
+  // 403 every fal voice — auditioning silently did nothing while *selecting*
+  // the same voice worked, because /speech sends them.
+  const [requireZdr, allowNonZdrMedia] = await Promise.all([
+    getRequireZdr(),
+    getAllowNonZdrMedia(),
+  ]);
+
   const res = await authService.makeAuthenticatedRequest('/api/audio/voice-preview', {
     method: 'POST',
     body: JSON.stringify({
       ttsModelId: opts.modelId,
       voice: opts.voice,
       locale: opts.locale || i18n.language,
+      requireZdr,
+      allowNonZdrMedia,
     }),
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({} as any));
     if (data?.code === 'FEATURE_LOCKED') {
       throw new VoiceChatError(data?.message || i18n.t('voice.errors.featureLocked'), 'FEATURE_LOCKED');
+    }
+    // A non-ZDR voice with the opt-in off — a setting, not a failure. Mapped
+    // like the synthesis path so the picker can name the toggle that fixes it
+    // instead of reporting a generic provider error.
+    if (res.status === 403 || data?.code === 'ZDR_MEDIA_BLOCKED') {
+      throw new VoiceChatError(i18n.t('voice.errors.zdrBlocked'), 'ZDR_MEDIA_BLOCKED');
     }
     if (res.status === 402 || data?.code === 'INSUFFICIENT_FUNDS') {
       throw new VoiceChatError(i18n.t('voice.errors.creditsTts'), 'INSUFFICIENT_FUNDS');

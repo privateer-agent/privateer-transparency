@@ -33,6 +33,8 @@
  *   GET  /v1/videos/:id             — poll a video job; returns a signed URL
  *   POST /v1/audio/transcriptions   — speech-to-text (OpenAI shape, multipart)
  *   POST /v1/audio/speech           — text-to-speech (OpenAI shape, audio bytes)
+ *   POST /v1/search                 — web search, server-side (Privateer ext.)
+ *   POST /v1/fetch                  — read web pages as text (Privateer ext.)
  *
  * sk-priv-… keys instead of the app JWT; downstream model resolution, ZDR,
  * entitlement, and billing are the same account path the app uses. Inference is
@@ -55,6 +57,8 @@ const audioService = require('../services/audioService');
 const { assertMediaModelAllowed, resolveAllowNonZdrMedia } = require('../controllers/chatController');
 const billingService = require('../services/billingService');
 const { listEnabledModels } = require('../services/inferenceService');
+const { search: braveSearch, SEARCH_COST_USD } = require('../services/braveSearchService');
+const linkAnalysisService = require('../services/linkAnalysisService');
 
 // Developer /v1 turns get their own concurrency pool ('apikey'), separate from
 // the app's chat slots and the Agent CLI's 'agentjobs' pool.
@@ -230,6 +234,125 @@ router.post(
       return sendMediaError(res, err, 'audio_sfx');
     }
   });
+
+// ── Search + fetch ────────────────────────────────────────────────────────────
+//
+// The same two capabilities the Privateer agent gets through /api/rag/*, offered
+// to developer keys: a web search whose provider key is ours, and a page fetch
+// made from our egress rather than the caller's.
+//
+// WHY IT IS ON THIS API AT ALL. It is the piece an OpenAI-compatible base URL
+// cannot supply by itself — a caller building a grounded answer otherwise needs
+// a second vendor, a second key and a second bill. Here the query is a POST to
+// the same base URL, on the same sk-priv-… key, metered on the same account.
+//
+// WHAT "PRIVATE" MEANS HERE, EXACTLY. Not end-to-end encrypted, and no more
+// private than the rest of this API: the query reaches our server in the clear
+// and we pass it to Brave. What it does buy is that the SEARCH PROVIDER never
+// sees the caller — no key of theirs, no IP of theirs, no account of theirs at
+// Brave, and no cross-request identity to profile — and that we persist billing
+// metadata only, never the query or the results. Say that; never call it
+// end-to-end encrypted or fully private.
+//
+// COST AND CAPS. Search bills the same flat provider cost the chat path pays,
+// at the developer-API markup, and spends the account's daily `webSearch`
+// allowance. Fetch has no provider cost so it charges nothing, but it does spend
+// the daily `linkFetch` allowance and sits behind linkAnalysisService's own
+// per-minute egress budget — an unmetered scraping endpoint is not something an
+// API key should hand out.
+
+// Estimated up front for the balance gate, then charged for real after the call.
+const searchBilledUsd = () => SEARCH_COST_USD * billingService.apiMarkupFactor();
+
+const clampCount = (raw, dflt) => {
+  const n = Number(raw);
+  return Number.isFinite(n) ? Math.max(1, Math.min(10, Math.trunc(n))) : dflt;
+};
+
+// Brave's own freshness window values. Anything else is dropped rather than
+// forwarded, so a typo can't turn into an upstream 422.
+const FRESHNESS = new Set(['pd', 'pw', 'pm', 'py']);
+
+router.post(
+  '/search',
+  apiRateLimiter,
+  requireDailyCap('webSearch'),
+  (req, res, next) => checkCreditBalance(searchBilledUsd())(req, res, next),
+  requireConcurrencySlot({ keyPrefix: 'apikey', cap: API_CONCURRENCY_CAP }),
+  async (req, res) => {
+    const body = req.body || {};
+    const query = typeof body.query === 'string' ? body.query.trim() : '';
+    if (!query) return oaError(res, 400, '`query` is required.', 'QUERY_REQUIRED');
+
+    const count = clampCount(body.count, 5);
+    const freshness = FRESHNESS.has(body.freshness) ? body.freshness : undefined;
+
+    try {
+      const data = await braveSearch(query, { count, ...(freshness ? { freshness } : {}) });
+      // Charged after the provider call succeeded: a 502 from Brave is our
+      // problem, not something the caller should pay for.
+      await billingService.chargeUsd(req.userId, searchBilledUsd(), {
+        model: 'brave-search',
+        providerCostUsd: SEARCH_COST_USD,
+        kind: 'webSearch',
+        origin: 'api',
+      });
+      // `include_media` costs nothing: the thumbnails and the video block ride
+      // along on the single response we already paid for, so the only reason to
+      // withhold them by default is wire size.
+      const media = body.include_media === true;
+      return res.json({
+        query,
+        results: (data?.results || []).map(r => ({
+          title: r.title, url: r.url, description: r.description, age: r.age,
+          ...(r.image ? { image: r.image } : {}),
+        })),
+        ...(media ? { images: data?.images || [], videos: data?.videos || [] } : {}),
+      });
+    } catch (err) {
+      logger.error('[v1 search]', err.message);
+      return oaError(res, 502, 'Web search failed.', 'SEARCH_FAILED');
+    }
+  }
+);
+
+router.post(
+  '/fetch',
+  apiRateLimiter,
+  requireDailyCap('linkFetch'),
+  requireConcurrencySlot({ keyPrefix: 'apikey', cap: API_CONCURRENCY_CAP }),
+  async (req, res) => {
+    const body = req.body || {};
+    // One URL or several: `url` is the shape a caller reaches for after a search
+    // result, `urls` the one that batches. Same handler, same cap.
+    const raw = Array.isArray(body.urls) ? body.urls : body.url != null ? [body.url] : [];
+    const urls = raw.filter(u => typeof u === 'string' && u.trim()).map(u => u.trim());
+    if (urls.length === 0) return oaError(res, 400, 'A `url`, or a `urls` array, is required.', 'URL_REQUIRED');
+    if (urls.some(u => !/^https?:\/\//i.test(u))) {
+      return oaError(res, 400, 'Each URL must be absolute and http(s).', 'URL_INVALID');
+    }
+
+    try {
+      // Extra URLs beyond the cap come back as failed entries rather than being
+      // silently dropped, so a caller can see what wasn't read. Private and
+      // internal addresses are refused inside the service (SSRF guard) and
+      // surface the same way — per-URL `ok: false`, not a failed request.
+      const { results, anyFailed } = await linkAnalysisService.analyzeLinks(urls, { userId: req.userId });
+      return res.json({
+        anyFailed,
+        results: (results || []).map(r => ({
+          ok: !!r.ok,
+          url: r.url,
+          title: r.title,
+          ...(r.ok ? { text: r.text } : { error: r.error }),
+        })),
+      });
+    } catch (err) {
+      logger.error('[v1 fetch]', err.message);
+      return oaError(res, 502, 'Fetch failed.', 'FETCH_FAILED');
+    }
+  }
+);
 
 function sendMediaError(res, err, op) {
   // ZDR_MEDIA_BLOCKED already carries statusCode 403 from assertMediaModelAllowed,

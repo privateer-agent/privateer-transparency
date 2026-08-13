@@ -33,6 +33,7 @@ import { Audio } from 'expo-av';
 import * as Speech from 'expo-speech';
 import { isGuestSession } from './sessionMode';
 import { synthesizeSpeechBytes, fetchVoicePreview, audioBytesToUri } from './voiceChatService';
+import i18n from '../i18n';
 
 interface SpeakOptions {
   /** Playback finished on its own. Not called when interrupted by stop(). */
@@ -45,6 +46,17 @@ interface SpeakOptions {
    * from the engine rather than from local state a global stop can't reach.
    */
   id?: string;
+  /**
+   * Synthesis failed and this utterance is being read by the device engine
+   * instead, with `reason` already localized.
+   *
+   * The fallback itself is right — a read-aloud button that goes quiet is worse
+   * than one that reads in the stock system voice — but doing it *silently* was
+   * not: the chosen voice and the device voice are audibly different, so a
+   * failed synthesis is indistinguishable from the app ignoring the voice you
+   * picked. Callers use this to say which of the two happened.
+   */
+  onFallback?: (reason: string) => void;
 }
 
 let activeSound: Audio.Sound | null = null;
@@ -266,10 +278,15 @@ export async function speakText(text: string, options: SpeakOptions = {}): Promi
     if (generation !== mine) return 'server';
     await playUri(uri, mine, handlers);
     return 'server';
-  } catch {
+  } catch (err: any) {
     // Out of credits / offline / provider down / undecodable audio — fall back
-    // so the button always does something audible.
+    // so the button always does something audible, and report *why* the voice
+    // changed. VoiceChatError messages are already localized; anything else is
+    // reported as the generic synthesis failure.
     if (generation !== mine) return 'server';
+    options.onFallback?.(
+      typeof err?.message === 'string' && err?.code ? err.message : i18n.t('voice.errors.ttsFailed'),
+    );
     speakOnDevice(trimmed, handlers);
     return 'device';
   }
