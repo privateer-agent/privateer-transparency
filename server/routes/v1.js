@@ -31,6 +31,8 @@
  *   POST /v1/images/generations     — image generation (OpenAI Images shape)
  *   POST /v1/videos                 — submit an async video job (Privateer ext.)
  *   GET  /v1/videos/:id             — poll a video job; returns a signed URL
+ *   POST /v1/models3d               — submit an async image-to-mesh job (Privateer ext.)
+ *   GET  /v1/models3d/:id           — poll a 3D job; returns a signed URL
  *   POST /v1/audio/transcriptions   — speech-to-text (OpenAI shape, multipart)
  *   POST /v1/audio/speech           — text-to-speech (OpenAI shape, audio bytes)
  *   POST /v1/search                 — web search, server-side (Privateer ext.)
@@ -50,7 +52,10 @@ const { apiRateLimiter } = require('../middleware/rateLimiter');
 const { checkCreditBalance } = require('../middleware/checkBalance');
 const { requireDailyCap, requireConcurrencySlot, requireFeature } = require('../middleware/entitlement');
 const { handleChatCompletion } = require('../services/openaiProxyHandler');
-const { handleImageGeneration, handleVideoSubmit, handleVideoStatus } = require('../services/openaiMediaHandler');
+const {
+  handleImageGeneration, handleVideoSubmit, handleVideoStatus,
+  handleModel3dSubmit, handleModel3dStatus,
+} = require('../services/openaiMediaHandler');
 const audioService = require('../services/audioService');
 // The non-ZDR media gate, shared with the app and agent paths — /audio/sfx is
 // the only /v1 audio route that needs it.
@@ -116,6 +121,21 @@ router.post(
   handleVideoSubmit
 );
 router.get('/videos/:id', apiRateLimiter, handleVideoStatus);
+
+// ── 3D meshes (async submit → poll) ───────────────────────────────────────────
+// Image-to-mesh. The balance floor is the cheapest legal generation rather than
+// a round number — the handler prices the real request and refuses on that, so
+// this gate only has to stop an empty wallet reaching the provider.
+router.post(
+  '/models3d',
+  apiRateLimiter,
+  requireFeature('modelGen'),
+  requireDailyCap('modelGen'),
+  checkCreditBalance(0.22),
+  requireConcurrencySlot({ keyPrefix: 'apikey', cap: API_CONCURRENCY_CAP }),
+  handleModel3dSubmit
+);
+router.get('/models3d/:id', apiRateLimiter, handleModel3dStatus);
 
 // ── Audio: speech-to-text (multipart `file`, or JSON audioBase64) ──────────────
 router.post(
