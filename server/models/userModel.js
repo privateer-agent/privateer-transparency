@@ -170,6 +170,19 @@ const userSchema = new mongoose.Schema(
       default: 0,
       min: 0
     },
+    // When subscriptionCreditUsd was last RESET by a grant (renewal, plan
+    // change, admin grant) — maintained by billingService.creditUsd.
+    //
+    // Load-bearing for reservations, not just informational. A hold moves money
+    // out of this bucket into reservedCreditUsd; if the grant resets the bucket
+    // while that hold is outstanding, refunding the hold's subscription share
+    // afterwards would credit the NEW cycle with money the OLD cycle granted —
+    // rolling over credit the plan says expires. reservationService stamps each
+    // reservation with this value and compares on refund.
+    subscriptionCreditGrantedAt: {
+      type: Date,
+      default: null
+    },
     // Top-up credit — pay-as-you-go USD purchased via Stripe or Solana/USDC.
     // Persists across cycles; drained only after subscriptionCreditUsd is empty.
     topUpCreditUsd: {

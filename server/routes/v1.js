@@ -31,6 +31,7 @@
  *   POST /v1/images/generations     — image generation (OpenAI Images shape)
  *   POST /v1/videos                 — submit an async video job (Privateer ext.)
  *   GET  /v1/videos/:id             — poll a video job; returns a signed URL
+ *   GET  /v1/models3d               — list 3D models and the options each takes
  *   POST /v1/models3d               — submit an async image-to-mesh job (Privateer ext.)
  *   GET  /v1/models3d/:id           — poll a 3D job; returns a signed URL
  *   POST /v1/audio/transcriptions   — speech-to-text (OpenAI shape, multipart)
@@ -54,7 +55,7 @@ const { requireDailyCap, requireConcurrencySlot, requireFeature } = require('../
 const { handleChatCompletion } = require('../services/openaiProxyHandler');
 const {
   handleImageGeneration, handleVideoSubmit, handleVideoStatus,
-  handleModel3dSubmit, handleModel3dStatus,
+  handleModel3dCatalog, handleModel3dSubmit, handleModel3dStatus,
 } = require('../services/openaiMediaHandler');
 const audioService = require('../services/audioService');
 // The non-ZDR media gate, shared with the app and agent paths — /audio/sfx is
@@ -135,6 +136,11 @@ router.post(
   requireConcurrencySlot({ keyPrefix: 'apikey', cap: API_CONCURRENCY_CAP }),
   handleModel3dSubmit
 );
+// Listed BEFORE the poll route so it cannot be swallowed by `:id`, and carrying
+// none of the submit route's gates: reading which models exist must not require
+// the modelGen entitlement or a credit balance. A caller who cannot afford a
+// mesh is exactly the one who needs to see what the cheap models cost.
+router.get('/models3d', apiRateLimiter, handleModel3dCatalog);
 router.get('/models3d/:id', apiRateLimiter, handleModel3dStatus);
 
 // ── Audio: speech-to-text (multipart `file`, or JSON audioBase64) ──────────────

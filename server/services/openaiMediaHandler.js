@@ -42,7 +42,8 @@ const {
 } = require('../controllers/chatController');
 const falService = require('./falService');
 const {
-  DEFAULT_3D_MODEL, resolve3dModel, fal3dModel, normalize3dOptions, fal3dCostUsd,
+  DEFAULT_3D_MODEL, resolve3dModel, fal3dModel, fal3dModelIds, normalize3dOptions, fal3dCostUsd,
+  fal3dPriceRangeUsd, axisEntries, axisIsPriced,
   buildFal3dInput, fal3dOutputUrl, fal3dMime,
 } = require('../data/fal3dModels');
 const ApiMediaJob = require('../models/apiMediaJobModel');
@@ -367,8 +368,91 @@ function input3dImage(entry, index) {
   return { data: buffer.toString('base64'), mimeType, bytes: buffer.length };
 }
 
+/**
+ * GET /v1/models3d — the 3D models this key can submit to, and what each takes.
+ *
+ * WHY IT EXISTS. Ten endpoints from five vendors, and they do not share their
+ * options: one prices on `resolution`, another on a texture ladder, another on
+ * an addon flag. `POST /v1/models3d` accepts an `axes` object to reach them, and
+ * a caller with no way to learn the legal axis NAMES for the model it picked can
+ * only discover them by spending money on refused requests. The alternative was
+ * to publish the whole matrix in the docs, where it would be wrong the first time
+ * a row changed.
+ *
+ * `GET /v1/models` is the OpenAI-shaped chat list and deliberately stays that
+ * way; a mesh row shares none of its fields.
+ *
+ * Prices are the API's own billed figures (the flat developer markup), not the
+ * provider's, and they are a QUOTE rather than a contract — the submit response
+ * still reports `estimated_cost_usd` for the exact request, which is the number
+ * that gets charged.
+ */
+async function handleModel3dCatalog(req, res) {
+  try {
+    if (!falService.isConfigured()) {
+      return oaError(res, 503, '3D generation is not available on this deployment.', 'MODEL_3D_UNAVAILABLE');
+    }
+    const requireZdr = await resolveRequireZdr(req.userId, undefined);
+    const allowNonZdrMedia = await resolveAllowNonZdrMedia(req.userId, undefined);
+
+    const data = [];
+    for (const id of fal3dModelIds()) {
+      const row = fal3dModel(id);
+      const range = fal3dPriceRangeUsd(id);
+      // Reported per row rather than as one flag on the response: it is the
+      // account's setting that blocks, but a caller reading this should see the
+      // refusal attached to the thing it was about to submit.
+      let blockedByZdr = false;
+      try {
+        await assertMediaModelAllowed({ userId: req.userId, modelId: id, requireZdr, allowNonZdrMedia });
+      } catch (e) {
+        blockedByZdr = e?.code === 'ZDR_MEDIA_BLOCKED';
+      }
+      data.push({
+        id,
+        object: 'model3d',
+        owned_by: row.lab,
+        name: row.name,
+        description: row.description,
+        formats: row.formats,
+        max_views: row.input.kind === 'array' ? MAX_3D_VIEWS : Math.min(MAX_3D_VIEWS, (row.input.extra?.length || 0) + 1),
+        blocked_by_zdr: blockedByZdr,
+        // Rounded to cents HERE and nowhere else: `apiBilledCost` returns a raw
+        // product, so an unrounded quote reads as $0.48999999999999994 in a list
+        // a developer is scanning to compare models. The charge itself is not
+        // rounded here — the submit path's `estimated_cost_usd` is the figure
+        // that binds, and this must never be mistaken for it.
+        price_usd: {
+          min: Math.round(billingService.apiBilledCost({ providerCostUsd: range.min }) * 100) / 100,
+          max: Math.round(billingService.apiBilledCost({ providerCostUsd: range.max }) * 100) / 100,
+        },
+        // Snake_case here, camelCase in the request — the /v1 house style for
+        // responses. `axes` keys themselves are NOT rewritten: they are the
+        // names the submit body must use, so translating them would make this
+        // list describe a request nobody can send.
+        axes: axisEntries(row).map(([name, axis]) => ({
+          name,
+          kind: axis.kind,
+          priced: axisIsPriced(id, name, axis),
+          default: axis.default ?? null,
+          values: axis.kind === 'enum' || axis.kind === 'bool' ? Object.keys(axis.values) : null,
+          min: axis.kind === 'int' ? axis.min : null,
+          max: axis.kind === 'int' ? axis.max : null,
+        })),
+        conflicts: (row.conflicts || []).map((c) => ({
+          when_axis: c.when.axis, is: c.when.is, forbids: c.forbids,
+        })),
+      });
+    }
+    return res.json({ object: 'list', data });
+  } catch (err) {
+    logger.error('GET /v1/models3d failed:', err.message);
+    return oaError(res, 500, 'Failed to fetch the 3D model list.', 'MODELS_UNAVAILABLE');
+  }
+}
+
 // POST /v1/models3d — submit an async image-to-mesh job.
-// { image | images[], model, format, generate_type, polygon_type, face_count, pbr, requireZdr }
+// { image | images[], model, format, axes, generate_type, polygon_type, face_count, pbr, requireZdr }
 async function handleModel3dSubmit(req, res) {
   const userId = req.userId;
   const body = req.body || {};
@@ -406,11 +490,18 @@ async function handleModel3dSubmit(req, res) {
     // Snake_case is the /v1 house style; camelCase is accepted alongside it so a
     // caller moving between the agent tool and this endpoint isn't tripped up.
     const normalized = normalize3dOptions(modelId, {
+      // `axes` is the general form — the only way to reach the options on the
+      // rows that price on resolution or a texture ladder rather than on
+      // Hunyuan's four levers. The named fields below stay for callers written
+      // against the single-model API.
+      axes: body.axes && typeof body.axes === 'object' ? body.axes : undefined,
       generateType: body.generate_type ?? body.generateType,
       polygonType: body.polygon_type ?? body.polygonType,
       faceCount: body.face_count ?? body.faceCount,
       format: body.format,
-      pbr: body.pbr === true || body.enable_pbr === true,
+      // Left undefined when unmentioned so the row's own default applies; see
+      // the same note in agentMediaHandler.
+      pbr: body.pbr ?? body.enable_pbr,
       extraViewCount: images.length - 1,
     });
 
@@ -608,6 +699,7 @@ module.exports = {
   handleImageGeneration,
   handleVideoSubmit,
   handleVideoStatus,
+  handleModel3dCatalog,
   handleModel3dSubmit,
   handleModel3dStatus,
   // Exported for test/v1Model3d.test.js — pure input decoding, asserted without
