@@ -20,13 +20,13 @@
  */
 
 import { secureKv } from './internal/secureKv';
-import { brand } from '../config/brand';
+import { accountKey } from './internal/accountScope';
 import authService from './authService';
 import { isMasterKeyLoaded } from './cryptoService';
 import { addMessageToChat } from './graphService';
 import { addLocalMessage } from './localChatService';
 
-const MARKERS_KEY = `${brand.storagePrefix}/pending_replies`;
+const markersKey = () => accountKey('pending_replies');
 // Hard cap on stored markers so a run of failed recoveries can't grow the blob
 // unbounded. Oldest are dropped first.
 const MAX_MARKERS = 50;
@@ -59,7 +59,7 @@ export interface PendingReplyMarker {
 
 async function readMarkers(): Promise<PendingReplyMarker[]> {
   try {
-    const raw = await secureKv.getItem(MARKERS_KEY);
+    const raw = await secureKv.getItem(markersKey());
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
@@ -70,7 +70,7 @@ async function readMarkers(): Promise<PendingReplyMarker[]> {
 
 async function writeMarkers(list: PendingReplyMarker[]): Promise<void> {
   try {
-    await secureKv.setItem(MARKERS_KEY, JSON.stringify(list.slice(-MAX_MARKERS)));
+    await secureKv.setItem(markersKey(), JSON.stringify(list.slice(-MAX_MARKERS)));
   } catch (_) {
     /* non-fatal — losing a marker just means a held reply isn't auto-recovered */
   }

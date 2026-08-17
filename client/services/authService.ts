@@ -23,6 +23,8 @@ import { clearOutboxResults } from './outboxService';
 import { clearAccountModelsCache } from './accountModelsService';
 import { clearTrustedTerminalKeys } from './terminalTrustService';
 import { clearCargoContentCache } from './internal/cargoContentCache';
+import { setAccountScope } from './internal/accountScope';
+import { installLegacyLocalDataAdoption } from './internal/legacyLocalData';
 import { Sentry } from './sentryService';
 import { sessionDeviceMeta } from '../utils/sessionDevice';
 
@@ -113,6 +115,10 @@ class AuthService {
         this.accessToken = storedAccess;
         this.refreshToken = storedRefresh;
         this.user = JSON.parse(storedUser);
+        // Point the on-device stores at this account before anything can read
+        // them — an unscoped read would find nothing, a wrong-scoped one would
+        // find somebody else's rows.
+        setAccountScope(this.user?.id ?? null);
         // Warm start restores the token here (not via storeAuthData); publish
         // if the cached master key is already loaded, else the key-load event will.
         this.trySyncOutboxKey();
@@ -363,6 +369,7 @@ class AuthService {
     this.accessToken = null;
     this.refreshToken = null;
     this.user = null;
+    setAccountScope(null);
 
     return data;
   }
@@ -390,6 +397,10 @@ class AuthService {
     this.accessToken = null;
     this.refreshToken = null;
     this.user = null;
+    // Signed out: the on-device stores address nobody until the next sign-in.
+    // The data stays on disk under the account's namespace — local-backend
+    // content has no server copy, so signing out must not destroy it.
+    setAccountScope(null);
     resetOutboxKeyState();
     // Drop the account model catalog cache so a different account signing in on this
     // device doesn't briefly see the previous account's model list.
@@ -707,6 +718,7 @@ class AuthService {
     this.accessToken = accessToken;
     this.refreshToken = refreshToken;
     if (user) this.user = user;
+    setAccountScope(this.user?.id ?? null);
     this.trySyncOutboxKey();
   }
 
@@ -721,6 +733,7 @@ class AuthService {
       this.accessToken = null;
       this.refreshToken = null;
       this.user = null;
+      setAccountScope(null);
       resetOutboxKeyState();
       void clearOutboxResults();
       void import('./inboxBriefService').then((m) => m.clearInboxBriefs()).catch(() => {});
@@ -735,5 +748,10 @@ class AuthService {
 
 export const authService = new AuthService();
 export default authService;
+
+// Hand any pre-namespace on-device data to the account that can prove it owns
+// it. Runs once both the session and the master key are known — see
+// internal/legacyLocalData.ts.
+installLegacyLocalDataAdoption();
 
 export type { UserData, VaultPayload };

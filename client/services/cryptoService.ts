@@ -253,8 +253,19 @@ export async function clearSessionKeyState(): Promise<void> {
 }
 
 /**
- * Full wipe of all key material and local user data. Called when a different
- * user logs in so they cannot see any trace of the previous user's data.
+ * Wipe the key material and the device-global preferences a session leaves
+ * behind. Called on involuntary sign-out (a 401 the client couldn't recover).
+ *
+ * It used to delete the on-device CONTENT indexes as well — chats, projects,
+ * cargo, memories, personalization. That is no longer this function's job and
+ * must not come back: those stores are namespaced per account now
+ * (`internal/accountScope.ts`), so nothing here leaks to the next account, and
+ * deleting them would mean an expired token silently destroying local-backend
+ * content that has no server copy and no recovery path (CLAUDE.md §5).
+ *
+ * What remains are the keys still shared by every account on this device: the
+ * cached master key, and the model preferences. Balance and entitlement caches
+ * are account-scoped now and need no wipe.
  */
 export async function clearAllKeyMaterial(): Promise<void> {
   _masterKey = null;
@@ -262,12 +273,6 @@ export async function clearAllKeyMaterial(): Promise<void> {
   const p = brand.storagePrefix;
   await settleAll([
     secureKv.removeItem(MASTER_KEY_KEY),
-    secureKv.removeItem(`${p}/local_chats_index`),
-    secureKv.removeItem(`${p}/local_projects_index`),
-    secureKv.removeItem(`${p}/project_files_index`),
-    secureKv.removeItem(`${p}/cargo_index`),
-    secureKv.removeItem(`${p}/memories`),
-    secureKv.removeItem(`${p}/personalization`),
     secureKv.removeItem(`${p}/preferred_model_id`),
     secureKv.removeItem(`${p}/preferred_model_name`),
     secureKv.removeItem(`${p}/recent_model_ids`),
@@ -278,7 +283,6 @@ export async function clearAllKeyMaterial(): Promise<void> {
     secureKv.removeItem(`${p}/image_gen_model_name`),
     secureKv.removeItem(`${p}/video_gen_model_id`),
     secureKv.removeItem(`${p}/video_gen_model_name`),
-    secureKv.removeItem(`${p}/balance_cache`),
   ]);
 }
 
