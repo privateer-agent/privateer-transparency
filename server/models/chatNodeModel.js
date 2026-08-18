@@ -159,7 +159,7 @@ const chatNodeSchema = new mongoose.Schema(
       aspectRatio:       { type: String, default: null },
       style:             { type: String, default: null },
       composition:       { type: String, default: null },
-      mode:              { type: String, enum: ['text', 'imageToVideo', 'startEndFrame'], default: 'text' },
+      mode:              { type: String, enum: ['text', 'imageToVideo', 'startEndFrame', 'reference'], default: 'text' },
       errorMessage:      { type: String, default: null },
       // Soft-delete: video removed from library but attachment preserved in node history
       deleted:           { type: Boolean, default: false },

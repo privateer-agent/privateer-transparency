@@ -1287,7 +1287,10 @@ async function getVideoModelRuntimeCaps(modelId) {
  * Submit a video generation job to OpenRouter.
  *
  * @param {string} prompt
- * @param {object} options  modelId, duration, resolution, aspect_ratio, generate_audio
+ * @param {object} options  modelId, duration, resolution, aspect_ratio, generate_audio,
+ *   plus at most ONE kind of image conditioning: frames (inputImageData /
+ *   startFrameData+endFrameData) or `referenceImages` [{data, mimeType}].
+ *   Frames win if both arrive — see the comment at the build site.
  * @returns {{ jobId: string, pollingUrl: string, status: string }}
  */
 async function submitVideoGeneration(prompt, options = {}) {
@@ -1318,7 +1321,35 @@ async function submitVideoGeneration(prompt, options = {}) {
   pushFrame(options.inputImageData, options.inputImageMimeType, 'first_frame');
   pushFrame(options.startFrameData, options.startFrameMimeType, 'first_frame');
   pushFrame(options.endFrameData,   options.endFrameMimeType,   'last_frame');
-  if (frameImages.length > 0) body.frame_images = frameImages;
+
+  // `input_references` is the OTHER way to hand the model a picture: style and
+  // content guidance rather than an exact frame, which is what "alter this with
+  // an image" wants.
+  //
+  // The two are mutually exclusive AT THE PROVIDER, and silently so: "if both
+  // fields are provided, frame_images takes precedence and the request is
+  // treated as image-to-video". So a body carrying both renders a clip that
+  // ignored every reference the user chose and bills the full price for it.
+  // Frames win here too — they are the stronger, better-supported conditioning
+  // and the caller that sent one meant it — but the references are DROPPED
+  // deliberately and loudly rather than handed over to be discarded upstream.
+  const references = Array.isArray(options.referenceImages) ? options.referenceImages : [];
+  if (references.length > 0 && frameImages.length > 0) {
+    logger.warn(
+      '[submitVideoGeneration] dropping input_references: frame_images take ' +
+      'precedence at the provider, so sending both renders from the frames alone',
+      { modelId, references: references.length, frames: frameImages.length },
+    );
+  }
+
+  if (frameImages.length > 0) {
+    body.frame_images = frameImages;
+  } else if (references.length > 0) {
+    body.input_references = references
+      .filter(r => r?.data && r?.mimeType)
+      .map(r => ({ type: 'image_url', image_url: { url: `data:${r.mimeType};base64,${r.data}` } }));
+    if (body.input_references.length === 0) delete body.input_references;
+  }
 
   // Video is a media action: ZDR key only when the model is ZDR-eligible. The
   // returned usedZdrKey must be persisted so poll/download hit the same account
@@ -1335,11 +1366,15 @@ async function submitVideoGeneration(prompt, options = {}) {
     const errText = await res.text();
     if (process.env.NODE_ENV !== 'production') {
       const safeBody = { ...body };
+      const redactUrls = arr => arr.map(f => ({
+        ...f,
+        image_url: f?.image_url?.url ? { url: `<base64 ${f.image_url.url.length} chars>` } : f?.image_url,
+      }));
       if (Array.isArray(safeBody.frame_images)) {
-        safeBody.frame_images = safeBody.frame_images.map(f => ({
-          ...f,
-          image_url: f?.image_url?.url ? { url: `<base64 ${f.image_url.url.length} chars>` } : f?.image_url,
-        }));
+        safeBody.frame_images = redactUrls(safeBody.frame_images);
+      }
+      if (Array.isArray(safeBody.input_references)) {
+        safeBody.input_references = redactUrls(safeBody.input_references);
       }
       logger.error('[submitVideoGeneration] failed', { status: res.status, body: safeBody, response: errText });
     }
