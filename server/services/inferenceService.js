@@ -44,6 +44,9 @@ const { safeFetch } = require('../utils/safeFetch');
 const { createPersonaGuard } = require('./personaGuard');
 const Sentry = require('@sentry/node');
 const logger = require('../utils/logger');
+// Single definition of what may not reach a user; also wired as an Express
+// response-boundary middleware in server.js. See utils/providerScrub.js.
+const { scrubProviderText } = require('../utils/providerScrub');
 const providerHealth = require('./providerHealthService');
 
 // ── Output formatting directive ──────────────────────────────────────────────
@@ -200,7 +203,7 @@ function orHeaders(useZdrKey = false) {
   const key = useZdrKey ? process.env.OPENROUTER_API_KEY_ZDR : process.env.OPENROUTER_API_KEY;
   if (useZdrKey && !key) {
     throw Object.assign(
-      new Error('Zero Data Retention is required for this request, but no ZDR OpenRouter key is configured.'),
+      new Error('Zero Data Retention is required for this request, but no ZDR inference key is configured.'),
       { statusCode: 503, code: 'ZDR_KEY_UNAVAILABLE' }
     );
   }
@@ -666,7 +669,7 @@ async function openRouterChat(messages, modelId, options = {}) {
       // AbortError from our own timer → treat as an unavailable provider so the
       // media paths surface a friendly, retryable error (mirrors 5xx/404 below).
       if (fetchErr?.name === 'AbortError') {
-        const err = new Error(`OpenRouter request timed out after ${timeoutMs}ms for ${modelId}`);
+        const err = new Error(`Upstream request timed out after ${timeoutMs}ms for ${modelId}`);
         err.code = 'PROVIDER_UNAVAILABLE';
         err.modelId = modelId;
         err.timedOut = true;
@@ -709,7 +712,7 @@ async function openRouterChat(messages, modelId, options = {}) {
     providerHealth.recordFailure(useZdrKey ? 'openrouter_zdr' : 'openrouter', {
       status: res.status, message: errText, kind: options.modalities ? 'imageGen' : 'inference'
     });
-    const err = new Error(`OpenRouter error ${res.status}: ${errText}`);
+    const err = new Error(`Upstream inference error ${res.status}: ${errText}`);
     if (res.status === 429) err.statusCode = 429;
     if (res.status === 404 || res.status === 503 || res.status >= 500) {
       err.code = 'PROVIDER_UNAVAILABLE';
@@ -757,7 +760,7 @@ async function resolveModelId(requestedModelId) {
 
   if (typeof modelId !== 'string' || !modelId.includes('/')) {
     throw Object.assign(
-      new Error(`Model '${modelId}' is not an OpenRouter model. Use the slash-prefixed form (e.g. "google/${modelId}").`),
+      new Error(`Model '${modelId}' is not a routed model id. Use the slash-prefixed form (e.g. "google/${modelId}").`),
       { statusCode: 400, code: 'INVALID_MODEL', modelId }
     );
   }
@@ -1378,7 +1381,7 @@ async function submitVideoGeneration(prompt, options = {}) {
       }
       logger.error('[submitVideoGeneration] failed', { status: res.status, body: safeBody, response: errText });
     }
-    throw new Error(`OpenRouter video generation error ${res.status}: ${errText}`);
+    throw new Error(`Upstream video generation error ${res.status}: ${errText}`);
   }
 
   const data = await res.json();
@@ -1454,7 +1457,7 @@ async function fetchVideoWithEitherKey(run, useZdrKey, label) {
   if (res) return res;
   if (altRes) return altRes;
   throw Object.assign(
-    new Error('Zero Data Retention is required for this request, but no ZDR OpenRouter key is configured.'),
+    new Error('Zero Data Retention is required for this request, but no ZDR inference key is configured.'),
     { statusCode: 503, code: 'ZDR_KEY_UNAVAILABLE' }
   );
 }
@@ -1475,7 +1478,7 @@ async function downloadVideoBuffer(url, { useZdrKey = false } = {}) {
   );
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
-    throw new Error(`OpenRouter video download error ${res.status}: ${errText}`);
+    throw new Error(`Upstream video download error ${res.status}: ${errText}`);
   }
   const arrayBuffer = await res.arrayBuffer();
   return {
@@ -1499,7 +1502,7 @@ async function pollVideoGeneration(jobId, { useZdrKey = false } = {}) {
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`OpenRouter video poll error ${res.status}: ${errText}`);
+    throw new Error(`Upstream video poll error ${res.status}: ${errText}`);
   }
 
   return res.json();
@@ -1841,7 +1844,7 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
       // callers (guest fallback chain, chatController) classify retryability
       // from `statusCode` and shouldn't have to regex the message.
       throw Object.assign(
-        new Error(`OpenRouter stream error ${res.status}: ${errText}`),
+        new Error(`Upstream stream error ${res.status}: ${errText}`),
         { statusCode: res.status },
       );
     }
@@ -2088,17 +2091,18 @@ async function proxyChatCompletion(openaiBody, { requireZdr = true } = {}) {
   return { response, modelId: effectiveModelId };
 }
 
+
 /**
  * Convert an OpenRouter image-gen failure into a user-facing assistant message.
- * Errors arrive as `Error("OpenRouter error 400: {<json>}")`; we lift the
+ * Errors arrive as `Error("Upstream inference error 400: {<json>}")`; we lift the
  * provider's `error.message`, strip the version-stamped model id back to its
  * canonical slug, and prefix a friendly lead-in. Falls back to a generic line
  * when the payload isn't recognisable.
  */
 function formatImageGenErrorForUser(err, { modelId } = {}) {
   const raw = err?.message || '';
-  // Strip "OpenRouter error <code>: " prefix and try to JSON-parse the rest.
-  const m = raw.match(/^OpenRouter error \d+:\s*(\{[\s\S]*\})\s*$/);
+  // Strip the "Upstream inference error <code>: " prefix and JSON-parse the rest.
+  const m = raw.match(/^Upstream inference error \d+:\s*(\{[\s\S]*\})\s*$/);
   let providerMsg = null;
   if (m) {
     try {
@@ -2106,15 +2110,25 @@ function formatImageGenErrorForUser(err, { modelId } = {}) {
       providerMsg = parsed?.error?.message || null;
     } catch { /* keep providerMsg null */ }
   }
+  // `raw` is the internal envelope ("Upstream inference error 400: …") — it can
+  // routing layer, so it must never be interpolated into user-facing copy.
   if (!providerMsg) {
+    if (raw) logger.error('[generateImage] unmapped failure', { modelId, raw });
     return modelId
-      ? `I couldn't generate that image with **${modelId}**. ${raw || 'Please try again or pick a different image model.'}`
-      : `I couldn't generate that image. ${raw || 'Please try again.'}`;
+      ? `I couldn't generate that image with **${modelId}**. Please try again or pick a different image model.`
+      : `I couldn't generate that image. Please try again.`;
   }
   // Canonicalise version-stamped model ids, e.g.
   // `google/gemini-3-pro-image-preview-20251120` → `google/gemini-3-pro-image-preview`.
   const cleaned = providerMsg.replace(/([a-z0-9-]+\/[a-z0-9.-]+?)-\d{8}\b/gi, '$1');
-  return `I couldn't generate that image: ${cleaned}`;
+  const safe = scrubProviderText(cleaned);
+  if (!safe) {
+    logger.error('[generateImage] provider message withheld from user', { modelId, providerMsg });
+    return modelId
+      ? `I couldn't generate that image with **${modelId}**. Please try again or pick a different image model.`
+      : `I couldn't generate that image. Please try again.`;
+  }
+  return `I couldn't generate that image: ${safe}`;
 }
 
 /**
@@ -2123,7 +2137,7 @@ function formatImageGenErrorForUser(err, { modelId } = {}) {
  */
 function formatVideoGenErrorForUser(err, { modelId } = {}) {
   const raw = err?.message || '';
-  const m = raw.match(/^OpenRouter video generation error (\d{3}):\s*([\s\S]*)$/);
+  const m = raw.match(/^Upstream video generation error (\d{3}):\s*([\s\S]*)$/);
   const status = m ? parseInt(m[1], 10) : null;
   const bodyText = m ? m[2] : raw;
 
@@ -2137,8 +2151,16 @@ function formatVideoGenErrorForUser(err, { modelId } = {}) {
 
   const modelLabel = modelId ? `**${modelId}**` : 'that video';
 
+  // No eligible endpoint: every provider that serves this model is excluded by
+  // the media account's data-policy allowlist. That is an operator problem with
+  // an operator fix, so the detail goes to the log, NOT to the user — the old
+  // copy here named the routing layer and linked its console.
   if (providerMsg && /no endpoints available/i.test(providerMsg)) {
-    return `I couldn't generate ${modelLabel}. No provider for this model is currently enabled on the server's OpenRouter account — its privacy / data-policy settings are blocking every available endpoint. An admin needs to allow the relevant provider (e.g. Google Vertex for Veo) at https://openrouter.ai/settings/privacy.`;
+    logger.error(
+      '[submitVideoGeneration] no eligible endpoint — the media account\'s provider data-policy allowlist excludes every provider serving this model',
+      { modelId, providerMsg },
+    );
+    return `I couldn't generate ${modelLabel} — that video model isn't available right now. Please pick a different video model.`;
   }
 
   if (status === 401 || status === 403) {
@@ -2154,8 +2176,11 @@ function formatVideoGenErrorForUser(err, { modelId } = {}) {
     return `I couldn't generate ${modelLabel}: the video provider is having trouble (HTTP ${status}). Please try again shortly.`;
   }
 
-  if (providerMsg) return `I couldn't generate ${modelLabel}: ${providerMsg}`;
-  return `I couldn't generate ${modelLabel}. ${raw || 'Please try again or pick a different video model.'}`;
+  const safe = scrubProviderText(providerMsg);
+  if (safe) return `I couldn't generate ${modelLabel}: ${safe}`;
+  // As above: `raw` carries the internal envelope, so it is logged, never shown.
+  if (raw) logger.error('[submitVideoGeneration] unmapped failure', { modelId, raw });
+  return `I couldn't generate ${modelLabel}. Please try again or pick a different video model.`;
 }
 
 // ── Memory helpers ───────────────────────────────────────────────────────────

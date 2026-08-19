@@ -182,7 +182,7 @@ async function tinfoilChatRequest(body, modelId, { signal } = {}) {
     if (res.status === 404 || res.status === 503 || res.status >= 500) {
       throw asProviderError(`The selected model (${modelId}) is currently unavailable. Please choose a different model in Settings.`, modelId, { statusCode: res.status });
     }
-    const err = new Error(`Tinfoil error ${res.status}: ${errText}`);
+    const err = new Error(`Upstream inference error ${res.status}: ${errText}`);
     if (res.status === 429) err.statusCode = 429;
     throw err;
   }
@@ -396,7 +396,7 @@ async function tinfoilMediaRequest(path, init, modelId) {
     if (res.status === 404 || res.status === 503 || res.status >= 500) {
       throw asProviderError(`The selected model (${modelId}) is currently unavailable. Please choose a different model in Settings.`, modelId, { statusCode: res.status });
     }
-    const err = new Error(`Tinfoil error ${res.status}: ${errText}`);
+    const err = new Error(`Upstream inference error ${res.status}: ${errText}`);
     if (res.status === 429) err.statusCode = 429;
     throw err;
   }
