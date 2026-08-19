@@ -361,9 +361,14 @@ const musicBalanceGate = (req, res, next) => {
 
 router.post('/music', authenticate, requireDailyCap('musicGen'), musicBalanceGate, async (req, res) => {
   try {
-    const { prompt, musicModelId, duration } = req.body || {};
+    const { prompt, musicModelId, duration, lyrics, instrumental } = req.body || {};
     const { buffer, mimeType, model, durationSeconds } = await audioService.generateMusic({
-      userId: req.user._id, prompt, modelId: musicModelId, duration,
+      userId: req.user._id, prompt, modelId: musicModelId, duration, lyrics,
+      // Vocal intent is the composer's switch, not something to read out of the
+      // prompt. Defaulted to instrumental when absent rather than to falsy: on
+      // MiniMax 'sing' with no lyrics and no optimizer is an unconditional 422,
+      // so an older client that sends neither field must still get a track.
+      instrumental: instrumental !== false,
     });
     // `durationSeconds` is present only for the models that take a length —
     // a Lyria SKU *is* its length, so there is nothing to report back.

@@ -267,8 +267,8 @@ function pcmToWav(pcm, sampleRate, channels, bitsPerSample) {
  * almost always the safety checker declining a prompt, and each surface has copy
  * for it; a shared code would make all three say "the network failed".
  */
-async function runFalAudio(modelId, { prompt, voice, seconds, promptMax, timeoutMs, emptyCode }) {
-  const input = buildFalInput(modelId, { prompt, voice, seconds, promptMax });
+async function runFalAudio(modelId, { prompt, voice, seconds, lyrics, instrumental, promptMax, timeoutMs, emptyCode }) {
+  const input = buildFalInput(modelId, { prompt, voice, seconds, lyrics, instrumental, promptMax });
   const result = await falService.run(modelId, input, { timeoutMs });
   const url = falOutputUrl(modelId, result);
   if (!url) {
@@ -610,7 +610,7 @@ function musicChargeEstimateUsd(modelId, duration) {
  * Generate music from a text prompt → { buffer, mimeType, model, costUsd }.
  * Bills 'musicGen'. Throws {statusCode,code} on bad input / provider failure.
  */
-async function generateMusic({ userId, prompt, modelId, duration, billingMarkup, origin = 'app' }) {
+async function generateMusic({ userId, prompt, modelId, duration, lyrics, instrumental = true, billingMarkup, origin = 'app' }) {
   if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
     throw Object.assign(new Error('prompt is required'), { statusCode: 400, code: 'PROMPT_REQUIRED' });
   }
@@ -624,7 +624,7 @@ async function generateMusic({ userId, prompt, modelId, duration, billingMarkup,
   if (isFalAudioModel(model)) {
     const seconds = falClampDuration(model, duration);
     const { buffer, mimeType } = await runFalAudio(model, {
-      prompt, seconds, promptMax: MUSIC_PROMPT_MAX,
+      prompt, seconds, lyrics, instrumental, promptMax: MUSIC_PROMPT_MAX,
       timeoutMs: MUSIC_TIMEOUT_MS, emptyCode: 'MUSIC_EMPTY',
     });
     const costUsd = falAudioCostUsd(model, { seconds: seconds ?? 0 });
@@ -746,30 +746,57 @@ async function readMusicStream(response) {
   const decoder = new TextDecoder();
   const audioParts = [];
   let costUsd = null;
-  let buf = '';
+  // Decoded chunks that do not yet complete a line. Held as an ARRAY and joined
+  // only when a newline actually arrives, because the audio is delivered as ONE
+  // `data:` line several megabytes long: a full song is ~4.8MB of base64 spread
+  // over ~400 network chunks with no newline among them. Appending each chunk to
+  // a growing string re-copies the whole accumulated line every time, which is
+  // quadratic in the payload — measured at ~0.8-3.5s of FULLY BLOCKED event loop
+  // for one Lyria 3 Pro clip on a fast laptop, and several times that on the
+  // production instance's half core. Nothing else on the server runs during it.
+  // Joining once instead keeps it flat (~20ms) regardless of how the stream is
+  // chunked. Do not "simplify" this back to `buf += chunk`.
+  let pending = [];
+
+  /** Handle one complete line. Returns true when the stream is done. */
+  const takeLine = (raw) => {
+    const line = raw.trim();
+    // Skips blank lines, `event:` lines and OpenRouter's `: PROCESSING`
+    // keepalive comments in one condition.
+    if (!line.startsWith('data:')) return false;
+    const payload = line.slice(5).trim();
+    if (payload === '[DONE]') return true;
+    let chunk;
+    try { chunk = JSON.parse(payload); } catch { return false; }
+    const data = chunk?.choices?.[0]?.delta?.audio?.data;
+    if (typeof data === 'string' && data) audioParts.push(data);
+    const cost = Number(chunk?.usage?.cost);
+    if (Number.isFinite(cost) && cost > 0) costUsd = cost;
+    return false;
+  };
 
   for (;;) {
     const { value, done } = await reader.read();
     if (done) break;
-    buf += decoder.decode(value, { stream: true });
+    const text = decoder.decode(value, { stream: true });
+    // The common case for this endpoint: mid-way through the one huge audio
+    // line, so there is nothing to parse and nothing to copy.
+    if (text.indexOf('\n') === -1) { pending.push(text); continue; }
 
+    let buf = pending.length ? pending.join('') + text : text;
+    pending = [];
     let nl;
     while ((nl = buf.indexOf('\n')) !== -1) {
-      const line = buf.slice(0, nl).trim();
+      const line = buf.slice(0, nl);
       buf = buf.slice(nl + 1);
-      // Skips blank lines, `event:` lines and OpenRouter's `: PROCESSING`
-      // keepalive comments in one condition.
-      if (!line.startsWith('data:')) continue;
-      const payload = line.slice(5).trim();
-      if (payload === '[DONE]') return { audioParts, costUsd };
-      let chunk;
-      try { chunk = JSON.parse(payload); } catch { continue; }
-      const data = chunk?.choices?.[0]?.delta?.audio?.data;
-      if (typeof data === 'string' && data) audioParts.push(data);
-      const cost = Number(chunk?.usage?.cost);
-      if (Number.isFinite(cost) && cost > 0) costUsd = cost;
+      if (takeLine(line)) return { audioParts, costUsd };
     }
+    if (buf) pending.push(buf);
   }
+
+  // A final line the stream never terminated with a newline. SSE normally does,
+  // and `[DONE]` returns above, so this is a guard rather than the usual path.
+  if (pending.length) takeLine(pending.join(''));
   return { audioParts, costUsd };
 }
 
