@@ -378,6 +378,19 @@ router.post('/music', authenticate, requireDailyCap('musicGen'), musicBalanceGat
     if (err?.code === 'MUSIC_MODEL_UNSUPPORTED') return res.status(400).json({ message: req.t('errors.musicModelUnsupported'), code: 'MUSIC_MODEL_UNSUPPORTED' });
     if (err?.code === 'MUSIC_TIMEOUT') return res.status(504).json({ message: req.t('errors.musicTimeout'), code: 'MUSIC_TIMEOUT' });
     if (err?.code === 'MUSIC_EMPTY') return res.status(502).json({ message: req.t('errors.musicEmpty'), code: 'MUSIC_EMPTY' });
+    // Vocals asked for on a model that can only sing words it was handed
+    // (MiniMax Music 3 / 2.0 / 1.5, DiffRhythm, ACE-Step — none has the
+    // lyrics_optimizer that 2.5 and 2.6 have). Refused before the call, so
+    // nothing has been billed.
+    if (err?.code === 'LYRICS_REQUIRED') return res.status(400).json({ message: req.t('errors.musicLyricsRequired'), code: 'LYRICS_REQUIRED' });
+    // MiniMax 2.0/1.5 alone impose a floor on the lyric field. Same idea: caught
+    // before the call, so nothing has been billed.
+    if (err?.code === 'LYRICS_TOO_SHORT') {
+      return res.status(400).json({
+        message: req.t('errors.musicLyricsTooShort', { n: err.lyricsMin }),
+        code: 'LYRICS_TOO_SHORT',
+      });
+    }
     if (err?.code === 'MUSIC_FAILED') return res.status(502).json({ message: req.t('errors.musicFailed'), code: 'MUSIC_FAILED' });
     if (err?.code === 'INSUFFICIENT_FUNDS') return res.status(402).json({ message: req.t('errors.insufficientBalance'), code: 'INSUFFICIENT_FUNDS' });
     // The music catalog spans two providers now, so a fal outage has to speak
