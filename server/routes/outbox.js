@@ -64,6 +64,7 @@ const OutboxBlob = require('../models/outboxBlobModel');
 const { authenticate } = require('../middleware/auth');
 const { outboxPostLimiter, outboxBlobLimiter } = require('../middleware/rateLimiter');
 const { checkBlobAccepted, BLOB_TTL_MS } = require('../services/outboxBlobLimits');
+const analyticsService = require('../services/analyticsService');
 
 // A sealed item is epk(32)+iv(12)+tag(16) overhead over a summary capped at
 // ~64KiB plaintext. Cap the base64 payload generously above that; the mailbox
@@ -186,6 +187,11 @@ router.post('/', authenticate, outboxPostLimiter, async (req, res) => {
       size: buf.length,
       expiresAt: new Date(Date.now() + TTL_MS),
     });
+
+    // Envelope-level only: an unattended run produced a result. The server
+    // holds ciphertext, so there is no status to report and no dimension to add
+    // — the count is the whole of what we can honestly know.
+    analyticsService.track('outbox_result');
 
     res.status(201).json({ id: item._id, createdAt: item.createdAt });
   } catch (error) {

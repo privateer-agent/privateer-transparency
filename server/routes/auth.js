@@ -54,7 +54,7 @@ const MAX_CHILD_SESSIONS_PER_FAMILY = Number(process.env.MAX_CHILD_SESSIONS_PER_
 // Must sit comfortably above the relay's 60s presence TTL + 3s auto-reconnect so
 // a transient disconnect (lid close, wifi blip) is never mistaken for a close.
 const TERMINAL_PRUNE_GRACE_MS = Number(process.env.TERMINAL_PRUNE_GRACE_MS) || 3 * 60 * 1000;
-const { validateEmail, validatePassword } = require('../services/validation');
+const { validateEmail, passwordProblem } = require('../services/validation');
 const Sentry = require('@sentry/node');
 
 // ---------------------------------------------------------------------------
@@ -229,8 +229,12 @@ router.post('/register', registerRateLimiter, async (req, res) => {
       return res.status(400).json({ message: req.t('errors.invalidEmail') });
     }
 
-    if (!validatePassword(password)) {
-      return res.status(400).json({ message: req.t('errors.passwordTooShort') });
+    // Report the reason that actually failed. Answering a whitespace-only or
+    // trivially-guessable password with "too short" is what sent QA looking for
+    // a length bug that wasn't there (#9/#10/#18).
+    const registerPasswordProblem = passwordProblem(password);
+    if (registerPasswordProblem) {
+      return res.status(400).json({ message: req.t(registerPasswordProblem), code: 'PASSWORD_REJECTED' });
     }
 
     if (!validateBase64(wrappedMasterKey)) {
@@ -845,8 +849,9 @@ router.post('/change-password', authenticate, async (req, res) => {
     if (!currentPassword || !newPassword) {
       return res.status(400).json({ message: 'currentPassword and newPassword are required' });
     }
-    if (!validatePassword(newPassword)) {
-      return res.status(400).json({ message: 'New password must be at least 8 characters' });
+    const newPasswordProblem = passwordProblem(newPassword);
+    if (newPasswordProblem) {
+      return res.status(400).json({ message: req.t(newPasswordProblem), code: 'PASSWORD_REJECTED' });
     }
     if (!validateBase64(wrappedMasterKey)) {
       return res.status(400).json({ message: 'wrappedMasterKey is required (base64)' });

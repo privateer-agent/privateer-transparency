@@ -23,6 +23,7 @@
 const User = require('../models/userModel');
 const ApiKey = require('../models/apiKeyModel');
 const logger = require('../utils/logger');
+const analyticsService = require('../services/analyticsService');
 
 // OpenAI-shaped auth failure so the standard OpenAI SDKs surface a clean error.
 function unauthorized(res, message) {
@@ -73,7 +74,13 @@ async function authenticateApiKey(req, res, next) {
     req.apiKeyId = keyDoc._id;
 
     // Best-effort "last used" stamp — never block or fail the request on it.
-    ApiKey.updateOne({ _id: keyDoc._id }, { lastUsedAt: new Date() }).catch(() => {});
+    // findOneAndUpdate rather than updateOne so the pre-image comes back in the
+    // same round trip: a null → set transition is the first request this key
+    // has ever served, which is the developer-activation signal (keys created
+    // and actually used, as opposed to keys created).
+    ApiKey.findOneAndUpdate({ _id: keyDoc._id }, { lastUsedAt: new Date() }, { new: false })
+      .then((prev) => { if (prev && !prev.lastUsedAt) analyticsService.track('first_api_key_used'); })
+      .catch(() => {});
 
     next();
   } catch (err) {

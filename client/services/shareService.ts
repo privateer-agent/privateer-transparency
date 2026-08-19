@@ -18,6 +18,7 @@ import * as graphService from './graphService';
 import { getLocalChat } from './localChatService';
 import { resolveChatBackend } from './chatService';
 import { readLocal } from './localStorageService';
+import { isDesktop } from './desktopTransport';
 import { getCargoContent } from './cargoService';
 import type { CargoKind } from '../utils/cargoKinds';
 import {
@@ -35,6 +36,40 @@ import {
 
 const req = (endpoint: string, options: RequestInit = {}): Promise<Response> =>
   authService.makeAuthenticatedRequest(endpoint, options);
+
+/**
+ * Why a share failed, in terms the sheet can localize.
+ *
+ * The messages here are English fallbacks for a caller that has no catalog —
+ * the UI branches on `code`, never on the text (CLAUDE.md §7). Anything that
+ * escapes uncaught used to reach the user verbatim, which is how QA saw the
+ * raw `fetch` TypeError "Failed to fetch" as the whole explanation.
+ */
+export type ShareErrorCode = 'locked' | 'stale' | 'network' | 'upload' | 'server' | 'unknown';
+
+export class ShareError extends Error {
+  code: ShareErrorCode;
+  constructor(code: ShareErrorCode, message: string) {
+    super(message);
+    this.name = 'ShareError';
+    this.code = code;
+  }
+}
+
+/**
+ * A failed `fetch` rejects with a bare TypeError ("Failed to fetch" / "Network
+ * request failed") that names neither the request nor anything the user can act
+ * on. Every leg of a share that leaves the device runs through here so the
+ * failure arrives as one of our codes instead.
+ */
+async function netStep<T>(code: Extract<ShareErrorCode, 'network' | 'upload'>, fallback: string, run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (e: any) {
+    if (e instanceof ShareError) throw e;
+    throw new ShareError(code, e?.message ? `${fallback} (${e.message})` : fallback);
+  }
+}
 
 export type ShareSourceType = 'chat' | 'graph' | 'cargo' | 'audio';
 export type ShareSourceBackend = 'cloud' | 'local';
@@ -134,10 +169,20 @@ interface FileRef {
 // Public API
 // ---------------------------------------------------------------------------
 
-/** The base origin public share links point at (production web app). */
+/**
+ * The base origin public share links point at (production web app).
+ *
+ * On web this is the origin actually serving the app, so a dev/preview build
+ * links to itself. The desktop shell is the exception it must NOT follow: its
+ * renderer is served from a loopback static server on an ephemeral port, so
+ * `window.location.origin` is `http://127.0.0.1:58206` — a link only that one
+ * machine could open, and only until the app restarts. QA shipped exactly that
+ * link to a recipient (#17). The test is the preload bridge rather than the
+ * loopback shape of the URL, so a browser on `localhost:8081` keeps linking to
+ * itself the way a dev expects.
+ */
 function shareBaseUrl(): string {
-  if (typeof window !== 'undefined' && window.location?.origin) {
-    // On web, link to the origin actually serving the app (works in dev too).
+  if (typeof window !== 'undefined' && window.location?.origin && !isDesktop()) {
     return window.location.origin;
   }
   return `https://${brand.domain}`;
@@ -174,10 +219,10 @@ function sourceLookupPath(sourceId: string): string {
  */
 export async function createOrUpdateShare(source: ShareSource): Promise<string> {
   if (!isMasterKeyLoaded()) {
-    throw new Error('Unlock your account before sharing.');
+    throw new ShareError('locked', 'Unlock your account before sharing.');
   }
   const masterKey = getMasterKey();
-  if (!masterKey) throw new Error('Master key not available.');
+  if (!masterKey) throw new ShareError('locked', 'Master key not available.');
 
   const shareKey = await resolveShareKey(source, masterKey);
 
@@ -203,16 +248,17 @@ export async function createOrUpdateShare(source: ShareSource): Promise<string> 
             : await buildChatSnapshot(source.id, shareKey);
 
   // 1) Reserve a token + presigned upload slots for the media.
-  const presign = await postJson('/api/share/assets/presign', {
-    sourceType: source.type,
-    sourceId: source.id,
-    sourceBackend: backend,
-    count: built.assets.length,
-  });
+  const presign = await netStep('network', 'Could not reach the server to start the share.', () =>
+    postJson('/api/share/assets/presign', {
+      sourceType: source.type,
+      sourceId: source.id,
+      sourceBackend: backend,
+      count: built.assets.length,
+    }));
   const token: string = presign.token;
   const slots: PresignSlot[] = presign.uploads || [];
   if (slots.length < built.assets.length) {
-    throw new Error('Could not reserve upload slots for share media.');
+    throw new ShareError('upload', 'Could not reserve upload slots for share media.');
   }
 
   // 2) Upload each re-encrypted binary directly to S3, recording its key + IV.
@@ -220,19 +266,20 @@ export async function createOrUpdateShare(source: ShareSource): Promise<string> 
     const asset = built.assets[i];
     const slot = slots[i];
     const ct = await reencryptBinary(asset, shareKey);
-    const put = await fetch(slot.uploadUrl, {
-      method: 'PUT',
-      headers: { 'Content-Type': slot.contentType },
-      body: ct.bytes as any,
-    });
-    if (!put.ok) throw new Error('Failed to upload share media.');
+    const put = await netStep('upload', 'Could not upload the media for this link.', () =>
+      fetch(slot.uploadUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': slot.contentType },
+        body: ct.bytes as any,
+      }));
+    if (!put.ok) throw new ShareError('upload', `Could not upload the media for this link (${put.status}).`);
     asset.s3Key = slot.s3Key;
     asset.newIv = ct.iv;
   }
 
   // 3) Finalize: write the ciphertext snapshot with resolved asset refs.
   const wrappedShareKey = wrapMasterKey(shareKey, masterKey);
-  await postJson('/api/share', {
+  await netStep('network', 'Could not reach the server to finish the share.', () => postJson('/api/share', {
     token,
     sourceType: source.type,
     sourceId: source.id,
@@ -249,7 +296,7 @@ export async function createOrUpdateShare(source: ShareSource): Promise<string> 
     audio: built.audio
       ? { encryptedMeta: built.audio.encryptedMeta, asset: { s3Key: built.audio.asset.s3Key, encIv: built.audio.asset.encIv } }
       : null,
-  });
+  }));
 
   return buildShareUrl(token, shareKey);
 }
@@ -635,7 +682,7 @@ function buildAudioSnapshot(
     // Signed URLs expire, so a stale row can reach here with nothing to fetch.
     // A cloud clip with no IV is a legacy unencrypted object — the other
     // builders skip those; a one-clip share has nothing left to make.
-    throw new Error('Reopen this clip and try sharing again.');
+    throw new ShareError('stale', 'Reopen this clip and try sharing again.');
   }
 
   const asset: PendingAsset = backend === 'local'
@@ -675,8 +722,8 @@ async function reencryptBinary(asset: PendingAsset, shareKey: Uint8Array): Promi
     const { buffer } = await readLocal(asset.localFileId);
     plain = new Uint8Array(buffer);
   } else {
-    const response = await fetch(asset.signedUrl!);
-    if (!response.ok) throw new Error('Failed to fetch media for re-encryption.');
+    const response = await netStep('upload', 'Could not read this media to re-encrypt it.', () => fetch(asset.signedUrl!));
+    if (!response.ok) throw new ShareError('upload', `Could not read this media to re-encrypt it (${response.status}).`);
     const arrBuf = await response.arrayBuffer();
     plain = await decryptBinaryRaw(asset.encIv!, new Uint8Array(arrBuf));
   }
@@ -684,11 +731,18 @@ async function reencryptBinary(asset: PendingAsset, shareKey: Uint8Array): Promi
   return { iv, bytes: ct };
 }
 
+/**
+ * The server ANSWERED and refused — a different thing from not reaching it, and
+ * the reason it carries its own code. `netStep` passes a ShareError through
+ * untouched, so wrapping a call in it can't relabel "Chat not found" as a
+ * network failure; and the server's message is already localized (CLAUDE.md
+ * §7), so the sheet shows it rather than a generic replacement.
+ */
 async function postJson(endpoint: string, body: any): Promise<any> {
   const response = await req(endpoint, { method: 'POST', body: JSON.stringify(body) });
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
-    throw new Error(err?.message || `Share request failed (${response.status}).`);
+    throw new ShareError('server', err?.message || `Share request failed (${response.status}).`);
   }
   return response.json();
 }

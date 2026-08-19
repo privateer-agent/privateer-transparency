@@ -263,6 +263,14 @@ class AuthService {
     return data;
   }
 
+  /**
+   * Ask for another verification email.
+   *
+   * The server caps this (3 per IP+email per hour) and answers a refusal with
+   * `code: 'RATE_LIMITED'` and `retryAfter` in seconds. Both are carried onto
+   * the thrown error so the screen can hold its button for exactly that long —
+   * branching on the code, never on the localized message text (CLAUDE.md §7).
+   */
   async resendVerification(email: string): Promise<{ message: string }> {
     const response = await fetch(`${API_BASE_URL}/auth/resend-verification`, {
       method: 'POST',
@@ -271,7 +279,12 @@ class AuthService {
     });
 
     const data = await response.json();
-    if (!response.ok) throw new Error(data.message || 'Failed to resend verification');
+    if (!response.ok) {
+      const err: any = new Error(data.message || 'Failed to resend verification');
+      if (data.code) err.code = data.code;
+      if (typeof data.retryAfter === 'number') err.retryAfter = data.retryAfter;
+      throw err;
+    }
     return data;
   }
 

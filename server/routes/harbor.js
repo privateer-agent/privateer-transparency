@@ -27,6 +27,7 @@ const { authenticate } = require('../middleware/auth');
 const { requireFeature, requireCreate } = require('../middleware/entitlement');
 const harbor = require('../services/harborProvisionService');
 const HostedAgent = require('../models/hostedAgentModel');
+const analyticsService = require('../services/analyticsService');
 
 // Harbor — hosted-agent control plane (Navigator+ feature). Gates:
 //   requireFeature('hostedAgent')  → min tier standard (Navigator)
@@ -58,6 +59,7 @@ router.post('/', authenticate, requireFeature('hostedAgent'), requireCreate('hos
       accountSignPub: typeof accountSignPub === 'string' ? accountSignPub.slice(0, 128) : null,
       label: typeof label === 'string' ? label.slice(0, 80) : null,
     });
+    analyticsService.track('harbor_provisioned');
     res.status(201).json({ success: true, agent });
   } catch (err) { fail(res, err, 'enable'); }
 });

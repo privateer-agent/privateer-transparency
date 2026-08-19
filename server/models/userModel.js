@@ -352,6 +352,7 @@ const userSchema = new mongoose.Schema(
     lastActiveAt: { type: Date, default: null },
     d1ReturnCounted: { type: Boolean, default: false },
     d7ReturnCounted: { type: Boolean, default: false },
+    d30ReturnCounted: { type: Boolean, default: false },
     // Current-ISO-week message counter, hard-capped at the activation
     // threshold (3) so per-user volume beyond it is never stored.
     weeklyMsg: {
