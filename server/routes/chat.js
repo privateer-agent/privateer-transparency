@@ -73,10 +73,10 @@ router.use((req, res, next) => { req.userId = req.user._id; next(); });
 // Send message — minimum $0.05 balance required so a near-empty wallet can't
 // kick off a large completion. Actual cost is deducted post-call (still cheap
 // per request; the floor caps worst-case leak per attempt).
-router.post('/message', limitTextInput, requireDailyCap('message'), checkCreditBalance(0.05), requireConcurrencySlot(), sendMessage);
+router.post('/message', limitTextInput, requireDailyCap('message'), checkCreditBalance(0.05, { promoOrigin: 'app' }), requireConcurrencySlot(), sendMessage);
 
 // Stream message — same gating as /message; delivers tokens via SSE.
-router.post('/stream', limitTextInput, requireDailyCap('message'), checkCreditBalance(0.05), requireConcurrencySlot(), streamMessage);
+router.post('/stream', limitTextInput, requireDailyCap('message'), checkCreditBalance(0.05, { promoOrigin: 'app' }), requireConcurrencySlot(), streamMessage);
 
 // Deep Research — detached background job. `start` validates + kicks off a run
 // and returns a jobId immediately; progress is consumed over the reconnectable
