@@ -15,6 +15,13 @@ export {
 } from './walletAuthShared';
 export type { WalletUser, WalletAuthResult } from './walletAuthShared';
 
+/**
+ * Nothing to cancel: no wallet sign-in can start on iOS at all
+ * (config/billingMode.ts → walletAuthEnabled is hard-false there). Present so
+ * the shared sign-in UI has one name to call on every platform.
+ */
+export function cancelWalletSignIn(): void {}
+
 export async function solanaLogin(_opts?: { recover?: boolean }): Promise<never> {
   throw new Error('Solana wallet login is not supported on iOS.');
 }

@@ -50,6 +50,10 @@ const {
 const {
   ttsFloorUsd, sttFloorUsd, TTS_USD_PER_CHAR, STT_USD_PER_MINUTE,
 } = require('../data/openrouterAudioModels');
+// An exact read of what a provider actually rendered — not to be confused with
+// estimateAudioSeconds below, which is a deliberate lower bound for audio we
+// only have a byte count for. See utils/audioDuration.js.
+const { audioDurationSeconds } = require('../utils/audioDuration');
 const { tinfoilVoicesFor } = require('../data/tinfoilModels');
 const UserStoragePrefs = require('../models/userStoragePrefsModel');
 
@@ -99,6 +103,10 @@ const TTS_INPUT_MAX = 8000;
 // synthesize a paragraph in a few seconds. Shorter than the SFX bound because
 // speech is usually in front of someone waiting to hear it.
 const FAL_TTS_TIMEOUT_MS = Number(process.env.FAL_TTS_TIMEOUT_MS) || 60_000;
+
+// The CDN download that follows every fal generation, bounded on its own rather
+// than inheriting the generation's budget. See runFalAudio.
+const FAL_FETCH_TIMEOUT_MS = Number(process.env.FAL_FETCH_TIMEOUT_MS) || 120_000;
 
 // OpenAI-compatible clients always send an OpenAI voice name (`alloy`, `nova`,
 // …), which no backend we route to accepts. Gemini's are named differently
@@ -267,14 +275,26 @@ function pcmToWav(pcm, sampleRate, channels, bitsPerSample) {
  * almost always the safety checker declining a prompt, and each surface has copy
  * for it; a shared code would make all three say "the network failed".
  */
-async function runFalAudio(modelId, { prompt, voice, seconds, lyrics, instrumental, promptMax, timeoutMs, emptyCode }) {
+async function runFalAudio(modelId, { prompt, voice, seconds, lyrics, instrumental, promptMax, timeoutMs, emptyCode, queued = false }) {
   const input = buildFalInput(modelId, { prompt, voice, seconds, lyrics, instrumental, promptMax });
-  const result = await falService.run(modelId, input, { timeoutMs });
+  // `queued` picks the submit-and-poll host over the blocking one. Speech and
+  // effects are seconds of work and stay on `run`; music can be minutes, which
+  // is the case falService.runQueued exists for — see its note.
+  const result = queued
+    ? await falService.runQueued(modelId, input, { timeoutMs })
+    : await falService.run(modelId, input, { timeoutMs });
   const url = falOutputUrl(modelId, result);
   if (!url) {
     throw Object.assign(new Error('no audio was returned'), { statusCode: 502, code: emptyCode });
   }
-  const { buffer, mimeType } = await falService.fetchOutput(url, { timeoutMs });
+  // Bounded independently of the generation's budget: this is one CDN download
+  // of at most a few megabytes, so a music job allowed fifteen minutes to render
+  // must not also be allowed fifteen minutes to fetch — the object expires
+  // shortly after it is produced (falService.OUTPUT_TTL_SECONDS), and a fetch
+  // still hanging two minutes in is not going to succeed on the third.
+  const { buffer, mimeType } = await falService.fetchOutput(url, {
+    timeoutMs: Math.min(timeoutMs, FAL_FETCH_TIMEOUT_MS),
+  });
   // Not the CDN's word for it. Some endpoints serve audio as
   // application/octet-stream, and that label reaches the client, which picks a
   // file extension from it — see falAudioMime.
@@ -558,10 +578,61 @@ const DEFAULT_MUSIC_MODEL = Object.hasOwn(MUSIC_MODELS, process.env.DEFAULT_MUSI
 // so a paste-bomb can't inflate a fixed-price call into a slow one.
 const MUSIC_PROMPT_MAX = 2000;
 
-// Generous: a full song takes longer than a clip, and the whole payload lands
-// in one burst near the end, so a tight bound would abort a request that was
-// about to succeed.
-const MUSIC_TIMEOUT_MS = Number(process.env.MUSIC_TIMEOUT_MS) || 240_000;
+// How long a music generation may take, and why it is no longer one number.
+//
+// It used to be a flat 240s for everything, which was a bound set for the Lyria
+// clip and then asked to cover a five-minute track — the exact request most
+// likely to need longer than four minutes was the one guaranteed to be cut off
+// at four. Worse, the failure was invisible as a length problem: the user asked
+// for 5:00, waited, and got "that took too long", with nothing saying the length
+// they picked was what made it too long.
+//
+// So the budget follows the ask: a floor that covers cold starts and queueing,
+// plus an allowance per second of audio requested. The multiplier is deliberately
+// well above what any model here needs (most render several times faster than
+// real time) because the cost of being generous is a spinner nobody is watching,
+// and the cost of being tight is a paid generation thrown away.
+//
+// The ceiling is the one thing that isn't about the model: past a quarter of an
+// hour we are holding a client's request open longer than any intermediary
+// between us reliably will, so a longer wait would fail somewhere less
+// explicable than here.
+const MUSIC_TIMEOUT_BASE_MS = Number(process.env.MUSIC_TIMEOUT_MS) || 240_000;
+const MUSIC_TIMEOUT_PER_AUDIO_SECOND_MS = Number(process.env.MUSIC_TIMEOUT_PER_SECOND_MS) || 3_000;
+const MUSIC_TIMEOUT_MAX_MS = Number(process.env.MUSIC_TIMEOUT_MAX_MS) || 900_000;
+
+/** The budget for one generation, from the length it was asked for. */
+function musicTimeoutMs(seconds) {
+  const asked = Number.isFinite(Number(seconds)) ? Math.max(0, Number(seconds)) : 0;
+  return Math.min(
+    MUSIC_TIMEOUT_MAX_MS,
+    MUSIC_TIMEOUT_BASE_MS + asked * MUSIC_TIMEOUT_PER_AUDIO_SECOND_MS,
+  );
+}
+
+/**
+ * What to bill for, given what was asked for and what actually arrived.
+ *
+ * Only the length-priced models care (ElevenLabs and CassetteAI per minute,
+ * MiniMax/Sonilo/ACE-Step per second) — a flat-priced row ignores the number
+ * entirely. The rule is deliberately asymmetric, and both halves matter:
+ *
+ *   - never bill for time the model didn't render. A request for 5:00 that comes
+ *     back 1:12 is 1:12 of audio, and charging for the other 3:48 is charging
+ *     for nothing. This is the common case: several of these endpoints treat
+ *     `duration` as a hint and stop early.
+ *   - never bill for MORE than was quoted. If a model over-delivers, that is
+ *     between us and fal — the balance gate quoted the requested length and the
+ *     user agreed to that number, not to whatever the model felt like making.
+ *
+ * A container we can't parse falls back to the requested length, which is what
+ * the old behaviour was for everything.
+ */
+function billableSeconds(requested, delivered) {
+  if (requested == null) return null;
+  if (delivered == null || !Number.isFinite(delivered) || delivered <= 0) return requested;
+  return Math.min(requested, delivered);
+}
 
 /**
  * Resolve + validate the music model. An allowlist rather than a passthrough:
@@ -625,9 +696,26 @@ async function generateMusic({ userId, prompt, modelId, duration, lyrics, instru
     const seconds = falClampDuration(model, duration);
     const { buffer, mimeType } = await runFalAudio(model, {
       prompt, seconds, lyrics, instrumental, promptMax: MUSIC_PROMPT_MAX,
-      timeoutMs: MUSIC_TIMEOUT_MS, emptyCode: 'MUSIC_EMPTY',
+      // Scaled to the ask, and run through fal's queue rather than its blocking
+      // host: a five-minute track is the one generation here long enough for a
+      // single held socket to be the thing that fails. See musicTimeoutMs and
+      // falService.runQueued.
+      timeoutMs: musicTimeoutMs(seconds), emptyCode: 'MUSIC_EMPTY', queued: true,
     });
-    const costUsd = falAudioCostUsd(model, { seconds: seconds ?? 0 });
+    // What the model actually rendered, read off the bytes. Every endpoint here
+    // treats `duration` as a request rather than a contract, so this is the only
+    // honest number to bill on and the only honest number to show the user.
+    const deliveredSeconds = audioDurationSeconds(buffer, mimeType);
+    const billed = billableSeconds(seconds, deliveredSeconds);
+    if (seconds && deliveredSeconds && deliveredSeconds < seconds * 0.8) {
+      // Logged, not thrown: the track is real and the user has it. This is the
+      // signal for tightening a row's published `duration.max` in
+      // data/falModels.js — a model that never reaches the length it advertises
+      // should stop being offered it.
+      logger.warn('[audioService.generateMusic] short delivery', model,
+        `asked ${seconds}s, got ${deliveredSeconds}s`);
+    }
+    const costUsd = falAudioCostUsd(model, { seconds: billed ?? 0 });
     // Billed after the fact and never fatal, as on the Lyria path below: fal has
     // charged us and the user has the track, so a billing hiccup must not
     // withhold it. The route's balance gate is what stops an empty wallet.
@@ -636,7 +724,16 @@ async function generateMusic({ userId, prompt, modelId, duration, lyrics, instru
     } catch (err) {
       Sentry.captureException(err, { level: 'warning', tags: { op: 'audio_charge_musicGen' } });
     }
-    return { buffer, mimeType, model, costUsd, durationSeconds: seconds };
+    // Both numbers travel: `durationSeconds` is what the clip IS (so the card,
+    // the Library row and the price the user sees all agree with the audio),
+    // `requestedSeconds` is what was asked for (so a composer can say when the
+    // two differ instead of quietly relabelling the user's choice).
+    return {
+      buffer, mimeType, model, costUsd,
+      durationSeconds: deliveredSeconds ?? seconds,
+      requestedSeconds: seconds,
+      deliveredSeconds,
+    };
   }
 
   // Exactly the body the endpoint accepts. Note what is absent: no `user`
@@ -650,7 +747,10 @@ async function generateMusic({ userId, prompt, modelId, duration, lyrics, instru
   };
 
   const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), MUSIC_TIMEOUT_MS);
+  // A Lyria SKU has no length to scale by — the SKU *is* the length — so this
+  // path keeps the flat floor.
+  const orTimeoutMs = MUSIC_TIMEOUT_BASE_MS;
+  const timer = setTimeout(() => abort.abort(), orTimeoutMs);
   try {
     let r;
     try {
@@ -665,7 +765,7 @@ async function generateMusic({ userId, prompt, modelId, duration, lyrics, instru
       });
     } catch (fetchErr) {
       if (fetchErr?.name === 'AbortError') {
-        throw Object.assign(new Error(`music generation timed out after ${MUSIC_TIMEOUT_MS}ms`), {
+        throw Object.assign(new Error(`music generation timed out after ${orTimeoutMs}ms`), {
           statusCode: 504, code: 'MUSIC_TIMEOUT', timedOut: true,
         });
       }
@@ -923,22 +1023,35 @@ async function generateSfx({ userId, prompt, modelId, duration, billingMarkup, o
   // reading to the user as a network failure.
   const { buffer, mimeType } = await runFalAudio(model, {
     prompt, seconds: durationSeconds, promptMax: SFX_PROMPT_MAX,
-    timeoutMs: SFX_TIMEOUT_MS, emptyCode: 'SFX_EMPTY',
+    // Ten seconds is the longest effect on offer, so the flat bound is already
+    // generous here — but it follows the ask like music's does, for the day a
+    // longer effect model is added and nobody remembers this line exists.
+    timeoutMs: SFX_TIMEOUT_MS + durationSeconds * 1_000, emptyCode: 'SFX_EMPTY',
   });
+
+  // Same rule as music, and the same reason: an effect model can stop short of
+  // the length it was asked for, and the length-priced rows must not bill for
+  // audio nobody received. See billableSeconds.
+  const deliveredSeconds = audioDurationSeconds(buffer, mimeType);
+  const billed = billableSeconds(durationSeconds, deliveredSeconds) ?? durationSeconds;
 
   // Billed after the fact and never fatal, exactly as in generateMusic: fal has
   // already charged us and the user already has the audio, so a billing hiccup
   // must not withhold it. The route's balance gate is what keeps an empty
   // wallet from starting a generation in the first place.
   try {
-    await chargeAudio(userId, sfxCostEstimateUsd(model, durationSeconds), {
+    await chargeAudio(userId, sfxCostEstimateUsd(model, billed), {
       model, kind: 'sfxGen', markup: billingMarkup, origin,
     });
   } catch (err) {
     Sentry.captureException(err, { level: 'warning', tags: { op: 'audio_charge_sfxGen' } });
   }
 
-  return { buffer, mimeType, model, durationSeconds };
+  return {
+    buffer, mimeType, model,
+    durationSeconds: deliveredSeconds ?? durationSeconds,
+    requestedSeconds: durationSeconds,
+  };
 }
 
 module.exports = {
@@ -954,6 +1067,11 @@ module.exports = {
   resolveMusicModel,
   musicCostEstimateUsd,
   musicChargeEstimateUsd,
+  // Exported for test/audioDelivered.test.js — the two rules that keep a length
+  // preset honest: how long we're willing to wait for the length that was asked
+  // for, and what we bill when less of it comes back.
+  musicTimeoutMs,
+  billableSeconds,
   resolveRequireZdr,
   pcmToWav,
   // Exported for test/audioModels.test.js — pure helpers over model ids and

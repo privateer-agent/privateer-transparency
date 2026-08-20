@@ -27,7 +27,7 @@ import {
 } from '@solana-mobile/mobile-wallet-adapter-protocol-web3js';
 import { brand } from '../config/brand';
 import { signatureFromSignedPayload } from './wallets/mwaSignedPayload';
-import { WalletAccount } from './wallets/chains';
+import { ChainNamespace, WalletAccount } from './wallets/chains';
 import {
   WalletAuthResult,
   buildWalletMessages,
@@ -37,51 +37,168 @@ import {
   completeLoadDerivedKey,
   assertVaultAccount,
   solanaAccount,
+  solanaAccountFromHex,
   base64ToBytes,
 } from './walletAuthShared';
+// The reply shape is the shared one both hand-off transports return
+// (wallets/walletLinkPayload.ts), not something this transport defines.
+import type { LinkedSignatures } from './wallets/walletLinkPayload';
+import {
+  InAppBrowserWallet,
+  canHandoffToWalletBrowser,
+  linkWalletViaWalletBrowser,
+  cancelWalletHandoff,
+  preferredWalletBrowser,
+  rememberWalletBrowser,
+  walletBrowsersFor,
+} from './walletHandoffLink';
+
+// ---------------------------------------------------------------------------
+// Wallet-browser hand-off — every chain except Solana
+//
+// Mobile Wallet Adapter is Solana-specific, and there is no injected provider
+// of any kind inside an Android app: no EIP-1193 for EVM, no window for Sui's
+// Wallet Standard events to fire in, no `tronLink`. WalletConnect was built
+// here and removed — its relay is metered per monthly active user, which is the
+// wrong shape of dependency for a sign-in path, because the cost scales with
+// exactly the thing you want to grow and it puts a third party between the app
+// and the wallet.
+//
+// The vendor-free replacement is the browser hand-off this app already uses on
+// desktop, with the wallet's OWN in-app browser standing in for the user's
+// default browser and the `privateer://` scheme standing in for the loopback
+// listener. Mechanics and the security argument: ./walletHandoffLink.ts.
+//
+// Solana deliberately does NOT go through it. MWA is a better experience (no
+// browser, one wallet picker, both prompts in one session) and it is the path
+// that is actually verified on devices.
+// ---------------------------------------------------------------------------
 
 /**
- * EVM sign-in has no transport in the native app yet.
+ * Back out of a wallet sign-in the user dismissed.
  *
- * Mobile Wallet Adapter is Solana-specific, and there is no injected EIP-1193
- * provider inside an Android app. WalletConnect was built here and removed: its
- * relay is metered per monthly active user, which is the wrong shape of
- * dependency for a sign-in path — the cost scales with exactly the thing you
- * want to grow, and it puts a third party between the app and the wallet.
- *
- * The vendor-free replacement is the browser hand-off this app already uses on
- * desktop (services/desktopWalletLink.ts): borrow a browser that *does* have
- * the wallet, sign there, seal the signatures back. On Android that browser is
- * the wallet's own in-app browser and the return channel is the `privateer://`
- * scheme rather than desktop's loopback listener.
- *
- * Until that exists, the LoginScreen only offers Ethereum on web.
+ * Platform-resolved, like the logins themselves, so the sign-in UI has one name
+ * to call: here it abandons a pending hand-off, on web it releases the desktop
+ * loopback listener, and on iOS there is nothing to cancel. Nothing can recall
+ * a request another app already owns — this abandons the *wait*.
  */
-export async function evmLogin(): Promise<never> {
-  throw new Error('Ethereum wallet sign-in is not supported on this platform yet.');
+export function cancelWalletSignIn(): void {
+  cancelWalletHandoff();
+}
+
+/** Options every hand-off login accepts. `wallet` is the user's pick, if asked. */
+export interface HandoffLoginOptions {
+  recover?: boolean;
+  /**
+   * Which wallet's browser to sign in. The sign-in screen asks (there is no
+   * "default wallet app" on Android the way there is a default browser); when
+   * it doesn't, the last one used on this device is reused.
+   */
+  wallet?: InAppBrowserWallet;
+}
+
+/** Rebuild the connected account from what the wallet's browser handed back. */
+function accountFromLink(linked: LinkedSignatures): WalletAccount {
+  // Solana is the one chain whose canonical address is derivable from the hex
+  // identity alone. It cannot reach here today (MWA owns that path), but the
+  // hand-off is chain-generic and this keeps it honest if that ever changes.
+  if (linked.namespace === 'solana' && !linked.address) return solanaAccountFromHex(linked.idHex);
+  return { namespace: linked.namespace, address: linked.address!, idHex: linked.idHex };
 }
 
 /**
- * Sui sign-in has no transport in the native app either, for a different
- * reason: Sui wallets are discovered over the Wallet Standard, which is a pair
- * of *window* events. There is no window inside React Native, so there is
- * nothing to announce to. The route forward is the same browser hand-off
- * described above; until it exists, the LoginScreen only offers Sui on web
- * (config/billingMode.ts → suiWalletEnabled).
+ * Resolve which wallet browser to use, or refuse in a way that says why.
+ *
+ * A chain with no wallet browser we can address is not a failure to report as
+ * "something went wrong" — it is a capability this build genuinely lacks, and
+ * config/billingMode.ts hides its tile for exactly this reason. Reaching here
+ * means something bypassed the gate.
  */
-export async function suiLogin(): Promise<never> {
-  throw new Error('Sui wallet sign-in is not supported on this platform yet.');
+async function resolveWalletBrowser(
+  chain: ChainNamespace,
+  picked?: InAppBrowserWallet,
+): Promise<InAppBrowserWallet> {
+  // A pick from a stale screen is checked rather than trusted: it becomes a
+  // deeplink, and an unknown wallet builds one that opens nothing.
+  if (picked && (walletBrowsersFor(chain) as string[]).includes(picked)) return picked;
+  const wallet = await preferredWalletBrowser(chain);
+  if (!wallet) {
+    throw new Error(`${chain} wallet sign-in is not supported on this platform yet.`);
+  }
+  return wallet;
 }
 
 /**
- * Tron sign-in has no transport here either. TronLink is a browser extension;
- * its Android app carries a dApp browser, which is the same in-app-browser
- * hand-off the EVM note above describes and which nothing in this build speaks
- * yet. Until it does, the LoginScreen only offers Tron on web
- * (config/billingMode.ts → tronWalletEnabled).
+ * Full sign-in through the wallet-browser hand-off, for any chain.
+ *
+ * Identical for all of them, because everything chain-specific — which provider
+ * to connect, which vault message to sign, how the identity is encoded —
+ * happens on the browser side and arrives here already normalized.
  */
-export async function tronLogin(): Promise<never> {
-  throw new Error('Tron wallet sign-in is not supported on this platform yet.');
+async function handoffLogin(
+  chain: ChainNamespace,
+  opts?: HandoffLoginOptions,
+): Promise<WalletAuthResult> {
+  const wallet = await resolveWalletBrowser(chain, opts?.wallet);
+  const { nonce, nonceId } = await fetchNonce();
+  const linked = await linkWalletViaWalletBrowser('login', nonce, chain, wallet);
+
+  // Only after a signature actually came back. Remembering a wallet the user
+  // never completed a sign-in with would send the silent unlock path to it.
+  void rememberWalletBrowser(chain, wallet);
+
+  return completeWalletLogin({
+    account: accountFromLink(linked),
+    authSignature: linked.authSignature!,
+    authMessage: linked.authMessage!,
+    vaultSignature: linked.vaultSignature,
+    nonceId,
+  }, {
+    ...opts,
+    // Enrollment only, once in an account's lifetime. Unlike desktop there is
+    // no tab still holding the wallet to ask (linked.resign() is null by
+    // construction here), so this is a whole second trip: back into the same
+    // wallet's browser, reconnect, one prompt. 'unlock' mode signs only the
+    // vault message.
+    resignVault: async () => {
+      const same = await linked.resign();
+      if (same) return same;
+
+      const again = await linkWalletViaWalletBrowser('unlock', '', chain, wallet);
+      // A fresh hand-off is a fresh wallet session the user could have switched
+      // accounts in, and two signatures from two different accounts would fail
+      // the determinism gate for the wrong reason.
+      if (again.idHex !== linked.idHex) {
+        throw new Error('A different wallet account signed the second time. Use the same account to finish setting up.');
+      }
+      return again.vaultSignature;
+    },
+  });
+}
+
+/**
+ * Sign in via an Ethereum (or any EVM) wallet, through its in-app browser.
+ * After this resolves the in-memory master key is loaded and the user is
+ * authenticated — the same end state as the MWA path below.
+ */
+export async function evmLogin(opts?: HandoffLoginOptions): Promise<WalletAuthResult> {
+  return handoffLogin('eip155', opts);
+}
+
+/**
+ * Sign in via a Sui wallet, through Slush's in-app browser.
+ *
+ * The only chain whose deeplink is a ROUTE rather than a parameter
+ * (`browse/:url`), which is worth knowing here because it means the target is
+ * encoded into a path — see wallets/inAppBrowserLinks.ts.
+ */
+export async function suiLogin(opts?: HandoffLoginOptions): Promise<WalletAuthResult> {
+  return handoffLogin('sui', opts);
+}
+
+/** Sign in via TronLink, through its in-app browser. */
+export async function tronLogin(opts?: HandoffLoginOptions): Promise<WalletAuthResult> {
+  return handoffLogin('tron', opts);
 }
 
 // Re-export the platform-agnostic surface so existing imports from
@@ -189,13 +306,29 @@ async function signVaultMessage(check?: (account: WalletAccount) => void): Promi
 export async function loadDerivedKey(): Promise<void> {
   const vault = await fetchWalletVault();
 
-  // An account enrolled on another chain can't be unlocked here: prompting
-  // Mobile Wallet Adapter would derive a different KEK and report "could not
-  // unlock your data" on a perfectly healthy account. Say what's actually wrong
-  // instead. (Reachable today only by enrolling on web, then installing the
-  // Android app — there is no native sign-in on any other chain to create one
-  // from.)
+  // An account enrolled on another chain can't be unlocked through MWA:
+  // prompting it would derive a different KEK and report "could not unlock your
+  // data" on a perfectly healthy account. The vault message is namespace-scoped,
+  // so the chain that enrolled is the only one that can unwrap.
   if (vault.walletChain && vault.walletChain !== 'solana') {
+    const chain = vault.walletChain as ChainNamespace;
+
+    // Same hand-off as sign-in, minus the auth message — an already
+    // authenticated user has no nonce to bind. There is no UI to ask which
+    // wallet from here (this runs on a cleared key cache or a REAUTH_REQUIRED),
+    // which is why the sign-in remembers the answer.
+    if (canHandoffToWalletBrowser(chain)) {
+      const wallet = await resolveWalletBrowser(chain);
+      const linked = await linkWalletViaWalletBrowser('unlock', '', chain, wallet);
+      // The one branch that can't check before signing: the hand-off returns a
+      // signature and the identity that made it in one answer.
+      assertVaultAccount(vault, accountFromLink(linked));
+      await completeLoadDerivedKey(vault, linked.vaultSignature);
+      return;
+    }
+
+    // A chain we can reach no wallet for on this device (Sui today). Say what's
+    // actually wrong rather than failing as a decryption error.
     throw new Error('This account signs in with a wallet on another chain. Use the web app to unlock it on this device.');
   }
 

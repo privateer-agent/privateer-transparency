@@ -362,7 +362,7 @@ const musicBalanceGate = (req, res, next) => {
 router.post('/music', authenticate, requireDailyCap('musicGen'), musicBalanceGate, async (req, res) => {
   try {
     const { prompt, musicModelId, duration, lyrics, instrumental } = req.body || {};
-    const { buffer, mimeType, model, durationSeconds } = await audioService.generateMusic({
+    const { buffer, mimeType, model, durationSeconds, requestedSeconds } = await audioService.generateMusic({
       userId: req.user._id, prompt, modelId: musicModelId, duration, lyrics,
       // Vocal intent is the composer's switch, not something to read out of the
       // prompt. Defaulted to instrumental when absent rather than to falsy: on
@@ -370,9 +370,16 @@ router.post('/music', authenticate, requireDailyCap('musicGen'), musicBalanceGat
       // so an older client that sends neither field must still get a track.
       instrumental: instrumental !== false,
     });
-    // `durationSeconds` is present only for the models that take a length —
-    // a Lyria SKU *is* its length, so there is nothing to report back.
-    return res.json({ audioBase64: buffer.toString('base64'), mimeType, model, ...(durationSeconds ? { durationSeconds } : {}) });
+    // `durationSeconds` is how long the track ACTUALLY is, read off the bytes —
+    // not the length that was asked for, which several of these models treat as
+    // a hint. `requestedSeconds` carries the ask alongside it so the composer can
+    // say when the two disagree instead of relabelling the user's choice. Both
+    // are absent for a Lyria SKU, which *is* its length and takes no duration.
+    return res.json({
+      audioBase64: buffer.toString('base64'), mimeType, model,
+      ...(durationSeconds ? { durationSeconds } : {}),
+      ...(requestedSeconds ? { requestedSeconds } : {}),
+    });
   } catch (err) {
     if (err?.code === 'PROMPT_REQUIRED') return res.status(400).json({ message: req.t('errors.promptRequired'), code: 'PROMPT_REQUIRED' });
     if (err?.code === 'MUSIC_MODEL_UNSUPPORTED') return res.status(400).json({ message: req.t('errors.musicModelUnsupported'), code: 'MUSIC_MODEL_UNSUPPORTED' });
@@ -454,10 +461,13 @@ router.post('/sfx', authenticate, requireDailyCap('sfxGen'), sfxBalanceGate, asy
     const allowNonZdrMedia = await resolveAllowNonZdrMedia(userId, req.body?.allowNonZdrMedia);
     await assertMediaModelAllowed({ userId, modelId, requireZdr, allowNonZdrMedia });
 
-    const { buffer, mimeType, model, durationSeconds } = await audioService.generateSfx({
+    const { buffer, mimeType, model, durationSeconds, requestedSeconds } = await audioService.generateSfx({
       userId, prompt, modelId, duration,
     });
-    return res.json({ audioBase64: buffer.toString('base64'), mimeType, model, durationSeconds });
+    // As on /music: the delivered length, with the ask beside it.
+    return res.json({
+      audioBase64: buffer.toString('base64'), mimeType, model, durationSeconds, requestedSeconds,
+    });
   } catch (err) {
     if (err?.code === 'PROMPT_REQUIRED') return res.status(400).json({ message: req.t('errors.promptRequired'), code: 'PROMPT_REQUIRED' });
     if (err?.code === 'SFX_MODEL_UNSUPPORTED') return res.status(400).json({ message: req.t('errors.sfxModelUnsupported'), code: 'SFX_MODEL_UNSUPPORTED' });

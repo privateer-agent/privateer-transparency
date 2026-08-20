@@ -36,6 +36,7 @@ import { connectSuiWallet } from './suiWalletProvider.web';
 import { connectTronWallet } from './tronWalletProvider.web';
 import {
   canLinkWalletViaBrowser,
+  cancelWalletLink,
   linkWalletViaBrowser,
   finishWalletLink,
   LinkedSignatures,
@@ -58,6 +59,16 @@ export type { WalletUser, WalletAuthResult } from './walletAuthShared';
 // signatures come back; everything after that — verify, enroll/unwrap, session
 // — still runs on this side. See ./desktopWalletLink.ts.
 // ---------------------------------------------------------------------------
+
+/**
+ * Back out of a wallet sign-in the user dismissed. Platform-resolved so the
+ * sign-in UI has one name to call (see the Android service for the other half):
+ * here that means releasing the desktop hand-off's loopback listener, so a late
+ * POST can't resume a flow the user quit.
+ */
+export function cancelWalletSignIn(): void {
+  void cancelWalletLink();
+}
 
 /** Rebuild the connected account from what the browser handed back. */
 function accountFromLink(linked: LinkedSignatures): WalletAccount {
