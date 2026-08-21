@@ -42,6 +42,7 @@ import * as Speech from 'expo-speech';
 import { isGuestSession } from './sessionMode';
 import { synthesizeSpeechBytes, fetchVoicePreview, audioBytesToUri } from './voiceChatService';
 import { chunkForReadAloud } from './speechChunker';
+import { pauseMusicForOtherAudio, registerSpeechStop } from './audioFocus';
 import { Sentry } from './sentryService';
 import i18n from '../i18n';
 
@@ -169,6 +170,10 @@ export async function stopSpeech(): Promise<void> {
   teardownPlayers();
   await Speech.stop().catch(() => {});
 }
+
+// The other half of the audio-focus seam: a track starting has to be able to
+// silence a reading without importing this module's whole graph.
+registerSpeechStop(() => { void stopSpeech(); }, isSpeechEngaged);
 
 /** Device/browser engine. Used for guests and as the synthesis fallback. */
 function speakOnDevice(text: string, handlers: SpeakOptions): void {
@@ -303,6 +308,9 @@ export async function previewVoice(
   if (!opts?.modelId || !opts?.voice) return;
 
   await stopSpeech();
+  // A preview under a playing track is two voices at once. Pause rather than
+  // stop — the queue is still there when the audition is over.
+  pauseMusicForOtherAudio();
   const mine = generation;
   setActivity(true, null);
 
@@ -412,6 +420,7 @@ export async function speakText(text: string, options: SpeakOptions = {}): Promi
   if (!trimmed) { options.onDone?.(); return 'device'; }
 
   await stopSpeech();
+  pauseMusicForOtherAudio();
   const mine = generation;
   // Engage before synthesis, not after: the seconds spent waiting for the clip
   // are seconds the user may want to back out of.
