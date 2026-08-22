@@ -56,6 +56,11 @@ const {
 const { audioDurationSeconds } = require('../utils/audioDuration');
 const { tinfoilVoicesFor } = require('../data/tinfoilModels');
 const UserStoragePrefs = require('../models/userStoragePrefsModel');
+// The chat-model rewrite that runs in front of every music generation. See
+// generateMusic, and the module header of musicBriefService for why a music
+// prompt needs rewriting at all.
+const { refineMusicPrompt } = require('./musicBriefService');
+
 
 const OPENROUTER_BASE = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
 
@@ -681,11 +686,43 @@ function musicChargeEstimateUsd(modelId, duration) {
  * Generate music from a text prompt → { buffer, mimeType, model, costUsd }.
  * Bills 'musicGen'. Throws {statusCode,code} on bad input / provider failure.
  */
-async function generateMusic({ userId, prompt, modelId, duration, lyrics, instrumental = true, billingMarkup, origin = 'app' }) {
+async function generateMusic({
+  userId, prompt, modelId, duration, lyrics, instrumental = true, billingMarkup, origin = 'app',
+  // The chat-model rewrite in front of the generation (see musicBriefService).
+  // On by default because the request that needs it most is the one nobody
+  // flags: "the weeknd type beat" is refused by the provider's IP checker after
+  // the balance gate has already quoted a price. Off is for a caller that has
+  // written the prompt for a specific endpoint and means it literally.
+  refinePrompt = true,
+}) {
   if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
     throw Object.assign(new Error('prompt is required'), { statusCode: 400, code: 'PROMPT_REQUIRED' });
   }
   const model = resolveMusicModel(modelId);
+
+  // Rewrite before anything is bought. Names become the sound that earned them,
+  // negatives become positives, and the brief is written in the shape this
+  // model's text field actually reads — a tag list for CassetteAI and ACE-Step,
+  // prose for everything else. Reassigned into `prompt` on purpose: from here
+  // down there is exactly one prompt, and no path can send the unrewritten one
+  // by reaching for the wrong variable.
+  //
+  // The account's zero-retention preference is honoured by the REWRITE, which
+  // is an ordinary chat call and can be pinned to a ZDR endpoint. It says
+  // nothing about the music provider below, which has no ZDR endpoint at any
+  // setting — that is the carve-out documented above, and this does not widen
+  // it. If anything it narrows what the music provider sees: the user's own
+  // words stop at the rewriting model, and only the brief goes on.
+  if (refinePrompt) {
+    const brief = await refineMusicPrompt({
+      userId,
+      prompt,
+      modelId: model,
+      instrumental,
+      requireZdr: await resolveRequireZdr(userId),
+    });
+    prompt = brief.prompt;
+  }
 
   // fal's music models. Same carve-out, same posture: falService.run sends no
   // user field, no account id and no history either, so the prompt reaches the
