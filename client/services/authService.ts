@@ -31,6 +31,45 @@ import { sessionDeviceMeta } from '../utils/sessionDevice';
 const API_BASE_URL = getServerUrl();
 
 // ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/**
+ * A 401 that survived the refresh attempt.
+ *
+ * `code` exists so a UI can tell the two cases apart without string-matching a
+ * message: SESSION_EXPIRED means we had a token going in and it is gone now
+ * (handleTokenExpiration has already fired the sign-out callbacks);
+ * NOT_AUTHENTICATED means the request was made with no token at all, so there
+ * is nothing to expire and no state was touched.
+ *
+ * The messages below are last-resort fallbacks for call sites that render
+ * `err.message` blind. Anything user-facing should switch on `code` and use its
+ * own localized copy — QA #27 was a user being shown the literal words
+ * "Not authenticated." under a failed video render.
+ */
+export type AuthErrorCode = 'SESSION_EXPIRED' | 'NOT_AUTHENTICATED';
+
+export class AuthError extends Error {
+  readonly code: AuthErrorCode;
+  constructor(code: AuthErrorCode, message: string) {
+    super(message);
+    this.name = 'AuthError';
+    this.code = code;
+    // Restore the prototype chain: TS targets below ES6 break `instanceof` on
+    // subclassed builtins, and isAuthError below leads with instanceof.
+    Object.setPrototypeOf(this, AuthError.prototype);
+  }
+}
+
+/** True for either auth failure thrown by makeAuthenticatedRequest. */
+export function isAuthError(err: unknown): err is AuthError {
+  if (err instanceof AuthError) return true;
+  const code = (err as { code?: string } | null | undefined)?.code;
+  return code === 'SESSION_EXPIRED' || code === 'NOT_AUTHENTICATED';
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -609,9 +648,9 @@ class AuthService {
         // callbacks (which log "Token expired" and look like a real signout).
         if (hadTokenAtStart) {
           await this.handleTokenExpiration();
-          throw new Error('Your session has expired. Please sign in again.');
+          throw new AuthError('SESSION_EXPIRED', 'Your session has expired. Please sign in again.');
         }
-        throw new Error('Not authenticated.');
+        throw new AuthError('NOT_AUTHENTICATED', "You're signed out. Sign in to continue.");
       }
     }
 
