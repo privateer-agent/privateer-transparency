@@ -35,7 +35,7 @@
  * inference exactly like the chat request that produced it, and is never
  * persisted server-side.
  */
-import { useSyncExternalStore } from 'react';
+import { useCallback, useSyncExternalStore } from 'react';
 import { Platform } from 'react-native';
 import { Audio } from 'expo-av';
 import * as Speech from 'expo-speech';
@@ -143,6 +143,20 @@ export function useIsSpeaking(): boolean {
 export function useSpeakingId(): string | null {
   return useSyncExternalStore(subscribe, getActiveId, getActiveId);
 }
+/**
+ * Whether read-aloud is engaged on THIS id.
+ *
+ * The same fact as `useSpeakingId() === id`, but derived inside the store so a
+ * surface that mounts one subscriber per item only re-renders the two items
+ * whose answer actually changed. The graph canvas is why: every card on the
+ * board carries its own read-aloud button, and the id-valued hook would re-render
+ * all of them — markdown bodies and all — each time one of them started talking.
+ */
+export function useIsSpeakingId(id: string | null | undefined): boolean {
+  const get = useCallback(() => !!id && activeId === id, [id]);
+  return useSyncExternalStore(subscribe, get, get);
+}
+
 /** Non-reactive read, for callers outside React. */
 export function isSpeechEngaged(): boolean {
   return engaged;

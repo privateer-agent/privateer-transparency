@@ -401,15 +401,24 @@ router.post('/music', authenticate, requireDailyCap('musicGen'), musicBalanceGat
     if (err?.code === 'MUSIC_FAILED') return res.status(502).json({ message: req.t('errors.musicFailed'), code: 'MUSIC_FAILED' });
     if (err?.code === 'INSUFFICIENT_FUNDS') return res.status(402).json({ message: req.t('errors.insufficientBalance'), code: 'INSUFFICIENT_FUNDS' });
     // The music catalog spans two providers now, so a fal outage has to speak
-    // the same MUSIC_* vocabulary the OpenRouter path does.
+    // the same MUSIC_* vocabulary the OpenRouter path does — and MUSIC_UNAVAILABLE
+    // is deliberately a different word in it from MUSIC_FAILED, because
+    // the distinction is the one that matters most when it fires. Everything
+    // fal hosts is 17 of the 19 music models, so a bad key, a rate limit or an
+    // exhausted fal balance takes all of them out AT ONCE — and under the old
+    // mapping every one of them answered "Music generation failed", which reads
+    // as "our models are broken" or "my prompt was refused". It is neither: it
+    // is our account, the user can do nothing about it, and trying a different
+    // model (the obvious next move) fails identically. Same split effects have
+    // had since they shipped (SFX_UNAVAILABLE vs SFX_FAILED).
     const falErr = falErrorFor(err, {
-      op: 'audio_music', unavailable: 'MUSIC_FAILED', timeout: 'MUSIC_TIMEOUT', failed: 'MUSIC_FAILED',
+      op: 'audio_music', unavailable: 'MUSIC_UNAVAILABLE', timeout: 'MUSIC_TIMEOUT', failed: 'MUSIC_FAILED',
     });
     if (falErr) {
-      return res.status(falErr.status).json({
-        message: req.t(falErr.code === 'MUSIC_TIMEOUT' ? 'errors.musicTimeout' : 'errors.musicFailed'),
-        code: falErr.code,
-      });
+      const messageKey = falErr.code === 'MUSIC_TIMEOUT' ? 'errors.musicTimeout'
+        : falErr.code === 'MUSIC_UNAVAILABLE' ? 'errors.musicUnavailable'
+        : 'errors.musicFailed';
+      return res.status(falErr.status).json({ message: req.t(messageKey), code: falErr.code });
     }
     Sentry.captureException(err, { tags: { op: 'audio_music' } });
     logger.error('[audio/music]', err);

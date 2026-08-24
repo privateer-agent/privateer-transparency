@@ -78,6 +78,12 @@ const chatNodeSchema = new mongoose.Schema(
     encryptedWeatherData: { type: String, default: null },
     // Note nodes: encrypted markdown body (user-authored content, no AI inference)
     encryptedNoteBody: { type: String, default: null },
+    // E2EE: a short description of whatever picture or clip this node carries,
+    // written once when the media landed on the chart (client-side vision call)
+    // so that branches off the node have something true to reason from — the
+    // ancestor walk that builds a child's context can only read text, and an
+    // uploaded photo has none. User content, so ciphertext only.
+    encryptedMediaDescription: { type: String, default: null },
     // File attachments for file/note nodes — binaries are stored either in S3 (cloud)
     // or on-device (local); only encrypted metadata/refs live here.
     fileAttachments: [{
@@ -335,7 +341,8 @@ chatNodeSchema.virtual('graphNodeData').get(function() {
     imageAttachments: this.imageAttachments,
     videoAttachments: this.videoAttachments,
     fileAttachments: this.fileAttachments,
-    encryptedNoteBody: this.encryptedNoteBody
+    encryptedNoteBody: this.encryptedNoteBody,
+    encryptedMediaDescription: this.encryptedMediaDescription
   };
 });
 
@@ -439,6 +446,7 @@ chatNodeSchema.statics.createGraphNode = async function(data) {
     encryptedMedia = null,
     encryptedWeatherData = null,
     encryptedNoteBody = null,
+    encryptedMediaDescription = null,
     imageUrl = null,
     imageAttachments = null,
     videoAttachments = null,
@@ -468,6 +476,7 @@ chatNodeSchema.statics.createGraphNode = async function(data) {
     encryptedMedia,
     encryptedWeatherData,
     encryptedNoteBody,
+    encryptedMediaDescription,
     imageUrl,
     imageAttachments: imageAttachments || [],
     videoAttachments: videoAttachments || [],
