@@ -43,6 +43,7 @@ import { isGuestSession } from './sessionMode';
 import { synthesizeSpeechBytes, fetchVoicePreview, audioBytesToUri } from './voiceChatService';
 import { chunkForReadAloud } from './speechChunker';
 import { pauseMusicForOtherAudio, registerSpeechStop } from './audioFocus';
+import { SHARED_PLAYBACK_MODE } from './audioSessionMode';
 import { Sentry } from './sentryService';
 import i18n from '../i18n';
 
@@ -215,7 +216,7 @@ async function startClip(uri: string, mine: number, onFinish: (r: ClipResult) =>
   }
 
   // Honour the silent switch: a user who tapped "read aloud" meant to hear it.
-  await Audio.setAudioModeAsync({ allowsRecordingIOS: false, playsInSilentModeIOS: true }).catch(() => {});
+  await Audio.setAudioModeAsync(SHARED_PLAYBACK_MODE).catch(() => {});
   const { sound } = await Audio.Sound.createAsync({ uri }, { shouldPlay: true });
   if (generation !== mine) {
     // Interrupted while the file was loading — drop it rather than start talking.
