@@ -42,7 +42,7 @@ import * as Speech from 'expo-speech';
 import { isGuestSession } from './sessionMode';
 import { synthesizeSpeechBytes, fetchVoicePreview, audioBytesToUri } from './voiceChatService';
 import { chunkForReadAloud } from './speechChunker';
-import { pauseMusicForOtherAudio, registerSpeechStop } from './audioFocus';
+import { setVoiceActive } from './audioFocus';
 import { SHARED_PLAYBACK_MODE } from './audioSessionMode';
 import { Sentry } from './sentryService';
 import i18n from '../i18n';
@@ -129,6 +129,12 @@ function setActivity(nextEngaged: boolean, nextId: string | null): void {
   if (engaged === nextEngaged && activeId === nextId) return;
   engaged = nextEngaged;
   activeId = nextId;
+  // The music ducks under a voice rather than stopping for one, and this is the
+  // one place that knows when the voice starts and stops — every seam below
+  // (finished, stopped, errored, superseded, fell back to the device engine)
+  // already lands here, so the track comes back up even on the paths that
+  // never reach an `onDone`. See audioFocus.ts.
+  setVoiceActive('readAloud', nextEngaged);
   listeners.forEach(l => l());
 }
 
@@ -157,11 +163,6 @@ export function useIsSpeakingId(id: string | null | undefined): boolean {
   return useSyncExternalStore(subscribe, get, get);
 }
 
-/** Non-reactive read, for callers outside React. */
-export function isSpeechEngaged(): boolean {
-  return engaged;
-}
-
 function teardownPlayers(): void {
   const sound = activeSound;
   activeSound = null;
@@ -185,10 +186,6 @@ export async function stopSpeech(): Promise<void> {
   teardownPlayers();
   await Speech.stop().catch(() => {});
 }
-
-// The other half of the audio-focus seam: a track starting has to be able to
-// silence a reading without importing this module's whole graph.
-registerSpeechStop(() => { void stopSpeech(); }, isSpeechEngaged);
 
 /** Device/browser engine. Used for guests and as the synthesis fallback. */
 function speakOnDevice(text: string, handlers: SpeakOptions): void {
@@ -323,9 +320,6 @@ export async function previewVoice(
   if (!opts?.modelId || !opts?.voice) return;
 
   await stopSpeech();
-  // A preview under a playing track is two voices at once. Pause rather than
-  // stop — the queue is still there when the audition is over.
-  pauseMusicForOtherAudio();
   const mine = generation;
   setActivity(true, null);
 
@@ -435,7 +429,6 @@ export async function speakText(text: string, options: SpeakOptions = {}): Promi
   if (!trimmed) { options.onDone?.(); return 'device'; }
 
   await stopSpeech();
-  pauseMusicForOtherAudio();
   const mine = generation;
   // Engage before synthesis, not after: the seconds spent waiting for the clip
   // are seconds the user may want to back out of.
