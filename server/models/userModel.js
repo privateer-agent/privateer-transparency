@@ -364,6 +364,15 @@ const userSchema = new mongoose.Schema(
     // read. Captured from the request language at registration. In-request
     // emails still prefer req.language; this is the fallback for cron jobs.
     emailLocale: { type: String, default: null },
+    // Opt-out of product-update mail (the occasional "here's what shipped"
+    // note). Deliberately NOT a general email switch: verification, deletion
+    // notices and the storage-quota warning are transactional — a user who
+    // silences those loses their account without being told, so they stay
+    // outside this flag and outside the unsubscribe link.
+    //
+    // Default false = opted in. Set from the signed link in the mail footer
+    // (routes/unsubscribe.js); no session needed, and no other route reads it.
+    productEmailsOptOut: { type: Boolean, default: false },
     // X25519 public key (base64, 32 bytes) for the cloud outbox. Derived
     // deterministically from the account master key on a key-holding client and
     // published here so terminals (which hold NO key material) can seal results
