@@ -38,7 +38,7 @@
 
 const ModelRateConfig = require('../models/modelRateConfigModel');
 const billingService = require('./billingService');
-const { getRatioParamMode, supportsTransparency, getMaxImageSize, getSupportedAspectRatios } = require('../data/imageModelCapabilities');
+const { getRatioParamMode, supportsTransparency, getMaxImageSize, getSupportedAspectRatios, getSupportedImageSizes } = require('../data/imageModelCapabilities');
 const { isZdrModel } = require('../data/zdrProviders');
 const { safeFetch } = require('../utils/safeFetch');
 const { createPersonaGuard } = require('./personaGuard');
@@ -601,16 +601,53 @@ async function applyZdrRouting(body, modelId, { useZdrKey = false } = {}) {
   return body;
 }
 
+// Sampling knobs we set by DEFAULT and can safely drop when a provider rejects
+// one outright. Deliberately excludes everything load-bearing (model, messages,
+// modalities, image_config, plugins): retrying without one of those would
+// silently render something other than what was asked for, at full price.
+const DROPPABLE_PARAMS = new Set(['temperature', 'max_tokens', 'top_p', 'frequency_penalty', 'presence_penalty']);
+
+/**
+ * Some endpoints 400 an unsupported parameter instead of ignoring it, naming the
+ * field ("Unsupported parameter: 'temperature' is not supported with this
+ * model." / `"param": "temperature"`). OpenRouter forwards that body verbatim,
+ * JSON-escaped, inside error.metadata.raw — so match both quoting styles.
+ * Returns the dropped field name, or null when there's nothing safe to drop.
+ * A field can only be dropped once (it's gone from `body` afterwards), so a
+ * caller retrying on a truthy return can't loop.
+ */
+function dropUnsupportedParam(body, errText) {
+  if (!errText) return null;
+  const m = errText.match(/Unsupported parameter: ['"\\]*([a-z_]+)/i)
+         || errText.match(/\\?"param\\?"\s*:\s*\\?"([a-z_]+)/i);
+  const name = m?.[1];
+  if (!name || !DROPPABLE_PARAMS.has(name) || !(name in body)) return null;
+  delete body[name];
+  return name;
+}
+
 async function openRouterChat(messages, modelId, options = {}) {
   const MAX_RETRIES = 3;
   const BASE_DELAY_MS = 2000;
 
+  // Image generation rides chat/completions (`modalities`), but the endpoints
+  // behind it are Images-API ones with no sampling knob: OpenAI's
+  // gpt-image-*/gpt-5-image-* 400 the WHOLE request with "Unsupported
+  // parameter: 'temperature'" rather than ignoring it. The 0.8 here was only
+  // ever the chat default, never a considered choice for drawing, so send it
+  // only when a caller explicitly asked for one. This was every transparent-
+  // background generation: "no background" reroutes to TRANSPARENCY_IMAGE_MODEL
+  // (an OpenAI image model) in chatController.resolveTransparencyModelId.
+  const isImageGen = Array.isArray(options.modalities) && options.modalities.includes('image');
+
   const body = {
     model: modelId,
     messages,
-    temperature: options.temperature ?? 0.8,
     max_tokens: options.maxTokens ?? 8192,
   };
+  if (!isImageGen || options.temperature !== undefined) {
+    body.temperature = options.temperature ?? 0.8;
+  }
 
   // Image generation via chat completions endpoint.
   // Per OpenRouter spec, both aspect_ratio and image_size live INSIDE image_config;
@@ -696,6 +733,18 @@ async function openRouterChat(messages, modelId, options = {}) {
       logger.debug(`[openrouter] ${modelId} requires reasoning — retrying without the hint`);
       delete body.reasoning;
       continue;
+    }
+
+    // Same shape, one layer out: an endpoint that rejects a sampling knob names
+    // the field in its 400. Drop it and retry with no backoff — nothing upstream
+    // is wrong, so there is nothing to wait out. Spends one of MAX_RETRIES and
+    // can't loop (the field is gone from the body).
+    if (res.status === 400 && attempt < MAX_RETRIES) {
+      const droppedParam = dropUnsupportedParam(body, errText);
+      if (droppedParam) {
+        logger.debug(`[openrouter] ${modelId} rejects ${droppedParam} — retrying without it`);
+        continue;
+      }
     }
 
     // Retry transient upstream failures: 429 (rate limit) and any 5xx incl. 503
@@ -1119,7 +1168,19 @@ function buildOpenRouterAspectFields(modelId, aspectRatio, imageSize, transparen
       logger.warn(`[imageGen] dropping unsupported aspect_ratio "${aspectRatio}" for ${modelId}`);
     }
   }
-  if (imageSize)   image_config.image_size   = imageSize;
+  // Same rule for image_size, and it matters most where the model was chosen for
+  // the user: a transparent-background request is redirected to a
+  // transparency-capable model (chatController.resolveTransparencyModelId), and
+  // the size the user picked for THEIR model may not exist on that one (4K on
+  // gemini-3.1-flash-image → gpt-5-image-mini, which offers 1K/2K).
+  if (imageSize) {
+    const allowedSizes = getSupportedImageSizes(modelId);
+    if (!allowedSizes || allowedSizes.includes(imageSize)) {
+      image_config.image_size = imageSize;
+    } else {
+      logger.warn(`[imageGen] dropping unsupported image_size "${imageSize}" for ${modelId}`);
+    }
+  }
   // Transparent background only for models that honor it. Force PNG (alpha-capable)
   // so the transparency survives the provider's encode step.
   if (transparentBackground && supportsTransparency(modelId)) {
