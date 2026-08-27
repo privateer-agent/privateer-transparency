@@ -57,6 +57,9 @@ const {
   handleImageGeneration, handleVideoSubmit, handleVideoStatus,
   handleModel3dCatalog, handleModel3dSubmit, handleModel3dStatus,
 } = require('../services/openaiMediaHandler');
+const {
+  handleSpriteCatalog, handleSpritePack, handleSpriteGenerate, handleSpriteStatus,
+} = require('../services/spriteApiHandler');
 const audioService = require('../services/audioService');
 // The non-ZDR media gate, shared with the app and agent paths — /audio/sfx is
 // the only /v1 audio route that needs it.
@@ -142,6 +145,44 @@ router.post(
 // mesh is exactly the one who needs to see what the cheap models cost.
 router.get('/models3d', apiRateLimiter, handleModel3dCatalog);
 router.get('/models3d/:id', apiRateLimiter, handleModel3dStatus);
+
+// ── Sprites: Godot sprite sheets ─────────────────────────────────────────────
+//
+// Two shapes, because the runtime forces it (see services/spriteApiHandler.js).
+//
+// `POST /sprites` packs frames the caller already holds into a sheet, a Godot 4
+// SpriteFrames resource and a zip. It calls no model, so it carries NO daily cap
+// and NO balance gate and is not billed — charging for it would be charging for
+// CPU rather than for inference, which is not what the rest of this API does.
+// The rate limiter and a concurrency slot are what bound it.
+router.post(
+  '/sprites',
+  apiRateLimiter,
+  requireConcurrencySlot({ keyPrefix: 'apikey', cap: API_CONCURRENCY_CAP }),
+  handleSpritePack
+);
+
+// `POST /sprites/generate` turns a picture and a sentence into that bundle, at
+// the cost of one video generation per BILLED facing — one, three or five, never
+// eight, because mirrored facings are flipped rather than rendered. The balance
+// floor is one cheap clip; the handler reserves the real fan-out and refuses on
+// that, so this gate only has to stop an empty wallet reaching the provider.
+router.post(
+  '/sprites/generate',
+  apiRateLimiter,
+  requireFeature('videoGen'),
+  requireDailyCap('videoGen'),
+  checkCreditBalance(0.2),
+  requireConcurrencySlot({ keyPrefix: 'apikey', cap: API_CONCURRENCY_CAP }),
+  handleSpriteGenerate
+);
+
+// Listed BEFORE the poll route so it cannot be swallowed by `:id`, and carrying
+// none of the gates above: reading what this deployment can do — including
+// WHETHER generation is available here at all — must not require an entitlement
+// or a balance. Same argument the 3D catalog makes.
+router.get('/sprites/models', apiRateLimiter, handleSpriteCatalog);
+router.get('/sprites/:id', apiRateLimiter, handleSpriteStatus);
 
 // ── Audio: speech-to-text (multipart `file`, or JSON audioBase64) ──────────────
 router.post(
