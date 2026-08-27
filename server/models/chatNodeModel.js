@@ -269,6 +269,31 @@ const chatNodeSchema = new mongoose.Schema(
         type: String,
         enum: ['', 'markdown', 'html'],
         default: ''
+      },
+      // A dropped sprite sheet's animation grid, so the card can PLAY the sheet
+      // rather than show it as one flat picture of a dozen poses.
+      //
+      // Plaintext, and deliberately: this is the same fence libraryFileModel
+      // draws around a sprite row, for the same reason — a sprite animates, so
+      // the renderer needs the cell size and the frame rate before it can
+      // decrypt anything. Nothing here says what the sprite IS; the name, the
+      // prompt and the facing list stay sealed in the bundle's own metadata.
+      // Absent → the node is an ordinary picture, which is what a sheet was
+      // before this existed.
+      sprite: {
+        type: {
+          frameCount: { type: Number },
+          frameWidth: { type: Number },
+          frameHeight: { type: Number },
+          columns: { type: Number },
+          rows: { type: Number },
+          fps: { type: Number },
+          loop: { type: Boolean },
+          directionCount: { type: Number },
+          animIndex: { type: Number }
+        },
+        default: null,
+        _id: false
       }
     },
     // Token usage tracking
@@ -334,6 +359,7 @@ chatNodeSchema.virtual('graphNodeData').get(function() {
     userSized: this.visualMetadata.userSized,
     fontScale: this.visualMetadata.fontScale,
     color: this.visualMetadata.color,
+    sprite: this.visualMetadata.sprite || null,
     edgeCount: this.connectedEdgeIds ? this.connectedEdgeIds.length : 0,
     lastActivity: this.lastActivity,
     connectionOrigin: this.connectionOrigin,
@@ -453,7 +479,8 @@ chatNodeSchema.statics.createGraphNode = async function(data) {
     fileAttachments = null,
     modelId = null,
     modePill = null,
-    renderMode = null
+    renderMode = null,
+    sprite = null
   } = data;
 
   const colorByType = {
@@ -493,7 +520,10 @@ chatNodeSchema.statics.createGraphNode = async function(data) {
       // Which composer pill created this node — kept through the pending →
       // finished swap so the card can keep showing it after reloads.
       modePill: typeof modePill === 'string' ? modePill : '',
-      renderMode: renderMode === 'html' || renderMode === 'markdown' ? renderMode : ''
+      renderMode: renderMode === 'html' || renderMode === 'markdown' ? renderMode : '',
+      // Already whitelisted and clamped by the controller; null for every node
+      // that is not a sprite, which is nearly all of them.
+      sprite: sprite || null
     }
   });
   
