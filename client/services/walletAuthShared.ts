@@ -69,21 +69,16 @@ export interface WalletAuthResult {
  * wallet app, dismissing the picker, or declining a sign prompt — rather than a
  * real error. Callers should treat this as a soft "try again" cue, not a
  * failure. Covers MWA's Android `CancellationException`, wallet "user
- * rejected/declined/dismissed" strings, and the EIP-1193-style `4001` code that
- * browser wallets (Phantom/Solflare/Backpack) return on user rejection.
+ * rejected/declined/dismissed/denied" strings, the EIP-1193 `4001` code (read
+ * off the error object, not just its text, because the wording beside it is the
+ * wallet's own), and the explicit WalletCancelledError a provider throws when a
+ * wallet reports a cancel by resolving with nothing granted.
+ *
+ * The implementation lives beside the other normalized wallet errors so the
+ * dependency-free providers can use it too; this re-export is the name every
+ * existing caller imports.
  */
-export function isWalletCancellation(err: unknown): boolean {
-  const msg = ((err as any)?.message ?? String(err ?? '')).toLowerCase();
-  return (
-    msg.includes('cancel') ||          // cancelled / canceled / cancellation / CancellationException
-    msg.includes('reject') ||          // user rejected
-    msg.includes('declin') ||          // declined
-    msg.includes('dismiss') ||         // wallet UI dismissed
-    msg.includes('did not approve') ||
-    msg.includes('not approved') ||
-    msg.includes('4001')               // EIP-1193-style user-rejection code
-  );
-}
+export { isWalletCancellation } from './wallets/walletErrors';
 
 // ---------------------------------------------------------------------------
 // Encoding helpers

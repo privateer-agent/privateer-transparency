@@ -42,7 +42,7 @@
  */
 
 const Sentry = require('@sentry/node');
-const { getNearPricing, NEAR_PREFIX } = require('../data/nearModels');
+const { getNearPricing, loadNearModels, NEAR_PREFIX } = require('../data/nearModels');
 // Standalone module (requires nothing back into inferenceService), so unlike the
 // shared() helpers below it can be required eagerly without a load-time cycle.
 const { createPersonaGuard } = require('./personaGuard');
@@ -187,6 +187,50 @@ function sanitizeNearMessages(messages) {
   );
 }
 
+/**
+ * Does this provider 400 mean "the prompt didn't fit"?
+ *
+ * vLLM (which NEAR fronts) doesn't say "context length exceeded" for the case
+ * that actually bites a multi-image turn. It subtracts the prompt from the
+ * window first and reports the ARITHMETIC:
+ *   `max_tokens must be at least 1, got -31298`
+ * — i.e. the images alone were 31k tokens past the ceiling. Left unclassified
+ * that reaches the user as raw provider JSON; classified, chatController turns
+ * it into the context-length bubble with its "choose a model" CTA.
+ */
+function looksLikeContextOverflow(text) {
+  if (!text) return false;
+  return /max_tokens must be at least \d+, got -\d+/i.test(text)
+    || /context[\s_]?length|maximum context|reduce the length|prompt is too long|too many tokens/i.test(text);
+}
+
+/**
+ * Cap the requested completion budget at what the model actually offers.
+ *
+ * Callers pass a flat 8192 (or an artifact-sized ceiling), which is more than
+ * some TEE models will emit and, on a small-window model, more than the window
+ * has left after a large prompt. Asking for a budget the model can't honour is
+ * how a vision turn came back with zero completion tokens — billed, and an
+ * empty bubble on screen. Unknown model or a failed catalog read leaves the
+ * request exactly as it was.
+ */
+async function clampMaxTokens(modelId, requested) {
+  const want = requested ?? 8192;
+  const ceiling = (await catalogRow(modelId))?.maxCompletionTokens;
+  if (typeof ceiling === 'number' && ceiling > 0 && want > ceiling) return ceiling;
+  return want;
+}
+
+/** The model's row in the live TEE catalog, or null if unknown/unreachable. */
+async function catalogRow(modelId) {
+  try {
+    const models = await loadNearModels();
+    return models.find((m) => m.id === modelId) || null;
+  } catch (_) {
+    return null;
+  }
+}
+
 async function nearChatRequest(body, modelId, { stream = false, signal } = {}) {
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), NEAR_TIMEOUT_MS);
@@ -218,6 +262,12 @@ async function nearChatRequest(body, modelId, { stream = false, signal } = {}) {
       throw asProviderError(`The selected model (${modelId}) is currently unavailable. Please choose a different model in Settings.`, modelId, { statusCode: res.status });
     }
     providerHealth.recordFailure('near', { status: res.status, message: errText, kind: 'inference' });
+    if (res.status === 400 && looksLikeContextOverflow(errText)) {
+      throw Object.assign(
+        new Error(`The attachments and conversation are larger than ${modelId} can read in one turn.`),
+        { code: 'CONTEXT_LENGTH_EXCEEDED', modelId, statusCode: 400 }
+      );
+    }
     const err = new Error(`Upstream inference error ${res.status}: ${errText}`);
     if (res.status === 429) err.statusCode = 429;
     throw err;
@@ -243,7 +293,7 @@ async function generateText(parts, options = {}) {
     model: upstream,
     messages,
     temperature: options.temperature ?? 0.8,
-    max_tokens: options.maxTokens ?? 8192,
+    max_tokens: await clampMaxTokens(modelId, options.maxTokens),
   };
 
   try {
@@ -287,6 +337,8 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
     windowHistory(messagesWithDirective, { maxTokens: options.historyTokenBudget ?? 12000 })
   );
 
+  const maxTokens = await clampMaxTokens(modelId, options.maxTokens);
+
   const body = {
     model: upstream,
     messages: windowed,
@@ -295,7 +347,7 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
     // is set; without it inputTokens/outputTokens stay 0 and the turn isn't billed.
     stream_options: { include_usage: true },
     temperature: options.temperature ?? 0.8,
-    max_tokens: options.maxTokens ?? 8192,
+    max_tokens: maxTokens,
   };
 
   const res = await nearChatRequest(body, modelId, { stream: true, signal: options.signal });
@@ -357,6 +409,27 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
     // mid-sentence. See inferenceService.js / personaGuard.js.
     tableConverter.end();
     personaGuard.end();
+  }
+
+  // A completion of zero tokens is never an answer — and it is exactly what a
+  // prompt that nearly fills the window produces: the provider accepts the
+  // request, charges for the prompt, and emits nothing. Measured on a
+  // 16k-context vision model handed ONE full-resolution photo: an empty bubble
+  // the account had paid for. Raise it instead of resolving, and when the token
+  // counts show the window was the reason, raise it as the context error so the
+  // client renders the "choose a model" CTA rather than a bare failure.
+  if (!sawContent && outputTokens === 0 && !interrupted) {
+    // The prompt plus the budget we asked to write into it — that sum, not the
+    // prompt alone, is what has to fit, and it is what the provider silently
+    // gave up on.
+    const ctx = (await catalogRow(modelId))?.contextLength;
+    if (typeof ctx === 'number' && ctx > 0 && inputTokens > 0 && inputTokens + maxTokens > ctx) {
+      throw Object.assign(
+        new Error(`The attachments and conversation are larger than ${modelId} can read in one turn.`),
+        { code: 'CONTEXT_LENGTH_EXCEEDED', modelId }
+      );
+    }
+    throw asProviderError(`${modelId} returned an empty reply. Please try again or choose a different model.`, modelId);
   }
 
   const { costUsd, providerCostUsd } = await calcNearCost(modelId, inputTokens, outputTokens);

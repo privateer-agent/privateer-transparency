@@ -790,6 +790,11 @@ async function openRouterChat(messages, modelId, options = {}) {
 // preferredImageGenModelId.
 const RETIRED_MODEL_ALIASES = {
   'google/gemini-3.1-flash-image-preview': 'google/gemini-3.1-flash-image',
+  // NEAR stopped serving Qwen3.5 122B A10B; it was our chat AND vision default,
+  // so a persisted pref naming it 400s with "not a valid model name or alias".
+  // Qwen 3.8 27B is the replacement that keeps both properties the pick implied:
+  // a TEE (confidential) endpoint, and image input.
+  'near/Qwen/Qwen3.5-122B-A10B': 'near/Qwen/Qwen3.8-27B',
   // `tinfoil/kimi-k2-6 → tinfoil/gemma4-31b` lived here 2026-07-28 → 2026-08-03:
   // Tinfoil delisted the slug from /v1/models and this alias kept persisted
   // prefs from 404ing. Tinfoil RELISTED it (confirmed live in /v1/models,
@@ -976,6 +981,11 @@ function mimeToAudioFormat(mimeType) {
  * @returns {{ text, inputTokens, outputTokens, costUsd, providerCostUsd }}
  */
 async function generateText(parts, options = {}) {
+  // Heal a retired slug FIRST — the confidential-host branches below return
+  // before resolveModelId applies the alias map (see generateTextStream).
+  if (options.modelId && RETIRED_MODEL_ALIASES[options.modelId]) {
+    options = { ...options, modelId: RETIRED_MODEL_ALIASES[options.modelId] };
+  }
   // NEAR AI (TEE) and Tinfoil (secure enclave) models are OpenAI-compatible but
   // routed to different hosts and keys, with no ZDR two-key logic. Lazy
   // requires avoid a load-time cycle.
@@ -1745,6 +1755,10 @@ async function listEnabledModels() {
  * Returns { inputTokens, outputTokens, costUsd, providerCostUsd } after the stream completes.
  */
 async function generateTextStream(messages, modelId, options = {}, onChunk) {
+  // Heal a retired slug FIRST: the confidential-host branches below return
+  // before resolveModelId (which is where the alias map is normally applied),
+  // so a retired NEAR/Tinfoil id would otherwise be sent to the provider as-is.
+  modelId = RETIRED_MODEL_ALIASES[modelId] || modelId;
   // NEAR AI (TEE) and Tinfoil (secure enclave) models route to their
   // confidential-compute hosts. Lazy requires avoid a load-time cycle with the
   // provider services (which reuse helpers here).
