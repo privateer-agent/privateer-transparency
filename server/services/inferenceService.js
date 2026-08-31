@@ -2167,6 +2167,41 @@ async function proxyChatCompletion(openaiBody, { requireZdr = true } = {}) {
 }
 
 
+function extractImageGenErrorMessage(err) {
+  const raw = err?.message || '';
+  const m = raw.match(/^Upstream inference error \d+:\s*(\{[\s\S]*\})\s*$/);
+  if (!m) return null;
+  try {
+    const parsed = JSON.parse(m[1]);
+    let providerMsg = parsed?.error?.message || null;
+    if (parsed?.error?.metadata?.raw) {
+      try {
+        const rawParsed = typeof parsed.error.metadata.raw === 'string'
+          ? JSON.parse(parsed.error.metadata.raw)
+          : parsed.error.metadata.raw;
+        const innerMsg = rawParsed?.error?.message || rawParsed?.message;
+        if (innerMsg) {
+          if (!providerMsg || /provider returned error/i.test(providerMsg)) {
+            providerMsg = innerMsg;
+          }
+        }
+      } catch { /* not JSON in metadata.raw */ }
+    }
+    return providerMsg;
+  } catch {
+    return null;
+  }
+}
+
+function isInvalidImageError(err) {
+  if (!err) return false;
+  if (err.code === 'INVALID_IMAGE') return true;
+  const raw = typeof err === 'string' ? err : (err.message || '');
+  const extracted = extractImageGenErrorMessage(err) || '';
+  const combined = `${raw} ${extracted}`;
+  return /\b(provided image is not valid|invalid.*image|image.*not valid|unsupported image|corrupt.*image|cannot decode image)\b/i.test(combined);
+}
+
 /**
  * Convert an OpenRouter image-gen failure into a user-facing assistant message.
  * Errors arrive as `Error("Upstream inference error 400: {<json>}")`; we lift the
@@ -2176,15 +2211,12 @@ async function proxyChatCompletion(openaiBody, { requireZdr = true } = {}) {
  */
 function formatImageGenErrorForUser(err, { modelId } = {}) {
   const raw = err?.message || '';
-  // Strip the "Upstream inference error <code>: " prefix and JSON-parse the rest.
-  const m = raw.match(/^Upstream inference error \d+:\s*(\{[\s\S]*\})\s*$/);
-  let providerMsg = null;
-  if (m) {
-    try {
-      const parsed = JSON.parse(m[1]);
-      providerMsg = parsed?.error?.message || null;
-    } catch { /* keep providerMsg null */ }
+  const providerMsg = extractImageGenErrorMessage(err);
+
+  if (isInvalidImageError(err)) {
+    return `I couldn't generate that image: The referenced image is invalid or unsupported. Please switch to a different reference image, pick another model, or try without a reference image.`;
   }
+
   // `raw` is the internal envelope ("Upstream inference error 400: …") — it can
   // routing layer, so it must never be interpolated into user-facing copy.
   if (!providerMsg) {
@@ -2476,7 +2508,7 @@ async function extractMemoryCandidates({ userMessage, aiResponse, existingMemori
   }
 }
 
-module.exports = { generateText, generateTextStream, proxyChatCompletion, proxyRequestBounds, withProxyPromptCacheHints, estimateTokens, calcOpenRouterCost, calcInferenceCost, calcImageGenCost, generateImage, submitVideoGeneration, getVideoModelRuntimeCaps, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, listSubscriptionCatalog, formatImageGenErrorForUser, formatVideoGenErrorForUser, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
+module.exports = { generateText, generateTextStream, proxyChatCompletion, proxyRequestBounds, withProxyPromptCacheHints, estimateTokens, calcOpenRouterCost, calcInferenceCost, calcImageGenCost, generateImage, submitVideoGeneration, getVideoModelRuntimeCaps, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, listSubscriptionCatalog, formatImageGenErrorForUser, formatVideoGenErrorForUser, isInvalidImageError, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
   // Shared formatting helpers reused by nearAiService (OpenAI-compatible NEAR path).
   NO_TABLES_DIRECTIVE, withNoTables, convertTablesToBullets, createStreamingTableConverter,
   // og:image enrichment for source cards — also applied to the Brave web-search path.
