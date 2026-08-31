@@ -36,6 +36,8 @@
  *   GET  /v1/models3d/:id           — poll a 3D job; returns a signed URL
  *   POST /v1/audio/transcriptions   — speech-to-text (OpenAI shape, multipart)
  *   POST /v1/audio/speech           — text-to-speech (OpenAI shape, audio bytes)
+ *   POST /v1/audio/sfx              — sound effects (Privateer ext., audio bytes)
+ *   POST /v1/audio/music            — music generation (Privateer ext., audio bytes)
  *   POST /v1/search                 — web search, server-side (Privateer ext.)
  *   POST /v1/fetch                  — read web pages as text (Privateer ext.)
  *
@@ -62,8 +64,13 @@ const {
 } = require('../services/spriteApiHandler');
 const audioService = require('../services/audioService');
 // The non-ZDR media gate, shared with the app and agent paths — /audio/sfx is
-// the only /v1 audio route that needs it.
+// the only /v1 audio route that needs it. /audio/music is exempt on purpose,
+// not by omission; the reason is written out above that route.
 const { assertMediaModelAllowed, resolveAllowNonZdrMedia } = require('../controllers/chatController');
+// Translating a provider outage into the MUSIC_* vocabulary the app already
+// speaks, and out of the provider's own. Shared with routes/audio.js so the
+// two surfaces cannot drift on which failures are ours.
+const { falErrorFor } = require('../utils/falErrors');
 const billingService = require('../services/billingService');
 const { listEnabledModels } = require('../services/inferenceService');
 const { search: braveSearch, SEARCH_COST_USD } = require('../services/braveSearchService');
@@ -299,6 +306,116 @@ router.post(
       return res.send(buffer);
     } catch (err) {
       return sendMediaError(res, err, 'audio_sfx');
+    }
+  });
+
+// ── Audio: music (returns raw audio bytes) ────────────────────────────────────
+//
+// A full track — sung or instrumental — from a text brief. Bytes back, like
+// /audio/speech and /audio/sfx, because what the caller wants is a file.
+//
+// NO ZDR GATE, AND THAT IS DELIBERATE. It is the one media generation on this
+// API that is exempt, and it is exempt for the same reason it is in the app
+// (CLAUDE.md §5, and the carve-out comment above audioService.generateMusic):
+// every other non-ZDR generator here has a zero-retention alternative, and
+// music has none on any host we reach — so gating it could only ever mean a
+// default account has no music at all, rather than a choice to make. Do NOT
+// "make this consistent" with /audio/sfx: sfx is gated precisely because it has
+// somewhere else to go.
+//
+// What is offered in exchange is honesty, and it is the docs' job as much as
+// this route's: the request goes upstream UNATTRIBUTED (no user field, no
+// account id, no history — see generateMusic), and a music prompt must never be
+// described as private, zero-retention or confidential anywhere a caller reads.
+//
+// SYNCHRONOUS, and it can take minutes. Several models in this catalog render a
+// five-minute track in one blocking call, and the server's own budget scales
+// with the length asked for (up to 15 minutes). There is no job store for audio
+// the way there is for video and 3D, so a caller asking for a long track needs
+// a client timeout to match — an SDK default of 60s will abandon a track it has
+// already paid for.
+const musicBalanceGate = (req, res, next) => {
+  // Exact rather than the bare $0.01 floor, and the requested duration is part
+  // of it: several of these models are metered by the minute, so a five-minute
+  // track and a thirty-second clip are not the same price and must not share a
+  // gate. Priced off the SAME duration the generation will use.
+  let estimate;
+  try {
+    estimate = audioService.musicChargeEstimateUsd(
+      audioService.resolveMusicModel(req.body?.model),
+      req.body?.duration,
+    );
+  } catch (err) {
+    return sendMediaError(res, err, 'audio_music');
+  }
+  return checkCreditBalance(estimate)(req, res, next);
+};
+
+router.post(
+  '/audio/music',
+  apiRateLimiter,
+  requireDailyCap('musicGen'),
+  musicBalanceGate,
+  requireConcurrencySlot({ keyPrefix: 'apikey', cap: API_CONCURRENCY_CAP }),
+  async (req, res) => {
+    try {
+      const body = req.body || {};
+      const prompt = typeof body.input === 'string' ? body.input : body.prompt;
+      if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
+        return oaError(res, 400, '`input` text is required.', 'PROMPT_REQUIRED');
+      }
+
+      const { buffer, mimeType, model, durationSeconds, requestedSeconds } =
+        await audioService.generateMusic({
+          userId: req.userId,
+          prompt,
+          modelId: body.model,
+          duration: body.duration,
+          lyrics: body.lyrics,
+          // Defaulted to instrumental when absent rather than to falsy, exactly
+          // as the app route does: on MiniMax, "sing" with no lyrics and no
+          // optimizer is an unconditional upstream 422, so a caller that sends
+          // neither field must still get a track back.
+          instrumental: body.instrumental !== false,
+          // The chat-model rewrite in front of the generation (musicBriefService),
+          // on by default here as in the app. The requests it saves are the ones
+          // that name an artist — refused by the provider's IP checker AFTER the
+          // price has been quoted and the wait spent. A caller who wrote the
+          // brief for a specific endpoint and means it literally opts out with
+          // `refine_prompt: false`; that also skips its (small, separate) charge.
+          refinePrompt: body.refine_prompt !== false && body.refinePrompt !== false,
+          billingMarkup: billingService.apiMarkupFactor(),
+          origin: 'api',
+        });
+
+      res.setHeader('Content-Type', mimeType || 'audio/mpeg');
+      res.setHeader('Content-Length', buffer.length);
+      // Which model actually rendered it. `model` is optional on the way in and
+      // the account default can change under a caller who never sent one.
+      res.setHeader('X-Privateer-Model', model);
+      // Both numbers, because every model here treats `duration` as a hint
+      // rather than a contract: what came back, and what was asked for. A Lyria
+      // SKU *is* its length, takes no duration, and reports neither.
+      if (durationSeconds) res.setHeader('X-Privateer-Duration-Seconds', String(durationSeconds));
+      if (requestedSeconds) res.setHeader('X-Privateer-Requested-Seconds', String(requestedSeconds));
+      return res.send(buffer);
+    } catch (err) {
+      // A provider outage here is ours, not a bad prompt, and it takes 17 of the
+      // 19 music models down at the same instant — so it must answer
+      // MUSIC_UNAVAILABLE rather than MUSIC_FAILED (trying another model is the
+      // obvious next move and fails identically), and it must not answer in the
+      // provider's own vocabulary. Same translation the app route makes.
+      const falErr = falErrorFor(err, {
+        op: 'v1_audio_music',
+        unavailable: 'MUSIC_UNAVAILABLE',
+        timeout: 'MUSIC_TIMEOUT',
+        failed: 'MUSIC_FAILED',
+      });
+      if (falErr) {
+        err.statusCode = falErr.status;
+        err.code = falErr.code;
+      }
+      return sendMediaError(res, err, 'audio_music');
     }
   });
 

@@ -30,7 +30,8 @@
  *
  * Image generation:
  *   OpenRouter image models (FLUX, Recraft, OpenAI gpt-image, etc.) via
- *   chat/completions with modalities: ["image","text"].
+ *   chat/completions with a `modalities` request intersected with what the
+ *   model advertises (['image'] for draw-only models — see generateImage).
  *
  * Video generation:
  *   OpenRouter /api/v1/videos — async, job-based.
@@ -1129,9 +1130,9 @@ async function generateText(parts, options = {}) {
 }
 
 /**
- * Generate or edit an image via OpenRouter chat/completions with
- * modalities: ["image","text"]. Supports FLUX, Recraft, Stability, OpenAI
- * gpt-image / DALL·E, and any other OpenRouter-hosted image model.
+ * Generate or edit an image via OpenRouter chat/completions with a `modalities`
+ * request built per model (see the intersection below). Supports FLUX, Recraft,
+ * Stability, OpenAI gpt-image / DALL·E, and any other OpenRouter-hosted image model.
  *
  * @param {Array<string | { image: Buffer, mimeType: string }>} parts
  * @param {object} options  modelId, aspectRatio
@@ -1255,15 +1256,31 @@ async function generateImage(parts, options = {}) {
       : contentArray
   });
 
+  // What we want rides in `modalities`, and OpenRouter ROUTES on it: an endpoint
+  // must support EVERY requested modality, so the docs' suggested pair —
+  // ["image", "text"] — 404s the whole request on a draw-only model. E.g.
+  // bytedance-seed/seedream-5-0-pro advertises output_modalities ['image'] and
+  // answers "No endpoints found that support the requested output modalities:
+  // image, text" before any provider is even tried. Intersect the pair with what
+  // the model actually advertises: text stays on only when the model offers it
+  // (Gemini image models return prose alongside the picture), 'image' is the
+  // floor — this IS an image call, so even a malformed catalog row can't strip
+  // it — and a catalog miss (unreachable, or the model not yet listed) keeps the
+  // historical pair so nothing that worked before loses its accompanying text.
+  const advertised = await getImageModelOutputModalities(modelId);
+  const modalities = ['image', 'text'].filter(
+    (m) => m === 'image' || !advertised || advertised.includes(m)
+  );
+
   // Lifecycle markers (shape/metadata only, never prompt/content) so a stuck
   // image gen is diagnosable from server logs — this upstream call is where the
   // "Preparing image generation" hang lives when the provider is slow/down.
   const _t0 = Date.now();
-  logger.debug('[generateImage] calling OpenRouter:', { modelId, requireZdr: !!options.requireZdr });
+  logger.debug('[generateImage] calling OpenRouter:', { modelId, requireZdr: !!options.requireZdr, modalities });
   let data;
   try {
     data = await openRouterChat(messages, modelId, {
-      modalities: ['image', 'text'],
+      modalities,
       isMediaAction: true,
       requireZdr: options.requireZdr,
       ...buildOpenRouterAspectFields(modelId, options.aspectRatio, imageSize, options.transparentBackground),
@@ -2514,4 +2531,6 @@ module.exports = { generateText, generateTextStream, proxyChatCompletion, proxyR
   // og:image enrichment for source cards — also applied to the Brave web-search path.
   enrichWithImages,
   // Exported for regression tests (retiredModelAlias / videoKeyAffinity).
-  RETIRED_MODEL_ALIASES, fetchVideoWithEitherKey };
+  RETIRED_MODEL_ALIASES, fetchVideoWithEitherKey,
+  // Exported for regression tests (imageGenParams: the modalities intersection).
+  getImageModelOutputModalities, resetImageModelInfoCacheForTests };

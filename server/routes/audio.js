@@ -41,6 +41,10 @@ const { isFalAudioModel } = require('../data/falModels');
 // synthesized once and cached globally rather than re-bought on every tap.
 const voicePreviewStore = require('../services/voicePreviewStore');
 const { t, SUPPORTED } = require('../i18n');
+// Translating a fal outage into this router's own MUSIC_*/TTS_*/SFX_* codes.
+// Shared with the developer API (routes/v1.js), which owes callers the same
+// UNAVAILABLE-vs-FAILED distinction for the same failure.
+const { falErrorFor } = require('../utils/falErrors');
 
 const router = express.Router();
 
@@ -76,42 +80,6 @@ async function voiceGateBlocked(req, res) {
   }
 }
 
-/**
- * Map a fal failure onto the surface's own error code.
- *
- * fal now serves three of this file's four generation routes, and each one has
- * its own vocabulary the client already branches on (SFX_*, MUSIC_*, TTS_*).
- * Rather than teach every client three new provider-shaped codes, translate
- * here: an unset key, a rejected key, our own balance running dry and fal
- * throttling us are all *our* outage, and the user gets one "try again shortly".
- * The distinction survives in the log and in Sentry, because the remediations
- * are completely different.
- *
- * Returns null when the error isn't fal's, so the caller falls through to its
- * own handling. (/sfx keeps its longer inline version — it is the route the
- * enforcement test reads.)
- *
- * @returns {{ status: number, code: string } | null}
- */
-function falErrorFor(err, { op, unavailable, timeout, failed }) {
-  const code = err?.code;
-  if (code === 'FAL_UNCONFIGURED' || code === 'FAL_AUTH'
-    || code === 'FAL_BALANCE_EXHAUSTED' || code === 'FAL_RATE_LIMITED') {
-    if (code === 'FAL_BALANCE_EXHAUSTED') {
-      // Loud, and captured: this one silently disables the feature for every
-      // user at once, and nothing else in the system will notice.
-      Sentry.captureException(err, { level: 'error', tags: { op, reason: 'fal_balance' } });
-      logger.error(`[${op}] fal balance exhausted — this feature is down until it is topped up`);
-    }
-    return { status: 503, code: unavailable };
-  }
-  if (code === 'FAL_TIMEOUT') return { status: 504, code: timeout };
-  if (code === 'FAL_FAILED' || code === 'FAL_BAD_OUTPUT' || code === 'FAL_OUTPUT_TOO_LARGE'
-    || code === 'FAL_MODEL_UNSUPPORTED') {
-    return { status: 502, code: failed };
-  }
-  return null;
-}
 
 /**
  * The non-ZDR gate for speech, and the reason it exists.
