@@ -31,6 +31,7 @@
  */
 const crypto = require('crypto');
 const logger = require('../utils/logger');
+const { imageMimeFor, assertImageBytes } = require('../utils/imageBytes');
 const Sentry = require('@sentry/node');
 const inferenceService = require('./inferenceService');
 const billingService = require('./billingService');
@@ -365,7 +366,11 @@ function input3dImage(entry, index) {
       { statusCode: 413, code: 'IMAGE_TOO_LARGE' }
     );
   }
-  return { data: buffer.toString('base64'), mimeType, bytes: buffer.length };
+  // The bytes decide what this is, not the label: a data URI a provider cannot
+  // decode comes back as "failed to download the image" a minute and a
+  // reservation later. See utils/imageBytes.
+  assertImageBytes(buffer, `images[${index}]`);
+  return { data: buffer.toString('base64'), mimeType: imageMimeFor(buffer, mimeType), bytes: buffer.length };
 }
 
 /**

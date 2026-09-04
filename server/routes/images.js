@@ -23,7 +23,7 @@
 const express = require('express');
 const logger = require('../utils/logger');
 const router = express.Router();
-const { downloadFromS3, S3_CONFIG } = require('../services/cloud-services');
+const { downloadFromS3, S3_CONFIG, bucketTypeFromKey } = require('../services/cloud-services');
 const { authenticate } = require('../middleware/auth');
 const ChatNode = require('../models/chatNodeModel');
 const Chat = require('../models/chatModel');
@@ -54,24 +54,29 @@ router.get('*', async (req, res) => {
       }
     }
 
-    // Determine bucket from key path structure
-    let bucketType = 'user_uploads';
-    if (
-      storageRef.includes('/generated/') ||
-      storageRef.includes('/edited/') ||
-      storageRef.includes('/videos/') ||
-      storageRef.includes('ai_generated/')
-    ) {
-      bucketType = 'ai_generated';
-    }
+    // Which bucket holds it, from the key's own path. Shared with the Library
+    // and the deletion path rather than kept as a private copy — this route had
+    // the only version that knew about `/videos/`, and the versions that didn't
+    // were pointing reads (and deletes) at the wrong bucket.
+    const bucketType = bucketTypeFromKey(storageRef);
 
     // Look up attachment metadata to check if client-encrypted
     const attachmentMeta = await findAttachmentMeta(storageRef, req.user._id.toString());
 
-    const result = await downloadFromS3(storageRef, bucketType);
+    // `downloadFromS3` throws on any S3 error (including NoSuchKey) rather than
+    // returning {success:false}, so a ref that is not in the bucket has to be
+    // caught here — otherwise it falls through to the catch below and reports a
+    // 500 for what is really a missing object.
+    let result;
+    try {
+      result = await downloadFromS3(storageRef, bucketType);
+    } catch (dlErr) {
+      logger.warn('Media proxy: object unavailable', { storageRef, bucketType, error: dlErr.message });
+      return res.status(404).json({ message: 'Media not found' });
+    }
 
     if (!result.success) {
-      return res.status(404).json({ message: 'Image not found' });
+      return res.status(404).json({ message: 'Media not found' });
     }
 
     const isEncrypted = !!(attachmentMeta?.encIv);
@@ -141,6 +146,25 @@ async function findAttachmentMeta(storageRef, userId) {
     const att = chat.messages[0].imageAttachments.find(a => a.storageRef === storageRef);
     if (att) return att;
   }
+
+  // Generated videos live in the same proxy but in a different subdoc array.
+  // Without this arm an encrypted video is served as `image/jpeg` with no
+  // X-Enc-IV, so a client that has lost the IV has no way to recover it.
+  const videoChat = await Chat.findOne(
+    { userId, 'messages.videoAttachments.storageRef': storageRef },
+    { 'messages.$': 1 }
+  ).lean();
+  if (videoChat?.messages?.[0]?.videoAttachments) {
+    const att = videoChat.messages[0].videoAttachments.find(a => a.storageRef === storageRef);
+    if (att) return att;
+  }
+
+  const msg = await require('../models/messageModel').findOne(
+    { userId, 'videoAttachments.storageRef': storageRef },
+    { 'videoAttachments.$': 1 }
+  ).lean();
+  if (msg?.videoAttachments?.[0]) return msg.videoAttachments[0];
+
   return null;
 }
 

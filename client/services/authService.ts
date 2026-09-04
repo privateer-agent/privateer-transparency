@@ -774,6 +774,33 @@ class AuthService {
     this.trySyncOutboxKey();
   }
 
+  /**
+   * A 401 that survived the refresh. The SESSION is gone; the ACCOUNT is not.
+   *
+   * Deliberately does NOT call setAccountScope(null), and that is the whole point of
+   * this comment. The scope names whose data is on this device (internal/accountScope),
+   * and every on-device store hangs off it — including the per-file AES keys behind
+   * localStorageService.readLocal. Nulling it here pointed every one of those lookups at
+   * the `__none__` namespace, so a single expiry turned every local image, video and
+   * audio row into "No key found for local file: <id>" while the blobs and their keys
+   * sat untouched on disk under the real account.
+   *
+   * Nothing was destroyed by that — repairLocalFiles() lists under the SAME scope it
+   * key-checks, so `__none__` makes it a no-op rather than a deleter — and the next
+   * successful sign-in put the scope back. What it cost was every local image, video and
+   * audio row for the rest of the session, silently: many callers swallow the AuthError
+   * thrown above, so the app went on looking signed in while nothing on-device could be
+   * addressed, and the user was never told to sign in again.
+   *
+   * The scope belongs to the two events that actually change whose data this is:
+   * signing in (initialize / storeAuthData) and signing out (logout / deleteAccount),
+   * both of which set it explicitly. An expiry is neither — the same user is about to
+   * sign back in, and their namespace has to be waiting for them when they do.
+   *
+   * Key MATERIAL is still cleared below: the master key goes, so nothing encrypted under
+   * it can be read while signed out. What survives is only the ability to ADDRESS this
+   * account's own on-device files, which is exactly what has to survive.
+   */
   private async handleTokenExpiration(): Promise<void> {
     try {
       await Promise.all([
@@ -785,7 +812,6 @@ class AuthService {
       this.accessToken = null;
       this.refreshToken = null;
       this.user = null;
-      setAccountScope(null);
       resetOutboxKeyState();
       void clearOutboxResults();
       void import('./inboxBriefService').then((m) => m.clearInboxBriefs()).catch(() => {});
