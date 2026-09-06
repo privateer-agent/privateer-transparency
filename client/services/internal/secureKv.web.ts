@@ -102,9 +102,22 @@ export const secureKv = {
     if (!wrapped) return null;
     try {
       return await decryptValue(wrapped);
-    } catch {
-      // Wrap key rotated or value corrupted — drop the stale entry.
-      await tx(STORE_KV, 'readwrite', s => s.delete(key));
+    } catch (err) {
+      // Unreadable right now — the wrap key in `meta` is gone or was replaced,
+      // or WebCrypto refused. Report it as absent and LEAVE THE CIPHERTEXT
+      // ALONE.
+      //
+      // This used to delete the entry, which turned every transient failure
+      // into a permanent one and did it silently. The values in here are not
+      // caches: they include the per-file AES keys behind every local image,
+      // video and audio blob on the device, and those blobs have no server copy
+      // and no password recovery behind them (CLAUDE.md §2, §5). A wrap key
+      // that comes back — a `meta` store read that failed once, a key handle
+      // restored with the profile — cannot un-delete what this already threw
+      // away, and the caller sees the same `null` either way. Keeping the bytes
+      // costs a few hundred stale entries in the worst case; deleting them cost
+      // the user their media.
+      console.warn('[secureKv.web] value did not decrypt; keeping it in place:', key, err);
       return null;
     }
   },
