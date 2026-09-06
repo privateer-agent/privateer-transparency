@@ -89,9 +89,6 @@ const chatSchema = new mongoose.Schema(
       // E2EE: encrypted live weather snapshot (open-meteo) attached to assistant responses.
       // Decrypts to the WeatherData JSON shape consumed by WeatherCard.
       encryptedWeatherData: { type: String, default: null },
-      // E2EE: encrypted compose-text payload (toned message variations) attached to
-      // assistant responses. Decrypts to the ComposeData shape consumed by ComposeCard.
-      encryptedComposeData: { type: String, default: null },
       // E2EE: encrypted JSON snapshot of the user's image/video generation selections at send time.
       encryptedGenerationOptions: { type: String, default: null },
       // PII redaction metadata (non-sensitive): true when the user's turn had PII
