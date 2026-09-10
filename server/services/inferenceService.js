@@ -656,6 +656,12 @@ async function openRouterChat(messages, modelId, options = {}) {
   if (options.modalities) body.modalities = options.modalities;
   if (options.image_config) body.image_config = options.image_config;
 
+  // Ask for the provider's own accounting on the same response as the picture.
+  // Image models are the one place we cannot price from the catalog (see
+  // catalogImagePrice), and `usage.cost` is the real amount OpenRouter billed us
+  // for this generation. Free on the request; read by generateImage.
+  if (isImageGen) body.usage = { include: true };
+
   // PDF plugin for file parsing
   if (options.plugins) body.plugins = options.plugins;
 
@@ -1349,7 +1355,28 @@ async function generateImage(parts, options = {}) {
   }
 
   const inputTokens = data.usage?.prompt_tokens || 0;
-  return { images, responseText, inputTokens };
+
+  // What the provider actually charged us for this generation (`usage.cost`,
+  // requested by openRouterChat). Recorded per model so calcImageGenCost bills
+  // the real price instead of the catalog's estimate — for image models the
+  // catalog cannot express a per-image price at all (see catalogImagePrice), and
+  // before this every Gemini/FLUX generation fell through to the $0.0005 flat
+  // fee against a real cost of ~$0.067. Record under BOTH ids when an alias was
+  // healed, since callers price by the id they asked for.
+  const observedCostUsd = Number(data.usage?.cost);
+  if (Number.isFinite(observedCostUsd) && images.length > 0) {
+    recordObservedImagePrice(modelId, observedCostUsd, images.length);
+    if (options.modelId && options.modelId !== modelId) {
+      recordObservedImagePrice(options.modelId, observedCostUsd, images.length);
+    }
+  }
+
+  return {
+    images,
+    responseText,
+    inputTokens,
+    providerCostUsd: Number.isFinite(observedCostUsd) ? observedCostUsd : null,
+  };
 }
 
 /**
@@ -2533,4 +2560,7 @@ module.exports = { generateText, generateTextStream, proxyChatCompletion, proxyR
   // Exported for regression tests (retiredModelAlias / videoKeyAffinity).
   RETIRED_MODEL_ALIASES, fetchVideoWithEitherKey,
   // Exported for regression tests (imageGenParams: the modalities intersection).
-  getImageModelOutputModalities, resetImageModelInfoCacheForTests };
+  getImageModelOutputModalities, resetImageModelInfoCacheForTests,
+  // Exported for regression tests (imageGenPricing: image_output vs the legacy
+  // `pricing.image`, and the learned per-image price).
+  catalogImagePrice, recordObservedImagePrice };
