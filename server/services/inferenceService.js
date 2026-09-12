@@ -1704,6 +1704,14 @@ async function listSubscriptionCatalog() {
         provider: (m.id || '').split('/')[0] || 'unknown',
         ratePerInputToken: isFinite(prompt) ? prompt : 0,
         ratePerOutputToken: isFinite(completion) ? completion : 0,
+        // The model's real context window. Same expression the app's
+        // /api/models/openrouter route uses — `top_provider` is the fallback because
+        // some rows carry the window only on the routed provider. Published because a
+        // client that does not know it has to GUESS one: the Agent CLI registered
+        // every model at a flat 128000, and pi sizes each turn's answer budget as
+        // (window - prompt), so a larger-windowed model ran out of budget while it
+        // still had room. null when upstream omits it — the client keeps its default.
+        contextLength: m.context_length || m.top_provider?.context_length || null,
         enabled: true,
         privacy: { tier: 'zdr-enforced' },
       });
@@ -1730,6 +1738,9 @@ async function listSubscriptionCatalog() {
           provider: m.provider || (m.id || '').split('/')[0] || 'unknown',
           ratePerInputToken: perMTokenToRate(m.pricing?.promptPerMToken),
           ratePerOutputToken: perMTokenToRate(m.pricing?.completionPerMToken),
+          // Already shaped by each loader (nearModels/tinfoilModels/phalaModels all
+          // normalise their upstream's spelling to `contextLength`).
+          contextLength: m.contextLength || null,
           enabled: true,
           privacy: { tier: 'tee-unverified' },
         });
@@ -1773,6 +1784,9 @@ async function listEnabledModels() {
         provider: c.provider || (c.modelId || '').split('/')[0] || 'unknown',
         ratePerInputToken: c.ratePerInputToken ?? 0,
         ratePerOutputToken: c.ratePerOutputToken ?? 0,
+        // An admin row carries no window; null means "unknown", and a client that
+        // needs one falls back to its own default rather than to a wrong number.
+        contextLength: null,
         enabled: true,
         privacy: { tier: await privacyTierFor(c.modelId) },
       });
@@ -2552,7 +2566,7 @@ async function extractMemoryCandidates({ userMessage, aiResponse, existingMemori
   }
 }
 
-module.exports = { generateText, generateTextStream, proxyChatCompletion, proxyRequestBounds, withProxyPromptCacheHints, estimateTokens, calcOpenRouterCost, calcInferenceCost, calcImageGenCost, generateImage, submitVideoGeneration, getVideoModelRuntimeCaps, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, listSubscriptionCatalog, formatImageGenErrorForUser, formatVideoGenErrorForUser, isInvalidImageError, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
+module.exports = { generateText, generateTextStream, proxyChatCompletion, proxyRequestBounds, withProxyPromptCacheHints, estimateTokens, calcOpenRouterCost, fetchOpenRouterCost, fetchOpenRouterUsage, calcInferenceCost, calcImageGenCost, generateImage, submitVideoGeneration, getVideoModelRuntimeCaps, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, listSubscriptionCatalog, formatImageGenErrorForUser, formatVideoGenErrorForUser, isInvalidImageError, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
   // Shared formatting helpers reused by nearAiService (OpenAI-compatible NEAR path).
   NO_TABLES_DIRECTIVE, withNoTables, convertTablesToBullets, createStreamingTableConverter,
   // og:image enrichment for source cards — also applied to the Brave web-search path.

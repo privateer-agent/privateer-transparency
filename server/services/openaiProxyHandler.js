@@ -144,24 +144,27 @@ function deltaChars(parsed) {
 }
 
 /**
- * Reconstruct a usage object for a stream the client abandoned.
+ * Reconstruct a usage object for a turn the provider never priced for us.
  *
- * The provider reports usage in the FINAL chunk, so a turn cut short carries
- * none — and this used to mean the turn was simply not billed. It is the
- * opposite of free: OpenRouter has charged us for the entire prompt (the bulk of
- * an agent turn's cost — 99% of it on a long transcript) plus every token
- * generated before the cancel landed. An interrupt is also completely ordinary
- * on the surface this mostly serves: every Esc in the Agent CLI, every dropped
- * connection, every client-side tool-loop cancel took an unmetered turn, and the
- * balance never moved, so the pre-flight gate kept admitting the next one.
+ * The provider reports usage in the FINAL chunk, so any turn that does not reach
+ * that chunk carries none — and this used to mean the turn was simply not
+ * billed. That is the opposite of free: OpenRouter has charged us for the entire
+ * prompt (the bulk of an agent turn's cost — 99% of it on a long transcript)
+ * plus every token generated before the stream stopped. Both causes are ordinary
+ * on the surface this mostly serves: an interrupt (every Esc in the Agent CLI,
+ * every dropped connection, every client-side tool-loop cancel) AND a stream
+ * that ENDS early — an upstream that died mid-generation, which never emits the
+ * usage chunk because it never finished.
  *
  * The estimate is the same chars/4 heuristic `proxyRequestBounds` prices the
  * pre-flight gate with, applied to the prompt we sent and the bytes we actually
- * streamed back. It undercounts (the aborting read is dropped, and it cannot see
- * server-side reasoning tokens the provider billed but never emitted), which is
- * the direction to err: the alternative on the table is charging zero.
+ * streamed back. It undercounts (bytes in flight when the stream stopped are
+ * lost, and it cannot see server-side reasoning tokens the provider billed but
+ * never emitted), which is the direction to err: the alternative on the table is
+ * charging zero. It is the LAST resort — `settleUsage` prefers the provider's
+ * own report and OpenRouter's generation record ahead of it.
  */
-function estimateAbortedUsage(body, completionChars) {
+function estimateUnmeteredUsage(body, completionChars) {
   const { inputTokens } = inferenceService.proxyRequestBounds(body);
   // Same chars/4 as inferenceService.estimateTokens, applied to a count rather
   // than to text we deliberately never kept. Parity with it is pinned by
@@ -176,6 +179,57 @@ function estimateAbortedUsage(body, completionChars) {
   return { prompt_tokens: inputTokens, completion_tokens: completionTokens };
 }
 
+/**
+ * Is this a usage report we can bill from?
+ *
+ * Absent is not billable — but neither is *zeroed*, and that distinction is the
+ * whole point of this function. OpenRouter reports
+ * `{prompt_tokens: 0, completion_tokens: 0}` when it has no usage to report, and
+ * a truthiness check (`if (usage)`) reads that as a measurement and bills
+ * nothing: a turn with a usage object on the wire, and a $0 charge. Zero prompt
+ * tokens is also literally impossible for a request that carried messages, so
+ * 0/0 is always a missing report wearing a usage object.
+ */
+function hasBillableUsage(usage) {
+  if (!usage) return false;
+  const prompt = Number(usage.prompt_tokens) || 0;
+  const completion = Number(usage.completion_tokens) || 0;
+  return prompt > 0 || completion > 0;
+}
+
+/**
+ * The usage a finished turn is billed on, from the most authoritative source
+ * that has one:
+ *
+ *   1. the provider's own report (the stream's final chunk, or the response
+ *      body) — the normal case, and the only one that costs no lookup;
+ *   2. OpenRouter's record for the generation, when that report is missing or
+ *      zeroed. Recovery rather than a guess: it is the number OpenRouter billed
+ *      US, and it exists precisely when the final chunk never arrived;
+ *   3. a chars/4 estimate of the prompt and of what we streamed back.
+ *
+ * The reported usage always wins, and each fallback is only tried after the one
+ * above it came back with nothing billable, so no turn is ever priced twice or
+ * priced from a worse source than the one available.
+ */
+async function settleUsage({ reported, genId, requireZdr, modelId, body, completionChars, userId, kind, aborted }) {
+  if (hasBillableUsage(reported)) return { usage: reported, estimated: false };
+
+  const recovered = await inferenceService
+    .fetchOpenRouterUsage(genId, { requireZdr, modelId })
+    .catch(() => null);
+  if (hasBillableUsage(recovered)) {
+    logger.info('OpenAI-proxy turn had no usage — recovered it from the generation record', {
+      userId: String(userId), modelId, kind, genId,
+      inputTokens: recovered.prompt_tokens, outputTokens: recovered.completion_tokens, aborted: !!aborted,
+    });
+    return { usage: recovered, estimated: false };
+  }
+
+  const estimated = estimateUnmeteredUsage(body, completionChars);
+  return { usage: estimated, estimated: !!estimated };
+}
+
 // Bill the user after a completion. Never throws — a billing failure must not
 // corrupt an already-streamed response. CRITICAL: a completion that runs but
 // isn't charged is free inference, so every un-billed path here is made
@@ -185,13 +239,19 @@ async function billCompletion(userId, modelId, usage, ctx = {}) {
   const inputTokens = usage?.prompt_tokens || 0;
   const outputTokens = usage?.completion_tokens || 0;
 
-  // No usage AND nothing to estimate from. With include_usage forced upstream
-  // this is now a narrow case: a provider that omits the usage chunk, or an abort
-  // so early that neither a prompt nor a streamed byte can be counted. Either way
-  // it surfaces in monitoring rather than running free and silent.
+  // Nothing billable reached us: no token counts, no generation record to
+  // recover them from, and nothing measurable in the stream. With include_usage
+  // forced upstream this is a narrow case — a provider that omits the usage
+  // chunk on a stream that then ends before anything countable, or an abort so
+  // early that neither a prompt nor a streamed byte can be counted. Either way
+  // it surfaces in monitoring rather than running free and silent, and the
+  // extra context below is what makes it reconcilable: `genId` is the handle
+  // OpenRouter's own record can be read back with, and `completionChars` says
+  // how much was generated behind the missing number.
   if (!inputTokens && !outputTokens) {
     logger.warn('OpenAI-proxy completion had no usage — UNBILLED', {
       userId: String(userId), modelId, kind, stream: !!ctx.stream, aborted: !!ctx.aborted,
+      genId: ctx.genId || null, completionChars: ctx.completionChars ?? null,
     });
     Sentry.captureMessage('openai_proxy_unbilled_no_usage', {
       level: 'warning',
@@ -199,13 +259,18 @@ async function billCompletion(userId, modelId, usage, ctx = {}) {
         op: 'openai_proxy_bill', reason: 'no_usage', kind,
         stream: String(!!ctx.stream), aborted: String(!!ctx.aborted),
       },
-      extra: { userId: String(userId), modelId },
+      extra: {
+        userId: String(userId), modelId,
+        genId: ctx.genId || null, completionChars: ctx.completionChars ?? null,
+      },
     });
     return;
   }
 
   if (ctx.estimatedUsage) {
-    logger.info('OpenAI-proxy turn aborted before usage — billing an estimate', {
+    // Never reported by the provider — the row is flagged so reconciliation can
+    // tell a measured charge from an estimated one. See settleUsage.
+    logger.info('OpenAI-proxy turn had no usage — billing an estimate', {
       userId: String(userId), modelId, kind, inputTokens, outputTokens,
     });
   }
@@ -286,7 +351,13 @@ async function handleChatCompletion(req, res, opts = {}) {
 
     if (!isStream) {
       const json = await response.json();
-      await billCompletion(userId, effectiveModelId, json?.usage, { stream: false, kind });
+      const settled = await settleUsage({
+        reported: json?.usage, genId: json?.id, requireZdr, modelId: effectiveModelId,
+        body, completionChars: null, userId, kind, aborted: false,
+      });
+      await billCompletion(userId, effectiveModelId, settled.usage, {
+        stream: false, kind, estimatedUsage: settled.estimated, genId: json?.id,
+      });
       return res.json(json);
     }
 
@@ -301,6 +372,10 @@ async function handleChatCompletion(req, res, opts = {}) {
     const decoder = new TextDecoder();
     let sseBuffer = '';
     let usage = null;
+    // OpenRouter's generation id (`gen-…`): the handle its /generation record is
+    // retrievable by when the usage chunk never arrives. Only an OpenRouter-shaped
+    // id is kept, so the enclave paths never trigger a lookup (see settleUsage).
+    let genId = null;
     // Length only, never the text: this file persists billing metadata and
     // nothing else, and a character count is all the estimate below needs.
     let completionChars = 0;
@@ -324,6 +399,7 @@ async function handleChatCompletion(req, res, opts = {}) {
         try {
           const parsed = JSON.parse(raw);
           if (parsed.usage) usage = parsed.usage;
+          if (!genId && typeof parsed.id === 'string' && parsed.id.startsWith('gen-')) genId = parsed.id;
           completionChars += deltaChars(parsed);
         } catch { /* partial/non-JSON chunk — ignore */ }
       }
@@ -332,11 +408,18 @@ async function handleChatCompletion(req, res, opts = {}) {
     if (aborted) { try { await reader.cancel(); } catch (_) {} }
     res.end();
 
-    // An abandoned stream is billed on an estimate rather than waived — see
-    // estimateAbortedUsage. `usage` still wins whenever the provider sent it.
-    const estimated = !usage && aborted ? estimateAbortedUsage(body, completionChars) : null;
-    await billCompletion(userId, effectiveModelId, usage || estimated, {
-      stream: true, aborted, kind, estimatedUsage: !!estimated,
+    // A stream that ends without a usable usage chunk is settled on the best
+    // source that still has a number — the provider report, OpenRouter's
+    // generation record, or an estimate — see settleUsage. Deliberately NOT
+    // gated on `aborted`: a stream that ends early (an upstream that died
+    // mid-generation) reaches here with `aborted === false` and no usage, which
+    // is the same unbilled turn the abort path was fixed for.
+    const settled = await settleUsage({
+      reported: usage, genId, requireZdr, modelId: effectiveModelId,
+      body, completionChars, userId, kind, aborted,
+    });
+    await billCompletion(userId, effectiveModelId, settled.usage, {
+      stream: true, aborted, kind, estimatedUsage: settled.estimated, genId, completionChars,
     });
   } catch (err) {
     const status = err.statusCode || 500;
@@ -361,5 +444,6 @@ module.exports = {
   refuseIfUnaffordable,
   // Exported for test/abortedStreamBilling.test.js.
   deltaChars,
-  estimateAbortedUsage,
+  hasBillableUsage,
+  estimateUnmeteredUsage,
 };
