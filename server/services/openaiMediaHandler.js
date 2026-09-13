@@ -48,6 +48,7 @@ const {
   buildFal3dInput, fal3dOutputUrl, fal3dMime,
 } = require('../data/fal3dModels');
 const ApiMediaJob = require('../models/apiMediaJobModel');
+const { claimJobDelivery } = require('./mediaJobClaim');
 const ApiMediaArtifact = require('../models/apiMediaArtifactModel');
 
 const VIDEO_URL_TTL_SEC = Number(process.env.API_VIDEO_URL_TTL_SEC) || 3600;
@@ -267,19 +268,25 @@ async function handleVideoStatus(req, res) {
 
     if (status === 'completed' && Array.isArray(poll.unsigned_urls) && poll.unsigned_urls[0]) {
       // Atomically claim the completion so concurrent polls settle billing once.
-      const claimed = await ApiMediaJob.findOneAndUpdate(
-        { jobId, userId, status: { $in: ['queued', 'processing'] } },
-        { status: 'processing' },
-        { new: true }
-      );
+      // See services/mediaJobClaim.js — the inline version this replaces wrote the
+      // same status its own filter accepted, so every concurrent poll "claimed"
+      // and the `if (claimed)` settle below ran more than once per job.
+      const claimed = await claimJobDelivery(ApiMediaJob, { jobId, userId });
+      // Now that the claim is real, the losing poll actually reaches this — it
+      // used to be unreachable — so it has to stop here rather than fall through
+      // and download + upload a second copy of the same video. `processing` is the
+      // honest answer: the winner is mid-delivery, and the next poll takes the
+      // idempotent early return at the top of this handler with the finished URL.
+      if (!claimed) return res.json({ id: jobId, object: 'video.job', status: 'processing' });
       const { buffer, mimeType } = await inferenceService.downloadVideoBuffer(poll.unsigned_urls[0], { useZdrKey: job.usedZdrKey });
       const up = await uploadToS3(
         { buffer, mimetype: mimeType || 'video/mp4', originalname: `video.${extForMime(mimeType || 'video/mp4')}`, size: buffer.length },
         'ai_generated', String(userId), 'api/videos/'
       );
 
-      if (claimed) {
-        // Settle billing from the provider's reported cost (fallback flat).
+      // Settle billing from the provider's reported cost (fallback flat). Reached
+      // only by the poll that holds the claim, which is the point of the claim.
+      {
         const providerCostUsd = Number(poll?.usage?.cost ?? poll?.usage?.total_cost) || 0.5;
         const chargeUsd = videoChargeUsd(providerCostUsd);
         try {
