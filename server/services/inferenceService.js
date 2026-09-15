@@ -2348,6 +2348,57 @@ function formatVideoGenErrorForUser(err, { modelId } = {}) {
   return `I couldn't generate ${modelLabel}. Please try again or pick a different video model.`;
 }
 
+/**
+ * Translate a FAILED video job's provider reason into a sentence a user can act on.
+ *
+ * Distinct from formatVideoGenErrorForUser above, which explains a submit that
+ * never became a job. By the time THIS runs the clip has already rendered: the
+ * wait was real, the hold is being refunded, and the one thing the user is left
+ * with is this line — so it has to say what to do differently, not just what
+ * went wrong.
+ *
+ * MODERATION IS THE CASE WORTH NAMING. MiniMax answers with its own vocabulary
+ * and a bare number — `input new_sensitive (1026)` when its filter refuses the
+ * prompt, `output new_sensitive (1027)` when it refuses the finished video. Both
+ * reached the card verbatim, and neither names anything the reader can change.
+ * 1027 is the one that reads as a product bug rather than a content decision:
+ * the request was accepted, the minutes were spent, and the clip is withheld at
+ * the end — so it says plainly that the model's own filter held the video back
+ * and that another model may not.
+ *
+ * Plain text, no markdown: this lands in the video card's caption
+ * (MessageBubble's `vid.errorMessage`), which is a bare <Text> — asterisks would
+ * render as asterisks.
+ */
+function formatVideoJobFailureForUser(providerError, { modelId } = {}) {
+  const raw = typeof providerError === 'string' ? providerError.trim() : '';
+  const named = modelId ? `${modelId} ` : '';
+
+  // Numeric codes are matched with a boundary on both sides: a bare /1027/ also
+  // hits a frame count, a seed, or a timestamp that happens to contain it.
+  const isOutputModeration = /\boutput[\s_-]?(new[\s_-]?)?sensitive\b/i.test(raw) || /\b1027\b/.test(raw);
+  const isInputModeration = /\binput[\s_-]?(new[\s_-]?)?sensitive\b/i.test(raw) || /\b1026\b/.test(raw);
+
+  if (isOutputModeration) {
+    return `${named}finished the video and then its own content filter withheld it. `
+      + `Nothing about the request was rejected — the same prompt on a different video model usually works.`;
+  }
+  if (isInputModeration) {
+    return `${named}refused this prompt as against its content policy. `
+      + `Try rewording it, or pick a different video model.`;
+  }
+  // Unlabelled moderation wording, same advice, without asserting which side.
+  if (/\b(moderat\w*|safety|content polic\w*|sensitive|prohibited)\b/i.test(raw)) {
+    return `${named}rejected this video on its content policy. `
+      + `Try rewording the prompt, or pick a different video model.`;
+  }
+
+  const safe = scrubProviderText(raw);
+  if (safe) return safe;
+  if (raw) logger.warn('[getVideoStatus] unmapped provider failure', { modelId, raw });
+  return 'The video model could not finish this clip. Please try again, or pick a different video model.';
+}
+
 // ── Memory helpers ───────────────────────────────────────────────────────────
 //
 // Both helpers operate on plaintext that the client decrypts client-side and
@@ -2566,7 +2617,7 @@ async function extractMemoryCandidates({ userMessage, aiResponse, existingMemori
   }
 }
 
-module.exports = { generateText, generateTextStream, proxyChatCompletion, proxyRequestBounds, withProxyPromptCacheHints, estimateTokens, calcOpenRouterCost, fetchOpenRouterCost, fetchOpenRouterUsage, calcInferenceCost, calcImageGenCost, generateImage, submitVideoGeneration, getVideoModelRuntimeCaps, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, listSubscriptionCatalog, formatImageGenErrorForUser, formatVideoGenErrorForUser, isInvalidImageError, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
+module.exports = { generateText, generateTextStream, proxyChatCompletion, proxyRequestBounds, withProxyPromptCacheHints, estimateTokens, calcOpenRouterCost, fetchOpenRouterCost, fetchOpenRouterUsage, calcInferenceCost, calcImageGenCost, generateImage, submitVideoGeneration, getVideoModelRuntimeCaps, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, listSubscriptionCatalog, formatImageGenErrorForUser, formatVideoGenErrorForUser, formatVideoJobFailureForUser, isInvalidImageError, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
   // Shared formatting helpers reused by nearAiService (OpenAI-compatible NEAR path).
   NO_TABLES_DIRECTIVE, withNoTables, convertTablesToBullets, createStreamingTableConverter,
   // og:image enrichment for source cards — also applied to the Brave web-search path.
