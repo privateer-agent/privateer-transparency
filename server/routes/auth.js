@@ -46,10 +46,6 @@ const { authenticate } = require('../middleware/auth');
 const { sessionDeviceMeta } = require('../utils/sessionDeviceMeta');
 const { loginRateLimiter, registerRateLimiter, nonceLimiter, walletVerifyLimiter, resendVerificationLimiter, resetLimit, deviceApproveLimiter, sessionSpawnLimiter } = require('../middleware/rateLimiter');
 
-// Max concurrent live child (per-terminal) sessions a single machine login may
-// spawn. Bounds credential amplification: even with a leaked credential set, a
-// refresh token can't be turned into an unbounded fleet of billable sessions.
-const MAX_CHILD_SESSIONS_PER_FAMILY = Number(process.env.MAX_CHILD_SESSIONS_PER_FAMILY) || 16;
 // How long a terminal child may be offline before GET /auth/sessions prunes it.
 // Must sit comfortably above the relay's 60s presence TTL + 3s auto-reconnect so
 // a transient disconnect (lid close, wifi blip) is never mistaken for a close.
@@ -436,8 +432,12 @@ router.post('/refresh', async (req, res) => {
  *       (allowed to be expired — the refresh token is the liveness proof; the
  *       signed access JWT is a possession proof that raises the bar above
  *       "refresh token alone").
- * Plus: per-IP rate limit and a hard per-family cap on concurrent live children
- * so a leaked credential set can't be amplified into an unbounded billable fleet.
+ * There is deliberately NO cap on how many live children one machine login may
+ * hold: a per-family limit only ever bit real users (a terminal killed without
+ * its shutdown hook leaves its row alive for the rest of its TTL, so a handful
+ * of crashes took the whole account channel down). Amplification is bounded by
+ * the credentials themselves — both a live parent refresh token and a signed
+ * access token for the same account — plus the per-IP rate limit above.
  */
 router.post('/session/spawn', sessionSpawnLimiter, async (req, res) => {
   try {
@@ -469,22 +469,6 @@ router.post('/session/spawn', sessionSpawnLimiter, async (req, res) => {
 
     // A child can't itself parent more children — root the lineage at the device.
     const parentFamilyId = parent.parentFamilyId || parent.familyId || parent.jti;
-
-    // Anti-amplification: cap concurrent live children per machine login. Count
-    // DISTINCT child familyIds (a child rotating its access token creates extra
-    // UserSession rows under the same familyId — those must not inflate the count).
-    const liveChildFamilies = await UserSession.distinct('familyId', {
-      userId: parent.userId,
-      parentFamilyId,
-      revokedAt: null,
-      expiresAt: { $gt: new Date() },
-    });
-    if (liveChildFamilies.length >= MAX_CHILD_SESSIONS_PER_FAMILY) {
-      return res.status(429).json({
-        message: 'Too many active terminals for this device. Sign one out and try again.',
-        code: 'CHILD_SESSION_CAP',
-      });
-    }
 
     const label = typeof deviceLabel === 'string' && deviceLabel.trim()
       ? deviceLabel.trim().slice(0, 100)

@@ -35,12 +35,12 @@
  * handlers are literally the same functions — this file adds no behaviour — but
  * the two routers differ in the two things a router is for:
  *
- *   - CONCURRENCY. The agent pool ('agentjobs') exists so that a user driving
- *     several linked terminals doesn't serialize through the app's chat slots
- *     (see routes/agentMedia's header). Sending app traffic into it would undo
- *     exactly that: a mesh started in the studio would take a slot away from the
- *     terminal the same person has open. The app uses the app's pool, which is
- *     what `requireConcurrencySlot()` with no arguments means.
+ *   - CONCURRENCY. The agent routes hold NO concurrency slot at all — a ceiling
+ *     on in-flight terminal work is exactly what made driving several linked
+ *     terminals fail, and terminals are the product (see CLAUDE.md → Terminal
+ *     limits). The APP still meters itself against the tier's maxConcurrentJobs,
+ *     which is what `requireConcurrencySlot()` with no arguments means, so the
+ *     studio's own fan-out stays bounded.
  *   - BILLING ORIGIN. `req.mediaOrigin` tags the usage row and the job record so
  *     studio spend reports as app spend. Without it every mesh made in the app
  *     would be filed under the terminal.

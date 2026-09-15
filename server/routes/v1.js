@@ -77,7 +77,7 @@ const { search: braveSearch, SEARCH_COST_USD } = require('../services/braveSearc
 const linkAnalysisService = require('../services/linkAnalysisService');
 
 // Developer /v1 turns get their own concurrency pool ('apikey'), separate from
-// the app's chat slots and the Agent CLI's 'agentjobs' pool.
+// the app's chat slots (the Agent CLI routes hold no slot at all).
 const API_CONCURRENCY_CAP = Number(process.env.API_CONCURRENCY_CAP) || 8;
 
 // In-memory multipart parsing for OpenAI-style audio uploads (bounded).
