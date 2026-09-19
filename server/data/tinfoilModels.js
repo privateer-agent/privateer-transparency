@@ -70,13 +70,20 @@ function tinfoilBase() {
 // pure metadata (a delisted slug simply never comes back from /v1/models), and
 // keeping it means a re-listing renders with its real name instead of a
 // title-cased slug — exactly what happened to `kimi-k2-6` (delisted 2026-07-28,
-// relisted by 2026-08-03). Delisted as of 2026-08-03: `deepseek-v4-pro`,
-// `qwen3-vl-30b`. A delisted id a user may have *persisted* is a different
-// problem — that heals in inferenceService.RETIRED_MODEL_ALIASES.
+// relisted by 2026-08-03, delisted again by 2026-09-18 in favor of `kimi-k3`).
+// Delisted as of 2026-09-18 (confirmed absent from a live /v1/models fetch):
+// `deepseek-v4-pro` (→ `deepseek-v4-1-flash`, delisted 2026-08-03), `qwen3-vl-30b`
+// (delisted 2026-08-03, no direct replacement), `glm-5-2` (→ `glm-5-3`),
+// `kimi-k2-6` (→ `kimi-k3`). A delisted id a user may have *persisted* is a
+// different problem — that heals in inferenceService.RETIRED_MODEL_ALIASES.
 const MODEL_INFO = {
   'deepseek-v4-pro':        { name: 'DeepSeek V4 Pro',        description: 'Long-context reasoning, coding, math, and agentic tasks.' },
+  'deepseek-v4-1-flash':    { name: 'DeepSeek V4.1 Flash',    description: '1M-token context window, image input, and tool calling with built-in speculative decoding.' },
   'glm-5-2':                { name: 'GLM 5.2',                 description: 'Agentic engineering, long-horizon tool use, sustained reasoning.' },
+  'glm-5-3':                { name: 'GLM 5.3',                 description: 'Flagship agentic coding and long-horizon tool use with a 1M-token context window.' },
+  'glm-5-3-flash':          { name: 'GLM 5.3 Flash',           description: 'Fast multimodal MoE with image input, reasoning, and tool calling.' },
   'kimi-k2-6':              { name: 'Kimi K2.6',               description: 'Multimodal understanding (text + images) with strong tool calling.' },
+  'kimi-k3':                { name: 'Kimi K3',                 description: 'Hybrid-attention multimodal model for long-context reasoning, coding, and agentic workflows.' },
   'gemma4-31b':             { name: 'Gemma 4 31B',             description: 'Built-in thinking mode, image understanding, native function calling.' },
   'gpt-oss-120b':           { name: 'GPT-OSS 120B',            description: 'Configurable reasoning effort with full chain-of-thought access.' },
   'llama3-3-70b':           { name: 'Llama 3.3 70B',           description: 'Multilingual, dialogue-optimized, function calling.' },

@@ -809,6 +809,17 @@ const RETIRED_MODEL_ALIASES = {
   // rewrite a live confidential-vision pick to Gemma. If Tinfoil delists it
   // again, restore the mapping (Gemma 4 31B is the substitution that keeps both
   // implied properties: enclave compute and image input).
+  //
+  // Tinfoil delisted `glm-5-2` and `kimi-k2-6` again by 2026-09-18 (confirmed
+  // absent from a live /v1/models fetch), this time in favor of new slugs
+  // rather than a relisting — `glm-5-3` and `kimi-k3`. Both old ids were
+  // curated Recommended/Hero picks (see ModelPickerSheet.tsx before this
+  // change), so a persisted preferredModelId/preferredVisionModelId naming
+  // either would otherwise 404 with "not a valid model name or alias". Kimi K3
+  // keeps the implied property the old pick carried (multimodal), so the
+  // vision picker stays sound after the rewrite.
+  'tinfoil/glm-5-2': 'tinfoil/glm-5-3',
+  'tinfoil/kimi-k2-6': 'tinfoil/kimi-k3',
 };
 
 /**
