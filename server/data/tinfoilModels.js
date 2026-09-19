@@ -70,12 +70,14 @@ function tinfoilBase() {
 // pure metadata (a delisted slug simply never comes back from /v1/models), and
 // keeping it means a re-listing renders with its real name instead of a
 // title-cased slug — exactly what happened to `kimi-k2-6` (delisted 2026-07-28,
-// relisted by 2026-08-03, delisted again by 2026-09-18 in favor of `kimi-k3`).
+// relisted by 2026-08-03, delisted again by 2026-09-18 in favor of `kimi-k3`)
+// and now `deepseek-v4-1-flash` (delisted 2026-08-03, confirmed relisted in a
+// live /v1/models fetch 2026-09-19 — still marked `experimental` by Tinfoil).
 // Delisted as of 2026-09-18 (confirmed absent from a live /v1/models fetch):
-// `deepseek-v4-pro` (→ `deepseek-v4-1-flash`, delisted 2026-08-03), `qwen3-vl-30b`
-// (delisted 2026-08-03, no direct replacement), `glm-5-2` (→ `glm-5-3`),
-// `kimi-k2-6` (→ `kimi-k3`). A delisted id a user may have *persisted* is a
-// different problem — that heals in inferenceService.RETIRED_MODEL_ALIASES.
+// `deepseek-v4-pro`, `qwen3-vl-30b` (delisted 2026-08-03, no direct
+// replacement), `glm-5-2` (→ `glm-5-3`), `kimi-k2-6` (→ `kimi-k3`). A delisted
+// id a user may have *persisted* is a different problem — that heals in
+// inferenceService.RETIRED_MODEL_ALIASES.
 const MODEL_INFO = {
   'deepseek-v4-pro':        { name: 'DeepSeek V4 Pro',        description: 'Long-context reasoning, coding, math, and agentic tasks.' },
   'deepseek-v4-1-flash':    { name: 'DeepSeek V4.1 Flash',    description: '1M-token context window, image input, and tool calling with built-in speculative decoding.' },
