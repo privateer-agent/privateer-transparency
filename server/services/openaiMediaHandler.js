@@ -50,6 +50,7 @@ const {
 const ApiMediaJob = require('../models/apiMediaJobModel');
 const { claimJobDelivery } = require('./mediaJobClaim');
 const ApiMediaArtifact = require('../models/apiMediaArtifactModel');
+const { listTtsModels } = require('./ttsCatalog');
 
 const VIDEO_URL_TTL_SEC = Number(process.env.API_VIDEO_URL_TTL_SEC) || 3600;
 const IMAGE_URL_TTL_SEC = Number(process.env.API_IMAGE_URL_TTL_SEC) || 3600;
@@ -463,6 +464,51 @@ async function handleModel3dCatalog(req, res) {
   }
 }
 
+/**
+ * GET /v1/audio/models — every text-to-speech model this deployment can
+ * reach, each with the voices it actually offers.
+ *
+ * Same posture as GET /v1/models3d: routed before /audio/speech and behind NO
+ * entitlement or balance gate, because a caller deciding WHICH model and voice
+ * to send is exactly the caller who has not yet placed a billable call. Until
+ * this existed, the developer API had no way to learn a model's real voice ids
+ * at all — passing a bare name like 'jupiter' to Deepgram Aura-2 (whose ids
+ * are 'aura-2-<name>-<lang>') either 400'd with an opaque provider error or, if
+ * validation were ever loosened, could be served on the wrong voice silently.
+ * See services/ttsCatalog.js for where the list itself comes from.
+ */
+async function handleTtsCatalog(req, res) {
+  try {
+    const requireZdr = await resolveRequireZdr(req.userId, undefined);
+    const allowNonZdrMedia = await resolveAllowNonZdrMedia(req.userId, undefined);
+    const blocked = async (modelId) => {
+      try {
+        await assertMediaModelAllowed({ userId: req.userId, modelId, requireZdr, allowNonZdrMedia });
+        return false;
+      } catch (e) {
+        return e?.code === 'ZDR_MEDIA_BLOCKED';
+      }
+    };
+    const models = await listTtsModels(blocked);
+    const data = models.map((m) => ({
+      id: m.id,
+      object: 'tts_model',
+      owned_by: m.provider,
+      name: m.name,
+      is_zdr: m.isZdr,
+      is_tee: m.isTee,
+      blocked_by_zdr: m.blockedByZdr,
+      // The exact ids `voice` accepts on POST /v1/audio/speech for THIS model —
+      // empty when the provider publishes no enumerable set (see ttsCatalog.js).
+      voices: m.voices,
+    }));
+    return res.json({ object: 'list', data });
+  } catch (err) {
+    logger.error('GET /v1/audio/models failed:', err.message);
+    return oaError(res, 500, 'Failed to fetch the text-to-speech model list.', 'MODELS_UNAVAILABLE');
+  }
+}
+
 // POST /v1/models3d — submit an async image-to-mesh job.
 // { image | images[], model, format, axes, generate_type, polygon_type, face_count, pbr, requireZdr }
 async function handleModel3dSubmit(req, res) {
@@ -714,6 +760,7 @@ module.exports = {
   handleModel3dCatalog,
   handleModel3dSubmit,
   handleModel3dStatus,
+  handleTtsCatalog,
   // Exported for test/v1Model3d.test.js — pure input decoding, asserted without
   // touching fal, S3 or Mongo.
   input3dImage,

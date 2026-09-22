@@ -125,6 +125,77 @@ const OPENAI_TO_GEMINI_VOICE = {
   coral: 'Kore', sage: 'Iapetus', verse: 'Fenrir',
 };
 
+// Deepgram Aura-2's full voice catalog, `aura-2-<name>-<lang>` — mirrors the
+// keys in client/constants/voiceProfiles.ts (source of the descriptions; this
+// is the ids only). Keep the two lists in sync.
+//
+// Every name below appears at exactly one language suffix — pinned by the
+// dedupe check `resolveVoice.test.js` runs over this array — which is what
+// makes AURA2_VOICE_BY_NAME an unambiguous map rather than a guess: 'jupiter'
+// can only ever mean 'aura-2-jupiter-en', never a second row at another `-xx`.
+const AURA2_VOICES = [
+  'aura-2-amalthea-en', 'aura-2-andromeda-en', 'aura-2-apollo-en', 'aura-2-arcas-en',
+  'aura-2-aries-en', 'aura-2-asteria-en', 'aura-2-athena-en', 'aura-2-atlas-en',
+  'aura-2-aurora-en', 'aura-2-callista-en', 'aura-2-cora-en', 'aura-2-cordelia-en',
+  'aura-2-delia-en', 'aura-2-draco-en', 'aura-2-electra-en', 'aura-2-harmonia-en',
+  'aura-2-helena-en', 'aura-2-hera-en', 'aura-2-hermes-en', 'aura-2-hyperion-en',
+  'aura-2-iris-en', 'aura-2-janus-en', 'aura-2-juno-en', 'aura-2-jupiter-en',
+  'aura-2-luna-en', 'aura-2-mars-en', 'aura-2-minerva-en', 'aura-2-neptune-en',
+  'aura-2-odysseus-en', 'aura-2-ophelia-en', 'aura-2-orion-en', 'aura-2-orpheus-en',
+  'aura-2-pandora-en', 'aura-2-phoebe-en', 'aura-2-pluto-en', 'aura-2-saturn-en',
+  'aura-2-selene-en', 'aura-2-thalia-en', 'aura-2-theia-en', 'aura-2-vesta-en',
+  'aura-2-zeus-en',
+  'aura-2-agustina-es', 'aura-2-alvaro-es', 'aura-2-antonia-es', 'aura-2-aquila-es',
+  'aura-2-carina-es', 'aura-2-celeste-es', 'aura-2-diana-es', 'aura-2-estrella-es',
+  'aura-2-gloria-es', 'aura-2-javier-es', 'aura-2-luciano-es', 'aura-2-nestor-es',
+  'aura-2-olivia-es', 'aura-2-selena-es', 'aura-2-silvia-es', 'aura-2-sirio-es',
+  'aura-2-valerio-es',
+  'aura-2-beatrix-nl', 'aura-2-cornelia-nl', 'aura-2-daphne-nl', 'aura-2-hestia-nl',
+  'aura-2-lars-nl', 'aura-2-leda-nl', 'aura-2-rhea-nl', 'aura-2-roman-nl',
+  'aura-2-sander-nl',
+  'aura-2-agathe-fr', 'aura-2-hector-fr',
+  'aura-2-aurelia-de', 'aura-2-elara-de', 'aura-2-fabian-de', 'aura-2-julius-de',
+  'aura-2-kara-de', 'aura-2-lara-de', 'aura-2-viktoria-de',
+  'aura-2-cesare-it', 'aura-2-cinzia-it', 'aura-2-demetra-it', 'aura-2-dionisio-it',
+  'aura-2-elio-it', 'aura-2-flavio-it', 'aura-2-livia-it', 'aura-2-maia-it',
+  'aura-2-melia-it',
+  'aura-2-ama-ja', 'aura-2-ebisu-ja', 'aura-2-fujin-ja', 'aura-2-izanami-ja',
+  'aura-2-uzume-ja',
+];
+const AURA2_MODEL_ID = 'deepgram/aura-2';
+// Used when no voice is given. Matches the app's voice-mode fallback speaker
+// (client/services/modelService.ts VOICE_MODE_TTS_FALLBACK_SPEAKER), so an
+// unspecified voice sounds the same from the app and from the API.
+const AURA2_DEFAULT_VOICE = 'aura-2-thalia-en';
+const AURA2_VOICE_SET = new Set(AURA2_VOICES);
+// Bare name ('jupiter') → full wire id ('aura-2-jupiter-en'), lower-cased key.
+const AURA2_VOICE_BY_NAME = new Map(
+  AURA2_VOICES.map((id) => [id.slice('aura-2-'.length, id.lastIndexOf('-')), id]),
+);
+
+/**
+ * `voice` for `aura-2-…`  →  the exact wire id, or throws VOICE_UNSUPPORTED.
+ *
+ * Deepgram's own /v1/audio/speech 400s on an unrecognised voice, but that
+ * error reaches us as an opaque upstream body (TTS_FAILED) after a submitted,
+ * billable request — so a name typo or a bare name sent where the wire wants
+ * `aura-2-<name>-<lang>` looked identical to a real provider outage. This
+ * validates BEFORE the call, the same contract falResolveVoice already gives
+ * fal's voice models (see below): a wrong name refuses immediately with
+ * VOICE_UNSUPPORTED, a right one — bare ('jupiter') or full
+ * ('aura-2-jupiter-en') — resolves to one exact id.
+ */
+function resolveAura2Voice(voice) {
+  if (!voice || typeof voice !== 'string') return AURA2_DEFAULT_VOICE;
+  const lower = voice.toLowerCase();
+  if (AURA2_VOICE_SET.has(lower)) return lower;
+  const byName = AURA2_VOICE_BY_NAME.get(lower);
+  if (byName) return byName;
+  throw Object.assign(new Error(`${voice} is not a voice of ${AURA2_MODEL_ID}`), {
+    statusCode: 400, code: 'VOICE_UNSUPPORTED', modelId: AURA2_MODEL_ID,
+  });
+}
+
 // Resolve the wire voice for a given model. Voice names are strictly per-model
 // family, so this must never hand one family's name to another.
 //
@@ -143,6 +214,11 @@ function resolveVoice(voice, model) {
     if (voice && presets.includes(voice)) return voice;
     return presets[0] || '';
   }
+  // Same story again, on OpenRouter rather than fal: Aura-2's 90 voices are
+  // real ids of the shape `aura-2-<name>-<lang>`, not the bare name a person
+  // (or an agent guessing from the character list) would type — validate and
+  // expand it here rather than letting a bare 'jupiter' ride to Deepgram raw.
+  if (model === AURA2_MODEL_ID) return resolveAura2Voice(voice);
   if (typeof model === 'string' && model.startsWith('openai/')) return voice || 'alloy';
   if (!voice || typeof voice !== 'string') return DEFAULT_TTS_VOICE;
   return OPENAI_TO_GEMINI_VOICE[voice.toLowerCase()] || voice;
@@ -369,7 +445,10 @@ async function transcribe({ userId, audioBase64, format, language, modelId, requ
 }
 
 /**
- * Synthesize speech → { buffer, mimeType, model }. Bills 'tts' in the
+ * Synthesize speech → { buffer, mimeType, model, voice }. `voice` is the exact
+ * wire value sent to the provider (post-`resolveVoice` — e.g. a bare 'jupiter'
+ * resolves to 'aura-2-jupiter-en'), so a caller can report back what actually
+ * spoke rather than echoing what was merely requested. Bills 'tts' in the
  * background. Throws {statusCode,code} on bad input / provider failure.
  */
 async function synthesizeSpeech({ userId, text, voice, format, modelId, requireZdr = true, billingMarkup, origin = 'app' }) {
@@ -398,7 +477,7 @@ async function synthesizeSpeech({ userId, text, voice, format, modelId, requireZ
     chargeAudio(userId, falAudioCostUsd(model, { chars: input.length }), {
       model, kind: 'tts', markup: billingMarkup, origin,
     }).catch(() => {});
-    return { buffer, mimeType, model };
+    return { buffer, mimeType, model, voice: wireVoice };
   }
 
   let r;
@@ -454,7 +533,7 @@ async function synthesizeSpeech({ userId, text, voice, format, modelId, requireZ
       markup: billingMarkup, origin, fallbackChars: input.length,
     }).catch(() => { /* alerted inside */ });
   }
-  return { buffer, mimeType, model };
+  return { buffer, mimeType, model, voice: wireVoice };
 }
 
 /**
@@ -1129,6 +1208,11 @@ module.exports = {
   DEFAULT_STT_MODEL,
   DEFAULT_TTS_MODEL,
   DEFAULT_TTS_VOICE,
+  // Exported so media_capabilities can tell an agent Aura-2's real voice ids
+  // (§ handleAgentMediaCapabilities) instead of leaving it to guess a bare
+  // name the wire never accepts.
+  AURA2_MODEL_ID,
+  AURA2_VOICES,
   DEFAULT_MUSIC_MODEL,
   MUSIC_MODELS,
   MUSIC_PROMPT_MAX,

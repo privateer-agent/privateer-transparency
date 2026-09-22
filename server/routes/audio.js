@@ -138,17 +138,24 @@ router.post('/transcribe', authenticate, async (req, res) => {
 });
 
 // ── POST /api/audio/speech ────────────────────────────────────────────────────
-// body: { text, ttsModelId?, voice?, format?, requireZdr? }  →  { audioBase64, mimeType }
+// body: { text, ttsModelId?, voice?, format?, requireZdr? }
+//   → { audioBase64, mimeType, model, voice }
+//
+// `model`/`voice` echo what was ACTUALLY sent to the provider (post-resolution —
+// see resolveVoice), not just what the caller asked for. The agent's
+// generate_speech tool reports these back to whoever is driving it; without
+// them a caller who passed an override has no way to confirm the request
+// wasn't silently served on a different model or voice.
 router.post('/speech', authenticate, async (req, res) => {
   try {
     if (await voiceGateBlocked(req, res)) return;
     const { text, ttsModelId, voice, format } = req.body || {};
     if (await ttsZdrBlocked(req, res, ttsModelId)) return;
     const requireZdr = await audioService.resolveRequireZdr(req.user._id, req.body?.requireZdr);
-    const { buffer, mimeType } = await audioService.synthesizeSpeech({
+    const { buffer, mimeType, model, voice: wireVoice } = await audioService.synthesizeSpeech({
       userId: req.user._id, text, voice, format, modelId: ttsModelId, requireZdr,
     });
-    return res.json({ audioBase64: buffer.toString('base64'), mimeType });
+    return res.json({ audioBase64: buffer.toString('base64'), mimeType, model, voice: wireVoice });
   } catch (err) {
     if (err?.code === 'TEXT_REQUIRED') return res.status(400).json({ message: req.t('errors.textRequired') });
     if (err?.code === 'TTS_FAILED') return res.status(502).json({ message: req.t('errors.ttsFailed'), code: 'TTS_FAILED' });

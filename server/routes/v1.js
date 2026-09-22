@@ -35,6 +35,7 @@
  *   POST /v1/models3d               — submit an async image-to-mesh job (Privateer ext.)
  *   GET  /v1/models3d/:id           — poll a 3D job; returns a signed URL
  *   POST /v1/audio/transcriptions   — speech-to-text (OpenAI shape, multipart)
+ *   GET  /v1/audio/models           — list TTS models and their voice ids (Privateer ext.)
  *   POST /v1/audio/speech           — text-to-speech (OpenAI shape, audio bytes)
  *   POST /v1/audio/sfx              — sound effects (Privateer ext., audio bytes)
  *   POST /v1/audio/music            — music generation (Privateer ext., audio bytes)
@@ -58,6 +59,7 @@ const { handleChatCompletion } = require('../services/openaiProxyHandler');
 const {
   handleImageGeneration, handleVideoSubmit, handleVideoStatus,
   handleModel3dCatalog, handleModel3dSubmit, handleModel3dStatus,
+  handleTtsCatalog,
 } = require('../services/openaiMediaHandler');
 const {
   handleSpriteCatalog, handleSpritePack, handleSpriteGenerate, handleSpriteStatus,
@@ -224,6 +226,10 @@ router.post(
 );
 
 // ── Audio: text-to-speech (returns raw audio bytes) ───────────────────────────
+// Listed BEFORE the generate route and carrying none of its gates, same as
+// /models3d above: a caller choosing a model and voice has not yet placed a
+// billable call, and reading the list must not require a credit balance.
+router.get('/audio/models', apiRateLimiter, handleTtsCatalog);
 router.post(
   '/audio/speech',
   apiRateLimiter,
@@ -242,12 +248,17 @@ router.post(
     // unsupported combination downgrades the container instead of 400ing.
     const format = body.response_format === 'pcm' ? 'pcm' : 'mp3';
     const requireZdr = await audioService.resolveRequireZdr(req.userId, body.requireZdr);
-    const { buffer, mimeType } = await audioService.synthesizeSpeech({
+    const { buffer, mimeType, model, voice } = await audioService.synthesizeSpeech({
       userId: req.userId, text, voice: body.voice, format, modelId: body.model, requireZdr,
       billingMarkup: billingService.apiMarkupFactor(), origin: 'api',
     });
     res.setHeader('Content-Type', mimeType || 'audio/mpeg');
     res.setHeader('Content-Length', buffer.length);
+    // What actually ran, not just what was requested — see GET /audio/models
+    // for the legal `voice` ids per model, same header convention /audio/music
+    // already uses for X-Privateer-Model below.
+    res.setHeader('X-Privateer-Model', model);
+    if (voice) res.setHeader('X-Privateer-Voice', voice);
     return res.send(buffer);
   } catch (err) {
     return sendMediaError(res, err, 'audio_speech');
