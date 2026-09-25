@@ -276,9 +276,11 @@ async function billCompletion(userId, modelId, usage, ctx = {}) {
   }
 
   try {
-    const { costUsd, providerCostUsd } = await inferenceService.calcInferenceCost(
-      modelId, inputTokens, outputTokens
-    );
+    // Priced from the provider's own cost / cache-read counts where it gave
+    // them — a warm agent turn is almost all cache. See priceUsage.
+    const { costUsd, providerCostUsd } = await inferenceService.priceUsage(modelId, {
+      inputTokens, outputTokens, ...inferenceService.usageFacts(usage), estimated: !!ctx.estimatedUsage,
+    });
     // Same policy the pre-flight estimate used — see billedCostFor.
     const billedUsd = billedCostFor(kind, { costUsd, providerCostUsd });
     // Attribute the spend to its surface for the usage summary: developer API

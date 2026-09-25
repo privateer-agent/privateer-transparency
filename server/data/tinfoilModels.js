@@ -269,6 +269,7 @@ async function _fetchTinfoilModels() {
     classified.map(({ m }) => [m.id, {
       promptPerToken: perTokenFromPer1M(m.pricing?.inputTokenPricePer1M),
       completionPerToken: perTokenFromPer1M(m.pricing?.outputTokenPricePer1M),
+      cacheReadPerToken: perTokenFromPer1M(m.pricing?.cachedInputTokenPricePer1M),
       perRequest: typeof m.pricing?.requestPrice === 'number' ? m.pricing.requestPrice : null,
     }])
   );

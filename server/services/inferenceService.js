@@ -1115,7 +1115,8 @@ async function generateText(parts, options = {}) {
     const text = convertTablesToBullets(rawText);
     const inputTokens = data.usage?.prompt_tokens || 0;
     const outputTokens = data.usage?.completion_tokens || 0;
-    const { costUsd, providerCostUsd } = await calcOpenRouterCost(modelId, data.id, inputTokens, outputTokens);
+    // Cache hits bill at the provider's reported cost, not list input rate.
+    const { costUsd, providerCostUsd } = await priceUsage(modelId, { inputTokens, outputTokens, ...usageFacts(data.usage) });
     const sources = await enrichWithImages(extractWebCitations(data.choices[0]?.message?.annotations));
     return { text, inputTokens, outputTokens, costUsd, providerCostUsd, sources };
   };
@@ -1895,6 +1896,11 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
   const decoder = new TextDecoder();
   let inputTokens = 0;
   let outputTokens = 0;
+  // Cache reads and the provider's reported cost, summed across requests like
+  // the token counts. The reported cost is only usable if EVERY request carried
+  // one — a partial sum would under-bill — so one miss drops it (null).
+  let cachedTokens = 0;
+  let reportedCostUsd = 0;
   // Set when the upstream stream failed mid-flight AFTER content had already been
   // delivered — the reply is salvaged as a truncated partial instead of throwing
   // the whole turn away (see the readErr catch in streamOnce).
@@ -2002,6 +2008,7 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
     // into the cross-request totals once the request completes.
     let reqInput = 0;
     let reqOutput = 0;
+    let reqFacts = { cachedTokens: 0, reportedCostUsd: null };
 
     outer: while (true) {
       // Caller aborted (speculative divert): stop reading and return what we have.
@@ -2057,6 +2064,7 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
           if (parsed.usage) {
             reqInput = parsed.usage.prompt_tokens || reqInput;
             reqOutput = parsed.usage.completion_tokens || reqOutput;
+            reqFacts = usageFacts(parsed.usage);
           }
         } catch { /* skip malformed chunk */ }
       }
@@ -2066,6 +2074,9 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
     // tokens, so both must be billed across all requests.
     inputTokens += reqInput;
     outputTokens += reqOutput;
+    cachedTokens += reqFacts.cachedTokens;
+    reportedCostUsd = reportedCostUsd != null && reqFacts.reportedCostUsd != null
+      ? reportedCostUsd + reqFacts.reportedCostUsd : null;
     return finishReason;
   };
 
@@ -2109,7 +2120,7 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
     personaGuard.end();
   }
 
-  const { costUsd, providerCostUsd } = await calcOpenRouterCost(effectiveModelId, null, inputTokens, outputTokens);
+  const { costUsd, providerCostUsd } = await priceUsage(effectiveModelId, { inputTokens, outputTokens, cachedTokens, reportedCostUsd });
   const sources = await enrichWithImages(extractWebCitations(Array.from(annotationsById.values())));
   // `truncated` is true when the reply is incomplete for either reason: it was
   // still length-capped after the continuation budget ran out, OR the upstream
@@ -2628,7 +2639,7 @@ async function extractMemoryCandidates({ userMessage, aiResponse, existingMemori
   }
 }
 
-module.exports = { generateText, generateTextStream, proxyChatCompletion, proxyRequestBounds, withProxyPromptCacheHints, estimateTokens, calcOpenRouterCost, fetchOpenRouterCost, fetchOpenRouterUsage, calcInferenceCost, calcImageGenCost, generateImage, submitVideoGeneration, getVideoModelRuntimeCaps, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, listSubscriptionCatalog, formatImageGenErrorForUser, formatVideoGenErrorForUser, formatVideoJobFailureForUser, isInvalidImageError, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
+module.exports = { generateText, generateTextStream, proxyChatCompletion, proxyRequestBounds, withProxyPromptCacheHints, estimateTokens, calcOpenRouterCost, fetchOpenRouterCost, fetchOpenRouterUsage, calcInferenceCost, priceUsage, usageFacts, applyReportedCost, calcImageGenCost, generateImage, submitVideoGeneration, getVideoModelRuntimeCaps, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, listSubscriptionCatalog, formatImageGenErrorForUser, formatVideoGenErrorForUser, formatVideoJobFailureForUser, isInvalidImageError, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
   // Shared formatting helpers reused by nearAiService (OpenAI-compatible NEAR path).
   NO_TABLES_DIRECTIVE, withNoTables, convertTablesToBullets, createStreamingTableConverter,
   // og:image enrichment for source cards — also applied to the Brave web-search path.

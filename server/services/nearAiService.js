@@ -303,7 +303,8 @@ async function generateText(parts, options = {}) {
     const text = convertTablesToBullets(rawText);
     const inputTokens = data.usage?.prompt_tokens || 0;
     const outputTokens = data.usage?.completion_tokens || 0;
-    const { costUsd, providerCostUsd } = await calcNearCost(modelId, inputTokens, outputTokens);
+    const cachedTokens = data.usage?.prompt_tokens_details?.cached_tokens || 0;
+    const { costUsd, providerCostUsd } = await calcNearCost(modelId, inputTokens, outputTokens, { cachedTokens });
     return { text, inputTokens, outputTokens, costUsd, providerCostUsd, sources: [] };
   } catch (err) {
     if (!err.__sentryReported) {
@@ -357,6 +358,7 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
   let buffer = '';
   let inputTokens = 0;
   let outputTokens = 0;
+  let cachedTokens = 0;
   let sawContent = false;
   // Set when the stream failed mid-flight after content was already delivered —
   // the partial is salvaged as a truncated reply instead of throwing the turn.
@@ -398,6 +400,7 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
           if (parsed.usage) {
             inputTokens = parsed.usage.prompt_tokens || inputTokens;
             outputTokens = parsed.usage.completion_tokens || outputTokens;
+            cachedTokens = parsed.usage.prompt_tokens_details?.cached_tokens || cachedTokens;
           }
         } catch { /* skip malformed chunk */ }
       }
@@ -432,7 +435,7 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
     throw asProviderError(`${modelId} returned an empty reply. Please try again or choose a different model.`, modelId);
   }
 
-  const { costUsd, providerCostUsd } = await calcNearCost(modelId, inputTokens, outputTokens);
+  const { costUsd, providerCostUsd } = await calcNearCost(modelId, inputTokens, outputTokens, { cachedTokens });
   return { inputTokens, outputTokens, costUsd, providerCostUsd, sources: [], truncated: interrupted, interrupted };
 }
 
