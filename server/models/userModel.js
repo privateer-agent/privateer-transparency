@@ -386,7 +386,18 @@ const userSchema = new mongoose.Schema(
     // to substitute a different outbox key (only the master-key holder can produce this
     // signature). Write-once alongside the key; backfillable once if an older client
     // published the key before signatures existed.
-    outboxPublicKeySig: { type: String, default: null }
+    outboxPublicKeySig: { type: String, default: null },
+    // This account's own referral code — the ?ref= on the link it shares.
+    // Minted lazily the first time the account opens its referral card
+    // (referralService.getOrCreateCode), so most accounts never carry one.
+    // Deliberately NO default: the unique index below is partial on
+    // $type string, and an explicit null would still be indexed.
+    referralCode: { type: String, uppercase: true, trim: true },
+    // Referral rewards this account has been paid. The per-referrer cap's
+    // state: referralService wins a slot with a conditional $inc on this
+    // counter, which is what keeps two friends topping up at the same moment
+    // from paying out an 11th reward. Not writable from any route.
+    referralRewardCount: { type: Number, default: 0, min: 0 }
   },
   { timestamps: true }
 );
@@ -405,6 +416,12 @@ userSchema.index({ 'subscription.apple.originalTransactionId': 1 }, { unique: tr
 userSchema.index(
   { overQuotaSince: 1 },
   { partialFilterExpression: { overQuotaSince: { $type: 'date' } } }
+);
+
+// Referral link lookup. Partial, not sparse — see the referralCode comment.
+userSchema.index(
+  { referralCode: 1 },
+  { unique: true, partialFilterExpression: { referralCode: { $type: 'string' } } }
 );
 
 userSchema.pre('save', async function(next) {
