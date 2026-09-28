@@ -44,13 +44,14 @@ const relayHub = require('../services/relayHub');
 const { signalRevokedTerminals, signalAllTerminals } = require('../services/sessionRevocation');
 const { authenticate } = require('../middleware/auth');
 const { sessionDeviceMeta } = require('../utils/sessionDeviceMeta');
-const { loginRateLimiter, registerRateLimiter, nonceLimiter, walletVerifyLimiter, resendVerificationLimiter, resetLimit, deviceApproveLimiter, sessionSpawnLimiter } = require('../middleware/rateLimiter');
+const { loginRateLimiter, registerRateLimiter, nonceLimiter, walletVerifyLimiter, resendVerificationLimiter, passwordResetRequestLimiter, passwordResetConfirmLimiter, resetLimit, deviceApproveLimiter, sessionSpawnLimiter } = require('../middleware/rateLimiter');
 
 // How long a terminal child may be offline before GET /auth/sessions prunes it.
 // Must sit comfortably above the relay's 60s presence TTL + 3s auto-reconnect so
 // a transient disconnect (lid close, wifi blip) is never mistaken for a close.
 const TERMINAL_PRUNE_GRACE_MS = Number(process.env.TERMINAL_PRUNE_GRACE_MS) || 3 * 60 * 1000;
 const { validateEmail, passwordProblem } = require('../services/validation');
+const accountReset = require('../services/accountReset');
 const Sentry = require('@sentry/node');
 
 // ---------------------------------------------------------------------------
@@ -71,6 +72,8 @@ function sanitizeUser(user) {
     walletChain: user.walletChain || (user.solanaPublicKey ? 'solana' : null),
     kekSource: user.kekSource || null,
     outboxPublicKey: user.outboxPublicKey || null,
+    // Folded into the client's on-device namespace — see userModel.vaultEpoch.
+    vaultEpoch: user.vaultEpoch || 0,
   };
 }
 
@@ -878,6 +881,208 @@ router.post('/change-password', authenticate, async (req, res) => {
     Sentry.captureException(error, { tags: { op: 'auth_change_password' } });
     logger.error('Change password error:', error);
     res.status(500).json({ message: 'Error changing password' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Password Reset (email link — DESTROYS the account's content)
+// ---------------------------------------------------------------------------
+//
+// A reset cannot recover data: the old password was the only way to unwrap the
+// master key. So the flow is "prove you own the email, choose a new password,
+// start with an empty vault" — the client mints a NEW master key under the new
+// password and everything sealed under the old one is purged
+// (services/accountReset.js). Account, plan, credits and billing history stay.
+//
+// Wallet accounts have no email and no password; the wallet is their recovery.
+
+// OFF unless PASSWORD_RESET_ENABLED=true. The privacy policy (§13) promises 7 days'
+// notice of a material change, and this one reverses a sentence the current policy
+// and Terms both state ("Privateer cannot reset your password"). So the code ships
+// dark and is switched on once the notice period for Privacy v2.2 has run — see
+// docs/E2EE_ARCHITECTURE.md → "Password reset" for the flip checklist. Read per
+// request, so flipping the variable needs no redeploy of the code.
+function passwordResetEnabled() {
+  return process.env.PASSWORD_RESET_ENABLED === 'true';
+}
+
+function refuseWhenDisabled(req, res, next) {
+  if (passwordResetEnabled()) return next();
+  return res.status(404).json({ message: 'Password reset is not available', code: 'PASSWORD_RESET_DISABLED' });
+}
+
+// Public: lets the app decide between the reset flow and the "we can't reset it"
+// copy. Carries nothing about any account.
+router.get('/password-reset/status', (req, res) => {
+  res.json({ enabled: passwordResetEnabled() });
+});
+
+const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
+const PASSWORD_RESET_GENERIC = 'If that email belongs to a password account, a reset link has been sent.';
+
+function hashResetToken(token) {
+  return require('crypto').createHash('sha256').update(token).digest('hex');
+}
+
+// A token must be a string of the exact shape we mint (64 hex chars). The type
+// check is also the NoSQL-injection guard, same as /verify-email.
+function isResetTokenShape(token) {
+  return typeof token === 'string' && /^[0-9a-f]{64}$/.test(token);
+}
+
+async function findUserByResetToken(token) {
+  if (!isResetTokenShape(token)) return null;
+  const user = await User.findOne({ passwordResetTokenHash: hashResetToken(token) });
+  if (!user) return null;
+  if (!user.passwordResetExpires || user.passwordResetExpires.getTime() <= Date.now()) return null;
+  if (user.accountStatus === 'deleted' || !user.email) return null;
+  return user;
+}
+
+router.post('/password-reset/request', refuseWhenDisabled, passwordResetRequestLimiter, async (req, res) => {
+  try {
+    const { email } = req.body;
+    // Same answer whatever happens below, so the route can't be used to find
+    // out which addresses have accounts.
+    if (typeof email !== 'string' || !validateEmail(email)) {
+      return res.json({ message: PASSWORD_RESET_GENERIC });
+    }
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (!user || user.accountStatus === 'deleted' || user.kekSource !== 'password') {
+      return res.json({ message: PASSWORD_RESET_GENERIC });
+    }
+
+    const token = EmailService.generateVerificationToken();
+    user.passwordResetTokenHash = hashResetToken(token);
+    user.passwordResetExpires = new Date(Date.now() + PASSWORD_RESET_TTL_MS);
+    await user.save();
+
+    try {
+      await EmailService.sendPasswordResetEmail(user, token, req.language);
+    } catch (emailError) {
+      Sentry.captureException(emailError, { level: 'warning', tags: { op: 'auth_send_password_reset_email' } });
+      logger.error('Failed to send password reset email:', emailError);
+    }
+
+    res.json({ message: PASSWORD_RESET_GENERIC });
+  } catch (error) {
+    Sentry.captureException(error, { tags: { op: 'auth_password_reset_request' } });
+    logger.error('Password reset request error:', error);
+    res.status(500).json({ message: 'Error requesting password reset' });
+  }
+});
+
+// Lets the reset screen say "this link has expired" before the user has typed a
+// new password twice and read the warning. Does NOT spend the token.
+router.post('/password-reset/verify', refuseWhenDisabled, passwordResetConfirmLimiter, async (req, res) => {
+  try {
+    const user = await findUserByResetToken(req.body?.token);
+    if (!user) {
+      return res.status(400).json({ message: 'Invalid or expired reset link', code: 'RESET_TOKEN_INVALID' });
+    }
+    res.json({ valid: true, email: user.email });
+  } catch (error) {
+    Sentry.captureException(error, { tags: { op: 'auth_password_reset_verify' } });
+    logger.error('Password reset verify error:', error);
+    res.status(500).json({ message: 'Error checking reset link' });
+  }
+});
+
+/**
+ * POST /auth/password-reset/confirm
+ *
+ * Body: {
+ *   token, newPassword,
+ *   wrappedMasterKey, kdfSalt, kdfParams   — a NEW vault the client just minted,
+ *   acknowledgeDataLoss: true               — the user saw and accepted the warning
+ * }
+ */
+router.post('/password-reset/confirm', refuseWhenDisabled, passwordResetConfirmLimiter, async (req, res) => {
+  try {
+    const { token, newPassword, wrappedMasterKey, kdfSalt, kdfParams, acknowledgeDataLoss } = req.body;
+
+    // An explicit flag rather than trusting the UI: the one thing this route must
+    // never do is erase an account whose owner didn't agree to it.
+    if (acknowledgeDataLoss !== true) {
+      return res.status(400).json({ message: 'Resetting erases all your data. Confirm to continue.', code: 'RESET_NOT_ACKNOWLEDGED' });
+    }
+    if (!isResetTokenShape(token)) {
+      return res.status(400).json({ message: 'Invalid or expired reset link', code: 'RESET_TOKEN_INVALID' });
+    }
+    const problem = passwordProblem(newPassword);
+    if (problem) {
+      return res.status(400).json({ message: req.t(problem), code: 'PASSWORD_REJECTED' });
+    }
+    if (!validateBase64(wrappedMasterKey)) {
+      return res.status(400).json({ message: 'wrappedMasterKey is required (base64)' });
+    }
+    if (!validateBase64(kdfSalt, 16)) {
+      return res.status(400).json({ message: 'kdfSalt is required (base64-encoded 16 bytes)' });
+    }
+    if (!validateKdfParams(kdfParams)) {
+      return res.status(400).json({ message: 'kdfParams must be { algorithm: "argon2id", m, t, p }' });
+    }
+
+    // Spend the token atomically: two concurrent confirms can't both reset.
+    const user = await User.findOneAndUpdate(
+      {
+        passwordResetTokenHash: hashResetToken(token),
+        passwordResetExpires: { $gt: new Date() },
+        accountStatus: { $ne: 'deleted' },
+        kekSource: 'password',
+      },
+      { $set: { passwordResetTokenHash: null, passwordResetExpires: null } },
+      { new: true }
+    );
+    if (!user) {
+      return res.status(400).json({ message: 'Invalid or expired reset link', code: 'RESET_TOKEN_INVALID' });
+    }
+    const userId = user._id;
+
+    // Sign every device out BEFORE purging, so nothing still holding the old key
+    // writes fresh ciphertext under it while the purge runs.
+    await tokenService.revokeAllUserSessions(userId);
+    void signalAllTerminals(userId).catch((err) => {
+      logger.warn('Relay session_revoked broadcast (password reset) failed:', err?.message || err);
+    });
+
+    const { failures } = await accountReset.purgeUserContent(userId);
+    if (failures.length) {
+      Sentry.captureMessage('password_reset_purge_incomplete', {
+        level: 'error',
+        tags: { op: 'auth_password_reset_purge' },
+        extra: { failures },
+      });
+    }
+
+    // Install the new vault. Loaded fresh so the pre-save hook hashes the password
+    // and the purge's own User updates (storage bytes) aren't overwritten.
+    const fresh = await User.findById(userId);
+    fresh.password = newPassword;
+    fresh.wrappedMasterKey = wrappedMasterKey;
+    fresh.kdfSalt = kdfSalt;
+    fresh.kdfParams = kdfParams;
+    fresh.vaultEpoch = (fresh.vaultEpoch || 0) + 1;
+    fresh.vaultResetAt = new Date();
+    // The outbox keypair derives from the master key. Clear it so the first client
+    // to load the new key can publish the new one (the route is write-once).
+    fresh.outboxPublicKey = null;
+    fresh.outboxPublicKeySig = null;
+    // Clicking the emailed link proved ownership of the address.
+    fresh.isEmailVerified = true;
+    await fresh.save();
+
+    try {
+      await EmailService.sendPasswordResetCompleteEmail(fresh, req.language);
+    } catch (emailError) {
+      Sentry.captureException(emailError, { level: 'warning', tags: { op: 'auth_send_password_reset_complete' } });
+    }
+
+    res.json({ message: 'Password reset. Sign in with your new password.' });
+  } catch (error) {
+    Sentry.captureException(error, { tags: { op: 'auth_password_reset_confirm' } });
+    logger.error('Password reset confirm error:', error);
+    res.status(500).json({ message: 'Error resetting password' });
   }
 });
 

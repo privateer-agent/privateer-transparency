@@ -697,12 +697,73 @@ is pruned rather than left spinning on the other device.
 - `POST /auth/wallet/master-key` — wallet account first-sign-in master key
   registration. Idempotent: 200 if matches, 409 if a different key is on file.
 - `POST /auth/change-password` — re-wrap the master key under a new KEK.
+- `POST /auth/password-reset/request` | `/verify` | `/confirm` — the email
+  reset. **Destroys data by construction**; see "Password reset" below.
 - `POST /auth/refresh`, `POST /auth/logout`, `POST /auth/verify-email`,
   `POST /auth/resend-verification` — standard.
 
+### Password reset — the account comes back, the data does not
+
+A forgotten password is still permanent data loss: the password derives the only
+KEK that unwraps the master key, and nothing else can. What the reset restores is
+the *account* — email, plan, credits, billing history — so a user who forgot their
+password isn't also locked out of what they paid for.
+
+- `request {email}` mails a 1-hour, single-use link (`/reset-password#token=…`,
+  fragment for token hygiene). Only the SHA-256 of the token is stored
+  (`User.passwordResetTokenHash`). Same response whether or not the address has an
+  account; wallet accounts (no email, no password) are never mailed.
+- `confirm` requires `acknowledgeDataLoss: true` and a **brand-new** vault the
+  client minted under the new password (`generateMasterKey` → Argon2id KEK →
+  wrap). The old master key is not involved and cannot be. The token is spent
+  atomically, every session is revoked, then `services/accountReset.js` purges
+  every collection holding content sealed under the old key (plus both S3 user
+  prefixes and public share snapshots), and the new vault is installed.
+  `outboxPublicKey`/`Sig` are cleared so the new key can publish its own.
+  Developer API keys are **revoked** (`revokedAt`, rows kept for billing) before
+  the purge starts — a reset signs out every credential, and a key is the one that
+  never expires and spends credit.
+- **On-device data is not deleted** (CLAUDE.md §2). `User.vaultEpoch` is bumped
+  and the client folds it into its account scope (`<id>-v<epoch>`,
+  `client/services/internal/accountScope.ts`), so the new vault starts empty and
+  the old blobs sit untouched and unaddressed.
+- **Terminals.** The account signing key derives from the master key, so a reset
+  changes it. Linked CLIs/desktops are signed out (session revoke → they drop their
+  pinned key) and pin the new one at re-link; the agent's outbox-key cache is keyed
+  to the pin (privateer-agent `src/outbox/cloudOutbox.ts`), so a resident harbor
+  can't keep sealing to the old account key. Hosted (Harbor) agents keep their rows
+  and routines, but `harbor.resetAccountKeys` clears their stored pin and suspends
+  running ones; the app re-supplies the new key on its next listing
+  (`harborService.repinAfterReset`), and the server only accepts a pin into an
+  EMPTY slot so a stolen token can't swap one.
+- The warning appears three times before anything is erased — in the email, on
+  the request screen, and on the reset screen (tick-box + final dialog).
+
+**Ships dark.** Every reset route refuses (`404 PASSWORD_RESET_DISABLED`) unless
+`PASSWORD_RESET_ENABLED=true`, and the app reads `GET /auth/password-reset/status`
+(`services/passwordResetAvailability.ts`) to choose between the pre-launch copy
+("Privateer can't reset your password") and the post-launch `…Reset` strings. That is
+because Privacy v2.2 / Terms v1.7 reverse a sentence the previous versions state, and
+the policy promises 7 days' notice of a material change (§13): notice goes out by email
+(`server/scripts/send_policy_notice.js`, dry run by default, refuses <7 days) and in the
+app (`components/PolicyNoticeGate.tsx`, which is also what reaches wallet accounts).
+
+**Launch checklist (on/after the effective date, 2026-10-05):**
+1. Set `PASSWORD_RESET_ENABLED=true` in the Render dashboard (read per request).
+2. Update the support bot's `server/data/supportKnowledge/faq.md` "forget my password"
+   answer to the post-launch wording (`help.faqs.forgotPassword.aReset` in `en.json`).
+3. Later, once it has stuck: drop the pre-launch strings, rename `…Reset` keys back,
+   and delete `resetAwareKey` call sites.
+
+Pinned by `server/test/passwordReset.test.js` (including a drift check that every
+model with sealed fields keyed on `userId` is in the purge list) and the scope
+tests in `client/services/internal/accountScope.test.ts`.
+
 ## What is intentionally absent
 
-- No password reset endpoints. Forgetting the password is permanent.
+- No password *recovery*. A reset (above) returns the account with an empty vault;
+  nothing can return the data. Never add a flow that claims otherwise, and never
+  escrow a copy of the master key to make one possible.
 - No Google sign-in. OAuth provides no user secret, and bolting on a separate
   encryption password defeats the convenience that drives OAuth conversions.
 - No recovery phrase / BIP39 / SLIP-0010. Replaced entirely by the wrapped

@@ -83,6 +83,8 @@ interface UserData {
   walletAddress?: string | null;
   walletChain?: 'solana' | 'eip155' | 'sui' | 'tron' | null;
   kekSource?: 'password' | 'wallet' | null;
+  /** Bumped by each password reset; selects this vault's on-device namespace. */
+  vaultEpoch?: number;
 }
 
 interface VaultPayload {
@@ -157,7 +159,7 @@ class AuthService {
         // Point the on-device stores at this account before anything can read
         // them — an unscoped read would find nothing, a wrong-scoped one would
         // find somebody else's rows.
-        setAccountScope(this.user?.id ?? null);
+        setAccountScope(this.user?.id ?? null, this.user?.vaultEpoch);
         // Warm start restores the token here (not via storeAuthData); publish
         // if the cached master key is already loaded, else the key-load event will.
         this.trySyncOutboxKey();
@@ -386,6 +388,74 @@ class AuthService {
 
     // Server revoked all sessions — clean up locally and force re-login.
     await this.handleTokenExpiration();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Password reset (email link) — ERASES the account's data
+  // ---------------------------------------------------------------------------
+  //
+  // There is no way to recover data without the old password: it was the only
+  // key to the vault. A reset keeps the account (email, plan, credits) and starts
+  // an EMPTY vault under a new master key; the server purges everything sealed
+  // under the old one (server/services/accountReset.js). The on-device namespace
+  // moves with the account's vaultEpoch, so nothing here is deleted either.
+
+  /** Always resolves the same way whether or not the address has an account. */
+  async requestPasswordReset(email: string): Promise<void> {
+    const response = await fetch(`${API_BASE_URL}/auth/password-reset/request`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({})) as { message?: string; code?: string };
+      throw Object.assign(new Error(data.message || 'Could not send reset email'), { code: data.code });
+    }
+  }
+
+  /** Checks the emailed link without spending it. Returns the account's email. */
+  async verifyPasswordResetToken(token: string): Promise<{ email: string }> {
+    const response = await fetch(`${API_BASE_URL}/auth/password-reset/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    });
+    const data = await response.json().catch(() => ({})) as { email?: string; message?: string; code?: string };
+    if (!response.ok) {
+      throw Object.assign(new Error(data.message || 'Invalid or expired reset link'), { code: data.code });
+    }
+    return { email: data.email || '' };
+  }
+
+  /**
+   * Mint a NEW vault under `newPassword` and hand it to the server with the
+   * reset token. The previous master key is not involved — it can't be; that is
+   * why the data goes. The server revokes every session; a caller that was
+   * signed in on this device must sign out through AuthContext afterwards.
+   */
+  async resetPasswordWithToken(args: { token: string; newPassword: string }): Promise<void> {
+    const masterKey = generateMasterKey();
+    const kdfSalt = generateKdfSalt();
+    const kdfParams = DEFAULT_KDF_PARAMS;
+    const kek = await deriveKekFromPassword(args.newPassword, kdfSalt, kdfParams);
+    const wrappedMasterKey = wrapMasterKey(masterKey, kek);
+
+    const response = await fetch(`${API_BASE_URL}/auth/password-reset/confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token: args.token,
+        newPassword: args.newPassword,
+        wrappedMasterKey,
+        kdfSalt: toBase64(kdfSalt),
+        kdfParams,
+        acknowledgeDataLoss: true,
+      }),
+    });
+    const data = await response.json().catch(() => ({})) as { message?: string; code?: string };
+    if (!response.ok) {
+      throw Object.assign(new Error(data.message || 'Password reset failed'), { code: data.code });
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -770,7 +840,7 @@ class AuthService {
     this.accessToken = accessToken;
     this.refreshToken = refreshToken;
     if (user) this.user = user;
-    setAccountScope(this.user?.id ?? null);
+    setAccountScope(this.user?.id ?? null, this.user?.vaultEpoch);
     this.trySyncOutboxKey();
   }
 

@@ -343,6 +343,18 @@ const userSchema = new mongoose.Schema(
     isEmailVerified: { type: Boolean, default: false },
     emailVerificationToken: String,
     emailVerificationExpires: Date,
+    // Password reset (routes/auth.js /password-reset/*). Only the SHA-256 of the
+    // emailed token is stored, so a database read can't be turned into a reset.
+    // A reset destroys the account's content — see services/accountReset.js.
+    passwordResetTokenHash: { type: String, default: null },
+    passwordResetExpires: { type: Date, default: null },
+    // Bumped by every password reset. The master key changes, so everything the
+    // client stored on-device under the old one is unreadable; the client folds
+    // this into its on-device namespace (client/services/internal/accountScope.ts)
+    // so the new vault starts empty instead of listing rows it can't decrypt.
+    // 0 = never reset, and maps to the original un-suffixed namespace.
+    vaultEpoch: { type: Number, default: 0, min: 0 },
+    vaultResetAt: { type: Date, default: null },
     // --- Aggregate analytics operational fields (see analyticsService) ---
     // Deliberately minimal: single overwritten scalars, never event trails.
     // Disclosed verbatim in the privacy policy — keep it that way.
@@ -416,6 +428,12 @@ userSchema.index({ 'subscription.apple.originalTransactionId': 1 }, { unique: tr
 userSchema.index(
   { overQuotaSince: 1 },
   { partialFilterExpression: { overQuotaSince: { $type: 'date' } } }
+);
+
+// Password-reset token lookup. Partial — only accounts with a reset in flight.
+userSchema.index(
+  { passwordResetTokenHash: 1 },
+  { partialFilterExpression: { passwordResetTokenHash: { $type: 'string' } } }
 );
 
 // Referral link lookup. Partial, not sparse — see the referralCode comment.

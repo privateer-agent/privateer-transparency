@@ -146,7 +146,7 @@ router.put('/:agentId/routines', authenticate, async (req, res) => {
 // harborProvisionService.updateAgent.
 router.patch('/:agentId', authenticate, async (req, res) => {
   try {
-    const { label, webAccess, mediaAccess } = req.body || {};
+    const { label, webAccess, mediaAccess, accountSignPub } = req.body || {};
     if (webAccess !== undefined && typeof webAccess !== 'boolean') {
       return res.status(400).json({ success: false, message: 'webAccess must be a boolean' });
     }
@@ -156,7 +156,11 @@ router.patch('/:agentId', authenticate, async (req, res) => {
     if (label !== undefined && typeof label !== 'string') {
       return res.status(400).json({ success: false, message: 'label must be a string' });
     }
-    const agent = await harbor.updateAgent(req.user._id, req.params.agentId, { label, webAccess, mediaAccess });
+    if (accountSignPub !== undefined && typeof accountSignPub !== 'string') {
+      return res.status(400).json({ success: false, message: 'accountSignPub must be a string' });
+    }
+    // accountSignPub only fills an empty pin (after a password reset) — see updateAgent.
+    const agent = await harbor.updateAgent(req.user._id, req.params.agentId, { label, webAccess, mediaAccess, accountSignPub });
     res.json({ success: true, agent });
   } catch (err) { fail(res, err, 'update'); }
 });
