@@ -52,6 +52,21 @@ const NEAR_BASE = () => process.env.NEAR_AI_BASE_URL || 'https://cloud-api.near.
 const NEAR_TIMEOUT_MS = Number(process.env.NEAR_TEXT_TIMEOUT_MS) || 240_000;
 const NEAR_MEDIA_TIMEOUT_MS = Number(process.env.NEAR_MEDIA_TIMEOUT_MS) || 120_000;
 
+// NEAR's open chat models (GLM, Qwen, DeepSeek) all THINK by default, and the
+// app drops `reasoning_content` on the floor — so a user watched an empty bubble
+// for the whole think. Measured 2026-09-28, "explain why the sky is blue":
+// glm-5.3-flash 24-27s to the first answer word with thinking, ~1.9s without;
+// Qwen3.8-27B spent a 2,500-token budget thinking and never answered at all.
+// `enable_thinking: false` is the vLLM chat-template switch all three honour
+// (reasoning_effort / thinking:{type} were not). App paths only — the agent
+// passthrough forwards the caller's body untouched. NEAR_ENABLE_THINKING=true
+// restores the old behaviour.
+function thinkingControl() {
+  return process.env.NEAR_ENABLE_THINKING === 'true'
+    ? {}
+    : { chat_template_kwargs: { enable_thinking: false } };
+}
+
 function isNearModel(modelId) {
   return typeof modelId === 'string' && modelId.startsWith(NEAR_PREFIX);
 }
@@ -294,6 +309,7 @@ async function generateText(parts, options = {}) {
     messages,
     temperature: options.temperature ?? 0.8,
     max_tokens: await clampMaxTokens(modelId, options.maxTokens),
+    ...thinkingControl(),
   };
 
   try {
@@ -349,6 +365,7 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
     stream_options: { include_usage: true },
     temperature: options.temperature ?? 0.8,
     max_tokens: maxTokens,
+    ...thinkingControl(),
   };
 
   const res = await nearChatRequest(body, modelId, { stream: true, signal: options.signal });

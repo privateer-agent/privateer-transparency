@@ -125,10 +125,20 @@ function convertTablesToBullets(text) {
 }
 
 // Stateful line-buffered converter for streamed output. Holds back lines just
-// long enough to decide whether they are part of a pipe table; non-table lines
-// flow through with at most one line of latency.
+// long enough to decide whether they are part of a pipe table.
+//
+// "Just long enough" used to be the whole line: nothing left until its '\n', so
+// a reply's first PARAGRAPH arrived as one lump — measured 2026-09-28 at ~1.1s
+// after the provider's first token on Qwen 3.8 27B, and several seconds on a
+// slower decoder. Now a line with no '|' that is already PROSE_COMMIT_CHARS long
+// (with nothing held ahead of it) is committed as prose and streams through as
+// it arrives. A table's header row is short cells and pipes, so it has shown a
+// '|' long before that; the cost of a miss is one table rendered raw, not lost.
+const PROSE_COMMIT_CHARS = 40;
+
 function createStreamingTableConverter(emit) {
   let partial = '';
+  let streaming = false; // the current line was committed as prose mid-line
   const pending = [];
 
   const flushReady = (force) => {
@@ -160,13 +170,27 @@ function createStreamingTableConverter(emit) {
   return {
     push(chunk) {
       if (!chunk) return;
+      if (streaming) {
+        const nl = chunk.indexOf('\n');
+        if (nl === -1) { emit(chunk); return; }
+        emit(chunk.slice(0, nl + 1));
+        streaming = false;
+        chunk = chunk.slice(nl + 1);
+        if (!chunk) return;
+      }
       partial += chunk;
       const lines = partial.split('\n');
       partial = lines.pop() ?? '';
       for (const line of lines) pending.push(line);
       flushReady(false);
+      if (pending.length === 0 && partial.length >= PROSE_COMMIT_CHARS && !PIPE_ROW_RE.test(partial)) {
+        emit(partial);
+        partial = '';
+        streaming = true;
+      }
     },
     end() {
+      if (streaming) { if (partial) emit(partial); partial = ''; streaming = false; return; }
       if (partial) { pending.push(partial); partial = ''; }
       flushReady(true);
     }
