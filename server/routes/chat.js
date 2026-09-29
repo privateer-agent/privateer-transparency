@@ -39,6 +39,7 @@ const {
   planNodes,
   compactContext,
   generateChatTitle,
+  parseSettingsCommandRoute,
   getPendingReply,
   ackPendingReply,
   getTokenStatus,
@@ -122,6 +123,12 @@ router.post('/compact', limitTextInput, checkCreditBalance(0), compactContext);
 // Cheap-utility gating like /compact: it fires as a side effect of a send that
 // was already counted, so it must not consume the daily cap or a slot of its own.
 router.post('/title', limitTextInput, checkCreditBalance(0), generateChatTitle);
+
+// Parse a chat message into settings changes ("switch to Claude", "dark mode").
+// The client only calls this when its own cue check flags the message, and
+// applies the result itself. Cheap-utility gating like /title: it is a
+// classifier call in front of a send, not a turn of its own.
+router.post('/settings-command', limitTextInput, checkCreditBalance(0), parseSettingsCommandRoute);
 
 // Generate or edit image based on intent
 router.post('/generate-or-edit-image', limitTextInput, requireCloudBackend(), requireDailyCap('imageGen', (req) => clampImageCount(req.body?.count)), checkCreditBalance(0), requireConcurrencySlot(), async (req, res) => {
