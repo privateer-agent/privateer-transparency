@@ -410,6 +410,14 @@ client-side with the master key.
 
 Wire format: a JSON string `{"iv":"<base64 12B>","ct":"<base64 ct ‖ tag>"}`.
 
+Media binaries in S3 are the raw `ct ‖ tag` with the IV kept beside the row as
+`encIv`. A second binary format, **PVS1**, exists so a player can start before
+the whole object arrives. It seals chunks under a per-file key wrapped by the
+master key, and a row marks it with `encIv === "pvs1"`. `decryptBinary` /
+`decryptBinaryRaw` open both formats, so it changes nothing about who can read
+what: the server still holds ciphertext only. Spec and rollout:
+`docs/STREAMING_MEDIA.md`.
+
 Plaintext fields on the server schemas (`content`, `aiResponse`, `title`,
 `prompt`) are kept optional only for legacy data that predates E2EE.
 

@@ -23,6 +23,7 @@ import './internal/randomPolyfill';
 // crypto.subtle on web, @noble/ciphers as the universal fallback. All three
 // share one wire format (12-byte IV, ct ‖ 16-byte tag) — see internal/aesGcm.
 import { gcmEncrypt, gcmDecrypt, gcmEncryptAsync, gcmDecryptAsync } from './internal/aesGcm';
+import { isSealedStreamIv, openStream, sealStream, SEALED_STREAM_MARKER } from './internal/sealedStream';
 import { Buffer } from 'buffer';
 import { hkdf } from '@noble/hashes/hkdf';
 import { sha256 } from '@noble/hashes/sha256';
@@ -349,14 +350,35 @@ export async function encryptBinary(buf: Uint8Array): Promise<{ iv: string; ct: 
   return { iv: toBase64(iv), ct: toBase64(ct) };
 }
 
+// Media binaries come in two formats, told apart by the row's `encIv`: a real
+// base64 IV means one whole-file GCM ciphertext; SEALED_STREAM_MARKER means a
+// chunked PVS1 object whose header carries everything (internal/sealedStream,
+// docs/STREAMING_MEDIA.md). Both decrypt functions accept both, which is what
+// lets every whole-file reader open a streamable file unchanged.
+
 export async function decryptBinary(iv: string, ct: string): Promise<Uint8Array> {
   if (!_masterKey) throw new Error('Master key not loaded.');
+  if (isSealedStreamIv(iv)) return openStream(_masterKey, fromBase64(ct));
   return gcmDecryptAsync(_masterKey, fromBase64(iv), fromBase64(ct));
 }
 
 export async function decryptBinaryRaw(iv: string, ctBytes: Uint8Array): Promise<Uint8Array> {
   if (!_masterKey) throw new Error('Master key not loaded.');
+  if (isSealedStreamIv(iv)) return openStream(_masterKey, ctBytes);
   return gcmDecryptAsync(_masterKey, fromBase64(iv), ctBytes);
+}
+
+/**
+ * Seal a media binary in the streamable PVS1 format. Returns the marker in
+ * place of an IV, so the result drops into every `encIv` field as it is.
+ *
+ * NOT YET USED BY ANY WRITER, deliberately: an app version without the reader
+ * above cannot open these files, so writers switch only once readers have
+ * shipped everywhere (docs/STREAMING_MEDIA.md, Phase 2).
+ */
+export async function encryptBinaryStream(buf: Uint8Array): Promise<{ iv: string; ct: Uint8Array }> {
+  if (!_masterKey) throw new Error('Master key not loaded.');
+  return { iv: SEALED_STREAM_MARKER, ct: await sealStream(_masterKey, buf) };
 }
 
 // ---------------------------------------------------------------------------

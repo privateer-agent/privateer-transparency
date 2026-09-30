@@ -115,6 +115,19 @@ async function ttsZdrBlocked(req, res, modelId) {
   }
 }
 
+// ── GET /api/audio/storage-format ─────────────────────────────────────────────
+// Whether clients should SEAL new saved tracks in the streamable PVS1 format
+// (docs/STREAMING_MEDIA.md, Phase 2). A server switch rather than a client
+// constant because the constraint is the READERS: an app version that predates
+// PVS1 cannot open these files, and the same account's other devices may be on
+// one. Turn STREAM_SEALED_AUDIO_ENABLED on only once reader adoption says so.
+// The server never reads the bytes either way — this is advice to the writer.
+// Public and unauthenticated on purpose, like /auth/password-reset/status: it
+// says nothing about any account.
+router.get('/storage-format', (req, res) => {
+  res.json({ streamSealed: process.env.STREAM_SEALED_AUDIO_ENABLED === 'true' });
+});
+
 // ── POST /api/audio/transcribe ────────────────────────────────────────────────
 // body: { audioBase64, format, language?, sttModelId?, requireZdr? }  →  { text }
 router.post('/transcribe', authenticate, async (req, res) => {

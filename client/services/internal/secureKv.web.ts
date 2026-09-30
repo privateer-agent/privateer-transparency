@@ -122,6 +122,17 @@ export const secureKv = {
     }
   },
 
+  /**
+   * Whether an entry exists, readable or not. getItem answers null for BOTH
+   * "absent" and "present but did not decrypt", which is right for a reader and
+   * wrong for anything that would create a value when it finds none — minting
+   * over an unreadable entry destroys the one that might come back.
+   */
+  async hasItem(key: string): Promise<boolean> {
+    const wrapped = await tx<WrappedValue | undefined>(STORE_KV, 'readonly', s => s.get(key));
+    return wrapped !== undefined;
+  },
+
   async setItem(key: string, value: string): Promise<void> {
     const wrapped = await encryptValue(value);
     await tx(STORE_KV, 'readwrite', s => s.put(wrapped, key));

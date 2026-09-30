@@ -7,6 +7,10 @@ import EncryptedStorage from 'react-native-encrypted-storage';
 
 export const secureKv = {
   getItem: (key: string): Promise<string | null> => EncryptedStorage.getItem(key),
+  // Presence, independent of whether the value can be read right now. Native
+  // getItem already throws on a store failure rather than answering null, so
+  // null here really means absent; the web shim is where the two differ.
+  hasItem: async (key: string): Promise<boolean> => (await EncryptedStorage.getItem(key)) !== null,
   setItem: (key: string, value: string): Promise<void> => EncryptedStorage.setItem(key, value),
   // EncryptedStorage.removeItem rejects when the key was never set (Keychain/
   // Keystore surface "not found" as an error instead of a no-op). Callers here

@@ -25,6 +25,7 @@ import { clearTrustedTerminalKeys } from './terminalTrustService';
 import { clearCargoContentCache } from './internal/cargoContentCache';
 import { setAccountScope } from './internal/accountScope';
 import { installLegacyLocalDataAdoption } from './internal/legacyLocalData';
+import { resolveLocalVaultEpoch } from './internal/localVaultEpoch';
 import { Sentry } from './sentryService';
 import { sessionDeviceMeta } from '../utils/sessionDevice';
 
@@ -158,8 +159,11 @@ class AuthService {
         this.user = JSON.parse(storedUser);
         // Point the on-device stores at this account before anything can read
         // them — an unscoped read would find nothing, a wrong-scoped one would
-        // find somebody else's rows.
-        setAccountScope(this.user?.id ?? null, this.user?.vaultEpoch);
+        // find somebody else's rows. The epoch is THIS DEVICE's, which a reset
+        // leaves alone once its content is all on the local key
+        // (internal/localVaultEpoch.ts).
+        const localEpoch = await resolveLocalVaultEpoch(this.user?.id, this.user?.vaultEpoch);
+        setAccountScope(this.user?.id ?? null, localEpoch);
         // Warm start restores the token here (not via storeAuthData); publish
         // if the cached master key is already loaded, else the key-load event will.
         this.trySyncOutboxKey();
@@ -397,8 +401,10 @@ class AuthService {
   // There is no way to recover data without the old password: it was the only
   // key to the vault. A reset keeps the account (email, plan, credits) and starts
   // an EMPTY vault under a new master key; the server purges everything sealed
-  // under the old one (server/services/accountReset.js). The on-device namespace
-  // moves with the account's vaultEpoch, so nothing here is deleted either.
+  // under the old one (server/services/accountReset.js). On-device content is
+  // never deleted: a device whose content is all on the local content key keeps
+  // it in place, and one that still holds master-key records moves to a fresh
+  // namespace and leaves them untouched (internal/localVaultEpoch.ts).
 
   /** Always resolves the same way whether or not the address has an account. */
   async requestPasswordReset(email: string): Promise<void> {
@@ -840,7 +846,8 @@ class AuthService {
     this.accessToken = accessToken;
     this.refreshToken = refreshToken;
     if (user) this.user = user;
-    setAccountScope(this.user?.id ?? null, this.user?.vaultEpoch);
+    const localEpoch = await resolveLocalVaultEpoch(this.user?.id, this.user?.vaultEpoch);
+    setAccountScope(this.user?.id ?? null, localEpoch);
     this.trySyncOutboxKey();
   }
 
