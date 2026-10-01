@@ -157,7 +157,9 @@ async function handleImageGeneration(req, res) {
         // surfaces as PROVIDER_UNAVAILABLE / a "modalities" 404. Fall back once
         // to the known-good default image model, mirroring the app's chat image
         // path (chatController), so a stock `images.generate` doesn't hard-fail.
-        if (isImageFallbackEligibleError(genErr) && modelId !== IMAGE_GEN_FALLBACK_MODEL) {
+        // Only when the caller left `model` unset: an OpenAI-shaped client that
+        // names a model expects that model or an error, never a substitute.
+        if (!body.model && isImageFallbackEligibleError(genErr) && modelId !== IMAGE_GEN_FALLBACK_MODEL) {
           logger.debug(`[v1 images] ${modelId} failed (${genErr.code || genErr.message?.slice(0, 80)}) — falling back to ${IMAGE_GEN_FALLBACK_MODEL}`);
           modelId = IMAGE_GEN_FALLBACK_MODEL;
           options.modelId = modelId;

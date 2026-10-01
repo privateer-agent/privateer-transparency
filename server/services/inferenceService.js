@@ -39,7 +39,7 @@
 
 const ModelRateConfig = require('../models/modelRateConfigModel');
 const billingService = require('./billingService');
-const { getRatioParamMode, supportsTransparency, getMaxImageSize, getSupportedAspectRatios, getSupportedImageSizes } = require('../data/imageModelCapabilities');
+const { getRatioParamMode, supportsTransparency, getMaxImageSize, getSupportedAspectRatios, getSupportedImageSizes, pixelSizeFor } = require('../data/imageModelCapabilities');
 const { isZdrModel } = require('../data/zdrProviders');
 const { safeFetch } = require('../utils/safeFetch');
 const { createPersonaGuard } = require('./personaGuard');
@@ -789,9 +789,13 @@ async function openRouterChat(messages, modelId, options = {}) {
       continue;
     }
 
-    providerHealth.recordFailure(useZdrKey ? 'openrouter_zdr' : 'openrouter', {
-      status: res.status, message: errText, kind: options.modalities ? 'imageGen' : 'inference'
-    });
+    // An Images-API-only model's refusal is a routing answer, not an outage —
+    // generateImage reroutes it to /images, so it must not count against health.
+    if (!/cannot be used with the chat\/completions endpoint/i.test(errText)) {
+      providerHealth.recordFailure(useZdrKey ? 'openrouter_zdr' : 'openrouter', {
+        status: res.status, message: errText, kind: options.modalities ? 'imageGen' : 'inference'
+      });
+    }
     const err = new Error(`Upstream inference error ${res.status}: ${errText}`);
     if (res.status === 429) err.statusCode = 429;
     if (res.status === 404 || res.status === 503 || res.status >= 500) {
@@ -1243,6 +1247,145 @@ function buildOpenRouterAspectFields(modelId, aspectRatio, imageSize, transparen
   return Object.keys(image_config).length > 0 ? { image_config } : {};
 }
 
+// ── Images-API-only models ───────────────────────────────────────────────────
+// OpenRouter serves its newer image models (openai/gpt-image-2.5-sunburst and
+// -flare, seen 2026-10-01) ONLY on POST /images. On chat/completions they answer
+// 404 "… is an image generation model and cannot be used with the
+// chat/completions endpoint. Use the /api/v1/images endpoint instead." — and a
+// 404 is fallback-eligible, so every caller silently re-drew the picture on
+// IMAGE_GEN_FALLBACK_MODEL and the user got Gemini Lite while asking for
+// gpt-image. Learned per model from that exact refusal (no catalog field says
+// which endpoint a model wants), kept for the life of the process.
+const _imagesEndpointModels = new Set();
+
+// The aspect ratios the /images schema accepts; anything else 400s the request.
+const IMAGES_ENDPOINT_ASPECT_RATIOS = new Set([
+  '1:1', '1:2', '1:4', '1:8', '2:1', '2:3', '2.35:1', '3:2', '3:4', '4:1',
+  '4:3', '4:5', '5:2', '5:4', '5:7', '7:5', '8:1', '9:16', '16:9',
+]);
+
+function isImagesEndpointOnlyError(err) {
+  return /cannot be used with the chat\/completions endpoint/i.test(err?.message || '');
+}
+
+/**
+ * Draw one image through OpenRouter's POST /images. Same contract as
+ * generateImage: { images: [{ buffer, mimeType }], responseText, inputTokens,
+ * providerCostUsd }. Text parts become the prompt; image parts become
+ * `input_references` (the edit / reference-image path).
+ */
+async function generateImageViaImagesEndpoint(normalizedParts, modelId, options, imageSize) {
+  const textParts = [];
+  const references = [];
+  for (const p of normalizedParts) {
+    if (typeof p === 'string') { if (p) textParts.push(p); }
+    else if (p?.image) {
+      references.push({
+        type: 'image_url',
+        image_url: { url: `data:${p.mimeType || 'image/jpeg'};base64,${p.image.toString('base64')}` },
+      });
+    } else if (p?.text) textParts.push(p.text);
+  }
+
+  const body = { model: modelId, prompt: textParts.join('\n\n'), n: 1 };
+  if (references.length > 0) body.input_references = references;
+  // `size` on /images is the provider's own "WIDTHxHEIGHT", not our 1K/2K/4K
+  // tier: a model with a known rule gets the tier + ratio translated to pixels
+  // (which carries the ratio too, so no aspect_ratio beside it to disagree with).
+  // A model with no rule keeps aspect_ratio alone and the provider's default size.
+  const pixelSize = typeof imageSize === 'string' && /^\d+x\d+$/.test(imageSize)
+    ? imageSize
+    : pixelSizeFor(modelId, imageSize, options.aspectRatio);
+  if (pixelSize) {
+    body.size = pixelSize;
+  } else if (options.aspectRatio) {
+    if (IMAGES_ENDPOINT_ASPECT_RATIOS.has(options.aspectRatio)) body.aspect_ratio = options.aspectRatio;
+    else logger.warn(`[imageGen] dropping unsupported aspect_ratio "${options.aspectRatio}" for ${modelId} (/images)`);
+  }
+  if (options.transparentBackground && supportsTransparency(modelId)) {
+    body.background = 'transparent';
+    body.output_format = 'png';
+  }
+
+  const useZdrKey = await resolveUseZdrKey({ requireZdr: options.requireZdr, modelId, isMediaAction: true });
+  await applyZdrRouting(body, modelId, { useZdrKey });
+  applyProviderRouting(body);
+
+  const MAX_RETRIES = 2;
+  const _t0 = Date.now();
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), OR_MEDIA_TIMEOUT_MS);
+    let res;
+    try {
+      res = await fetch(`${OPENROUTER_BASE}/images`, orFetchInit({
+        method: 'POST',
+        headers: orHeaders(useZdrKey),
+        body: JSON.stringify(body),
+        signal: abort.signal,
+      }));
+    } catch (fetchErr) {
+      if (fetchErr?.name === 'AbortError') {
+        throw Object.assign(new Error(`Upstream request timed out after ${OR_MEDIA_TIMEOUT_MS}ms for ${modelId}`),
+          { code: 'PROVIDER_UNAVAILABLE', modelId, timedOut: true });
+      }
+      throw fetchErr;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (res.ok) {
+      providerHealth.recordSuccess(useZdrKey ? 'openrouter_zdr' : 'openrouter');
+      const data = await res.json();
+      logger.debug('[generateImage] /images returned:', { modelId, ms: Date.now() - _t0 });
+      const images = [];
+      for (const item of (data?.data || [])) {
+        if (typeof item?.b64_json === 'string') {
+          images.push({ buffer: Buffer.from(item.b64_json, 'base64'), mimeType: item.media_type || 'image/png' });
+        } else if (typeof item?.url === 'string') {
+          try {
+            const r = await fetch(item.url);
+            if (r.ok) images.push({ buffer: Buffer.from(await r.arrayBuffer()), mimeType: r.headers.get('content-type') || 'image/png' });
+          } catch { /* counted as no image below */ }
+        }
+      }
+      const observedCostUsd = Number(data?.usage?.cost);
+      if (Number.isFinite(observedCostUsd) && images.length > 0) {
+        recordObservedImagePrice(modelId, observedCostUsd, images.length);
+        if (options.modelId && options.modelId !== modelId) {
+          recordObservedImagePrice(options.modelId, observedCostUsd, images.length);
+        }
+      }
+      return {
+        images,
+        responseText: '',
+        inputTokens: data?.usage?.prompt_tokens || 0,
+        providerCostUsd: Number.isFinite(observedCostUsd) ? observedCostUsd : null,
+      };
+    }
+
+    const errText = await res.text();
+    if ((res.status === 429 || res.status >= 500) && attempt < MAX_RETRIES) {
+      const delay = 2000 * Math.pow(2, attempt);
+      logger.warn(`[openrouter /images] ${res.status} for ${modelId}, retrying in ${delay}ms: ${errText.slice(0, 200)}`);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      continue;
+    }
+    providerHealth.recordFailure(useZdrKey ? 'openrouter_zdr' : 'openrouter', {
+      status: res.status, message: errText, kind: 'imageGen',
+    });
+    const err = new Error(`Upstream inference error ${res.status}: ${errText}`);
+    err.modelId = modelId;
+    err.statusCode = res.status;
+    if (res.status === 404 || res.status >= 500) {
+      err.code = 'PROVIDER_UNAVAILABLE';
+      err.upstreamBody = errText.slice(0, 500);
+    }
+    logger.warn('[generateImage] /images call failed:', { modelId, ms: Date.now() - _t0, statusCode: res.status, detail: errText.slice(0, 300) });
+    throw err;
+  }
+}
+
 async function generateImage(parts, options = {}) {
   // NEAR confidential image models (FLUX) use the dedicated /v1/images endpoint,
   // not OpenRouter's chat-completions-with-modalities convention. Delegate before
@@ -1261,6 +1404,11 @@ async function generateImage(parts, options = {}) {
   // models resolve to null → image_size stays unset; the prompt directive the
   // controller appends is the only upscale signal that reaches them.
   const imageSize = options.imageSize || (options.upscale ? getMaxImageSize(modelId) : null);
+
+  // A model already known to be Images-API-only skips the chat attempt entirely.
+  if (_imagesEndpointModels.has(modelId)) {
+    return generateImageViaImagesEndpoint(normalizedParts, modelId, options, imageSize);
+  }
 
   const messages = [];
   const contentArray = [];
@@ -1328,6 +1476,11 @@ async function generateImage(parts, options = {}) {
       ...buildOpenRouterAspectFields(modelId, options.aspectRatio, imageSize, options.transparentBackground),
     });
   } catch (err) {
+    if (isImagesEndpointOnlyError(err)) {
+      _imagesEndpointModels.add(modelId);
+      logger.debug(`[generateImage] ${modelId} is Images-API only — retrying on ${OPENROUTER_BASE}/images`);
+      return generateImageViaImagesEndpoint(normalizedParts, modelId, options, imageSize);
+    }
     logger.warn('[generateImage] OpenRouter call failed:', {
       modelId,
       ms: Date.now() - _t0,
