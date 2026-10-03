@@ -1901,6 +1901,11 @@ async function listSubscriptionCatalog() {
         // (window - prompt), so a larger-windowed model ran out of budget while it
         // still had room. null when upstream omits it — the client keeps its default.
         contextLength: m.context_length || m.top_provider?.context_length || null,
+        // The most the model will write in one turn, for the same reason: the CLI
+        // registered every model at a flat 16384, which cut thinking models off
+        // mid-reasoning (and over-asked the ~30 models whose real cap is lower).
+        // null when upstream omits it.
+        maxCompletionTokens: m.top_provider?.max_completion_tokens || null,
         enabled: true,
         privacy: { tier: 'zdr-enforced' },
       });
@@ -1930,6 +1935,7 @@ async function listSubscriptionCatalog() {
           // Already shaped by each loader (nearModels/tinfoilModels/phalaModels all
           // normalise their upstream's spelling to `contextLength`).
           contextLength: m.contextLength || null,
+          maxCompletionTokens: m.maxCompletionTokens || null,
           enabled: true,
           privacy: { tier: 'tee-unverified' },
         });
@@ -1976,6 +1982,7 @@ async function listEnabledModels() {
         // An admin row carries no window; null means "unknown", and a client that
         // needs one falls back to its own default rather than to a wrong number.
         contextLength: null,
+        maxCompletionTokens: null,
         enabled: true,
         privacy: { tier: await privacyTierFor(c.modelId) },
       });
