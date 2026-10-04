@@ -651,6 +651,27 @@ function dropUnsupportedParam(body, errText) {
   return name;
 }
 
+/**
+ * An always-thinking endpoint answers `reasoning: {enabled:false}` with a hard
+ * 400 ("Reasoning is mandatory for this endpoint and cannot be disabled")
+ * instead of ignoring it. Deleting the hint outright left such a model at its
+ * DEFAULT effort — measured 2026-10-04 on claude-opus-5.5 Build turns: 43-72s
+ * of invisible thinking before the first character, about half the 16k artifact
+ * budget gone (so a continuation was usually needed), and twice the cost of
+ * `effort:'minimal'` (9s to first character, ~1 min total). So "off" falls back
+ * to the cheapest effort first, and only a refusal of THAT drops the hint.
+ * Mutates `body`. Returns what it did ('minimal' | 'dropped'); each call moves
+ * the hint one step toward gone, so a retry loop driven by it terminates.
+ */
+function relaxReasoningHint(body) {
+  if (body.reasoning?.enabled === false) {
+    body.reasoning = { effort: 'minimal' };
+    return 'minimal';
+  }
+  delete body.reasoning;
+  return 'dropped';
+}
+
 async function openRouterChat(messages, modelId, options = {}) {
   const MAX_RETRIES = 3;
   const BASE_DELAY_MS = 2000;
@@ -757,12 +778,13 @@ async function openRouterChat(messages, modelId, options = {}) {
 
     // An always-thinking endpoint 400s the request that asks it not to think
     // ("Reasoning is mandatory for this endpoint and cannot be disabled")
-    // rather than ignoring the field. Drop the hint and retry with no backoff
-    // (nothing upstream is wrong, so there is nothing to wait out). It spends
-    // one of the MAX_RETRIES attempts, and can't loop — the field is gone.
+    // rather than ignoring the field. Relax the hint (see relaxReasoningHint)
+    // and retry with no backoff (nothing upstream is wrong, so there is nothing
+    // to wait out). Each relaxation spends one of the MAX_RETRIES attempts, and
+    // can't loop — the hint goes off → minimal → gone.
     if (res.status === 400 && body.reasoning && /reasoning/i.test(errText) && attempt < MAX_RETRIES) {
-      logger.debug(`[openrouter] ${modelId} requires reasoning — retrying without the hint`);
-      delete body.reasoning;
+      const relaxed = relaxReasoningHint(body);
+      logger.debug(`[openrouter] ${modelId} requires reasoning — retrying with the hint ${relaxed}`);
       continue;
     }
 
@@ -2139,14 +2161,15 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
       // Not every endpoint that ignores an unsupported parameter ignores THIS
       // one: an always-thinking endpoint answers `reasoning: {enabled:false}`
       // with a hard 400 ("Reasoning is mandatory for this endpoint and cannot
-      // be disabled") instead of quietly reasoning anyway. Drop the hint and
-      // retry — mutating baseBody, so a continuation doesn't re-buy the round
-      // trip, and so the retry can't recurse (the field is gone). Not counted
+      // be disabled") instead of quietly reasoning anyway. Relax the hint to
+      // the cheapest effort (see relaxReasoningHint) and retry — mutating
+      // baseBody, so a continuation doesn't re-buy the round trip, and so the
+      // retry recurses at most twice (off → minimal → gone). Not counted
       // against provider health: the request was malformed for this endpoint,
       // which says nothing about whether the provider is up.
       if (res.status === 400 && baseBody.reasoning && /reasoning/i.test(errText)) {
-        logger.debug('[generateTextStream] endpoint requires reasoning — retrying without the hint', { modelId: effectiveModelId });
-        delete baseBody.reasoning;
+        const relaxed = relaxReasoningHint(baseBody);
+        logger.debug(`[generateTextStream] endpoint requires reasoning — retrying with the hint ${relaxed}`, { modelId: effectiveModelId });
         return streamOnce(reqMessages);
       }
       providerHealth.recordFailure(useZdrKey ? 'openrouter_zdr' : 'openrouter', {
