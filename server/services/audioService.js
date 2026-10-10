@@ -60,6 +60,7 @@ const UserStoragePrefs = require('../models/userStoragePrefsModel');
 // generateMusic, and the module header of musicBriefService for why a music
 // prompt needs rewriting at all.
 const { refineMusicPrompt } = require('./musicBriefService');
+const audioTranscode = require('./audioTranscode');
 
 
 const OPENROUTER_BASE = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
@@ -392,23 +393,44 @@ async function transcribe({ userId, audioBase64, format, language, modelId, requ
   }
   const model = resolveAudioModel(modelId, DEFAULT_STT_MODEL);
 
+  // Not every STT model takes every container the recorders produce — see
+  // services/audioTranscode.js for the measured list. Known refusals are
+  // converted up front, whichever provider serves them (NEAR's Whisper is one);
+  // an unlisted OpenRouter model that refuses gets one wav retry below.
+  let wireAudio = audioBase64;
+  let wireFormat = format || 'm4a';
+  if (audioTranscode.needsWavFor(model, wireFormat)) {
+    const wav = await audioTranscode.toWavBase64(audioBase64, wireFormat);
+    if (wav) { wireAudio = wav; wireFormat = 'wav'; }
+  }
+
   if (nearAiService.isNearModel(model)) {
-    const { text, providerCostUsd } = await nearAiService.transcribe({ audioBase64, format, language, modelId: model });
+    const { text, providerCostUsd } = await nearAiService.transcribe({ audioBase64: wireAudio, format: wireFormat, language, modelId: model });
     await chargeAudio(userId, providerCostUsd, { model, kind: 'stt', markup: billingMarkup, origin });
     return { text, model };
   }
   if (tinfoilService.isTinfoilModel(model)) {
-    const { text, providerCostUsd } = await tinfoilService.transcribe({ audioBase64, format, language, modelId: model });
+    const { text, providerCostUsd } = await tinfoilService.transcribe({ audioBase64: wireAudio, format: wireFormat, language, modelId: model });
     await chargeAudio(userId, providerCostUsd, { model, kind: 'stt', markup: billingMarkup, origin });
     return { text, model };
   }
 
-  const body = { model, input_audio: { data: audioBase64, format: format || 'm4a' }, temperature: 0, ...(language ? { language } : {}) };
-  const r = await fetch(`${OPENROUTER_BASE}/audio/transcriptions`, {
+  const post = () => fetch(`${OPENROUTER_BASE}/audio/transcriptions`, {
     method: 'POST',
     headers: { ...inferenceService.orHeaders(requireZdr), 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ model, input_audio: { data: wireAudio, format: wireFormat }, temperature: 0, ...(language ? { language } : {}) }),
   });
+  let r = await post();
+  if (!r.ok && audioTranscode.shouldRetryAsWav(r.status, wireFormat)) {
+    const wav = await audioTranscode.toWavBase64(audioBase64, format || 'm4a');
+    if (wav) {
+      const refused = await r.text().catch(() => '');
+      logger.warn('[audioService.transcribe] retrying as wav', model, wireFormat, r.status, refused.slice(0, 160));
+      wireAudio = wav;
+      wireFormat = 'wav';
+      r = await post();
+    }
+  }
   if (!r.ok) {
     const errText = await r.text().catch(() => '');
     logger.error('[audioService.transcribe] OpenRouter error', r.status, errText);

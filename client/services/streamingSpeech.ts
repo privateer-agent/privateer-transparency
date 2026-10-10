@@ -30,11 +30,36 @@ import { getActionModel, resolveTtsVoice, getRequireZdr, getAllowNonZdrMedia } f
 
 const MIME = 'audio/mpeg';
 
+/**
+ * The MediaSource constructor to stream through, or null.
+ *
+ * Every speech model we can route to answers mp3 on the streaming path (the
+ * server 409s anything else — Gemini is PCM-only, fal renders whole clips), so
+ * the only question is whether this browser's MSE takes `audio/mpeg`.
+ *
+ * iPhone Safari has no `MediaSource` at all; since iOS 17.1 it has
+ * `ManagedMediaSource` instead, and checking only the first sent every iPhone
+ * down the buffered path — the whole sentence synthesized and downloaded before
+ * a sound, on the device where that wait is longest. Feature-detected per type,
+ * never assumed: where it doesn't take mp3 this still returns null and the
+ * buffered path runs exactly as before.
+ */
+function streamingSource(): { MS: any; managed: boolean } | null {
+  if (Platform.OS !== 'web') return null;
+  const g = globalThis as any;
+  for (const [MS, managed] of [[g.MediaSource, false], [g.ManagedMediaSource, true]] as const) {
+    try {
+      if (typeof MS === 'function' && typeof MS.isTypeSupported === 'function' && MS.isTypeSupported(MIME)) {
+        return { MS, managed };
+      }
+    } catch { /* keep looking */ }
+  }
+  return null;
+}
+
 /** Can this platform/browser decode a streamed mp3 through MediaSource? */
 export function canStreamSpeech(): boolean {
-  if (Platform.OS !== 'web') return false;
-  const MS = (globalThis as any).MediaSource;
-  return typeof MS === 'function' && typeof MS.isTypeSupported === 'function' && MS.isTypeSupported(MIME);
+  return streamingSource() !== null;
 }
 
 export interface StreamingSpeech {
@@ -52,10 +77,11 @@ export interface StreamingSpeech {
  */
 export async function streamSpeech(
   text: string,
-  opts: { modelId?: string; voice?: string } = {},
+  opts: { modelId?: string; voice?: string; requireZdr?: boolean; allowNonZdrMedia?: boolean } = {},
 ): Promise<StreamingSpeech | null> {
   const trimmed = (text || '').trim();
-  if (!trimmed || !canStreamSpeech()) return null;
+  const source = streamingSource();
+  if (!trimmed || !source) return null;
 
   const modelId = opts.modelId || (await getActionModel('tts')).modelId;
   const voice = opts.voice || (await resolveTtsVoice(modelId));
@@ -63,9 +89,11 @@ export async function streamSpeech(
   // these prefs exist only on this device, and a non-ZDR voice is gated on them.
   // A blocked voice 403s here, which this function reports as `null` like any
   // other non-OK — the buffered path then produces the one user-facing error.
+  // Callers synthesizing several sentences in a row resolve these once and pass
+  // them in, rather than re-reading two secure-store keys per sentence.
   const [requireZdr, allowNonZdrMedia] = await Promise.all([
-    getRequireZdr(),
-    getAllowNonZdrMedia(),
+    opts.requireZdr ?? getRequireZdr(),
+    opts.allowNonZdrMedia ?? getAllowNonZdrMedia(),
   ]);
 
   const controller = new AbortController();
@@ -84,9 +112,12 @@ export async function streamSpeech(
   // there's exactly one place that turns TTS failures into user-facing copy.
   if (!res.ok || !res.body) return null;
 
-  const MS = (globalThis as any).MediaSource;
-  const mediaSource = new MS();
+  const mediaSource = new source.MS();
   const el = new (globalThis as any).Audio() as HTMLAudioElement;
+  // ManagedMediaSource only opens on an element that has opted out of AirPlay
+  // (remote playback can't follow a MediaSource) — without this the source
+  // never fires `sourceopen` and every sentence waits out the timeout below.
+  if (source.managed) (el as any).disableRemotePlayback = true;
   const objectUrl = URL.createObjectURL(mediaSource);
   el.src = objectUrl;
 

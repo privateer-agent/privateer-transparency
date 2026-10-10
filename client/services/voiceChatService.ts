@@ -95,7 +95,7 @@ export const TTS_MAX_CHARS = 8000;
  */
 export async function synthesizeSpeechBytes(
   text: string,
-  opts: { modelId?: string; voice?: string } = {},
+  opts: { modelId?: string; voice?: string; requireZdr?: boolean; allowNonZdrMedia?: boolean } = {},
 ): Promise<{ audioBase64: string; mimeType: string; modelId: string; voice: string }> {
   const trimmed = (text || '').trim();
   if (!trimmed) throw new VoiceChatError(i18n.t('voice.errors.nothingToSpeak'), 'TTS_EMPTY');
@@ -109,8 +109,8 @@ export async function synthesizeSpeechBytes(
   // backend — the prefs never leave it (CLAUDE.md §2) — so they travel with the
   // request exactly as sfxService sends them, rather than being read server-side.
   const [requireZdr, allowNonZdrMedia] = await Promise.all([
-    getRequireZdr(),
-    getAllowNonZdrMedia(),
+    opts.requireZdr ?? getRequireZdr(),
+    opts.allowNonZdrMedia ?? getAllowNonZdrMedia(),
   ]);
 
   const res = await authService.makeAuthenticatedRequest('/api/audio/speech', {
@@ -207,7 +207,7 @@ export async function fetchVoicePreview(
  */
 export async function synthesizeSpeechToUri(
   text: string,
-  opts: { modelId?: string; voice?: string } = {},
+  opts: { modelId?: string; voice?: string; requireZdr?: boolean; allowNonZdrMedia?: boolean } = {},
 ): Promise<string> {
   const { audioBase64, mimeType } = await synthesizeSpeechBytes(text, opts);
   return audioBytesToUri(audioBase64, mimeType);
