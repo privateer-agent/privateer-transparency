@@ -23,7 +23,8 @@
 const express = require('express');
 const logger = require('../utils/logger');
 const router = express.Router();
-const { downloadFromS3, S3_CONFIG, bucketTypeFromKey } = require('../services/cloud-services');
+const { pipeline } = require('stream');
+const { streamFromS3, bucketTypeFromKey } = require('../services/cloud-services');
 const { authenticate } = require('../middleware/auth');
 const ChatNode = require('../models/chatNodeModel');
 const Chat = require('../models/chatModel');
@@ -63,19 +64,16 @@ router.get('*', async (req, res) => {
     // Look up attachment metadata to check if client-encrypted
     const attachmentMeta = await findAttachmentMeta(storageRef, req.user._id.toString());
 
-    // `downloadFromS3` throws on any S3 error (including NoSuchKey) rather than
-    // returning {success:false}, so a ref that is not in the bucket has to be
-    // caught here — otherwise it falls through to the catch below and reports a
-    // 500 for what is really a missing object.
+    // Streamed, never buffered: this route serves videos up to 100MB, and
+    // holding each one whole for the length of the response is what ran the
+    // 512MB instance out of memory. `streamFromS3` HEADs first, so a ref that
+    // is not in the bucket throws here — before any header is written — and is
+    // a 404, not the 500 the catch below would report.
     let result;
     try {
-      result = await downloadFromS3(storageRef, bucketType);
+      result = await streamFromS3(storageRef, bucketType);
     } catch (dlErr) {
       logger.warn('Media proxy: object unavailable', { storageRef, bucketType, error: dlErr.message });
-      return res.status(404).json({ message: 'Media not found' });
-    }
-
-    if (!result.success) {
       return res.status(404).json({ message: 'Media not found' });
     }
 
@@ -92,7 +90,14 @@ router.get('*', async (req, res) => {
       }
     }
     res.set(headers);
-    res.send(result.buffer);
+    // pipeline tears down the S3 read when the client goes away mid-download.
+    // Headers are already out by the time the stream can fail, so a failure
+    // here can only cut the response short, never change its status.
+    pipeline(result.stream, res, (streamErr) => {
+      if (streamErr && streamErr.code !== 'ERR_STREAM_PREMATURE_CLOSE') {
+        logger.warn('Media proxy: stream failed mid-response', { storageRef, error: streamErr.message });
+      }
+    });
   } catch (error) {
     logger.error('Media proxy error:', error);
     res.status(500).json({ message: 'Failed to retrieve image' });
