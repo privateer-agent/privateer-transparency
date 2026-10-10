@@ -146,6 +146,11 @@ router.post('/migrate/:treeId', graphController.migrateTreeToGraph);
 // Create a new chat (on first message)
 router.post('/chat/create', graphController.createChat);
 
+// Bulk-file chats from a ChatGPT/Claude export, parsed and encrypted on device.
+// Deliberately no daily cap, credit floor or create limit — nothing here calls
+// a model (services/chatImport.js).
+router.post('/chat/import', requireCloudBackend(), graphController.importChats);
+
 // Get a specific chat
 router.get('/chat/:chatId', graphController.getChat);
 

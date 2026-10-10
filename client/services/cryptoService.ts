@@ -26,6 +26,7 @@ import { gcmEncrypt, gcmDecrypt, gcmEncryptAsync, gcmDecryptAsync } from './inte
 import { isSealedStreamIv, openStream, sealStream, SEALED_STREAM_MARKER } from './internal/sealedStream';
 import { Buffer } from 'buffer';
 import { hkdf } from '@noble/hashes/hkdf';
+import { hmac } from '@noble/hashes/hmac';
 import { sha256 } from '@noble/hashes/sha256';
 import { deriveArgon2idHash } from './internal/argon2';
 import { secureKv } from './internal/secureKv';
@@ -320,6 +321,25 @@ export function encryptBinaryWithKey(buf: Uint8Array, key: Uint8Array): { iv: st
 export function decryptBinaryWithKey(iv: string, ct: string, key: Uint8Array): Uint8Array {
   if (key.length !== 32) throw new Error('Decryption key must be 32 bytes');
   return gcmDecrypt(key, fromBase64(iv), fromBase64(ct));
+}
+
+/**
+ * A stable, account-private fingerprint of `message`: HMAC-SHA256 under a key
+ * HKDF-derived from the master key for `context`, as 64 hex chars.
+ *
+ * For handles the SERVER must be able to compare but must not be able to read
+ * or correlate — e.g. chat import's dedupe key, where the plain source
+ * conversation id would let anyone holding the other service's records confirm
+ * which conversations an account brought here. The per-context subkey keeps
+ * one use's digests from matching another's. Rotates with the master key,
+ * which is what a password reset (that erases the content) should do.
+ */
+export function keyedDigest(context: string, message: string): string {
+  if (!_masterKey) throw new Error('Master key not loaded.');
+  const enc = new TextEncoder();
+  const subkey = hkdf(sha256, _masterKey, undefined, enc.encode(`privateer keyed digest v1:${context}`), 32);
+  const mac = hmac(sha256, subkey, enc.encode(message));
+  return Array.from(mac, b => b.toString(16).padStart(2, '0')).join('');
 }
 
 /**

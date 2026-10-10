@@ -240,7 +240,17 @@ const chatSchema = new mongoose.Schema(
       type: Map,
       of: mongoose.Schema.Types.Mixed,
       default: () => new Map()
-    }
+    },
+    // Chat history brought over from another assistant's data export
+    // (POST /api/graph/chat/import). `importedFrom` names the service so the
+    // app can label the chat; `importKey` is the dedupe handle that makes
+    // re-running an import a no-op. It is an HMAC the CLIENT computes under a
+    // key derived from the account's master key (cryptoService.keyedDigest),
+    // so it is stable per account but reveals nothing about the source
+    // conversation's id — the plain id would let anyone holding that service's
+    // records confirm which of their conversations an account brought here.
+    importedFrom: { type: String, enum: ['chatgpt', 'claude'], default: undefined },
+    importKey: { type: String, default: undefined }
   },
   { 
     timestamps: true 
@@ -257,6 +267,13 @@ chatSchema.index({ userId: 1, isActive: 1 });
 chatSchema.index({ userId: 1, 'messages.imageAttachments.s3Key': 1 });
 chatSchema.index({ userId: 1, 'messages.fileAttachments.storageRef': 1 });
 chatSchema.index({ userId: 1, 'messages.videoAttachments.storageRef': 1 });
+// One live chat per imported conversation. Partial on isActive so deleting an
+// imported chat and importing again brings it back rather than reporting it as
+// already there.
+chatSchema.index(
+  { userId: 1, importKey: 1 },
+  { unique: true, partialFilterExpression: { importKey: { $type: 'string' }, isActive: true } }
+);
 
 // E2EE fence: any new or modified save nulls out the legacy plaintext
 // `title` field and the plaintext `messages[].content`. The encrypted
