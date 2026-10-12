@@ -40,6 +40,18 @@
  *   GET  /api/outbox/blob/:id (authed) → that attachment's ciphertext.
  *   POST /api/outbox/blob/ack (authed) → delete collected attachments by id.
  *
+ *   POST /api/outbox/cargo           (authed, rate-limited) → one sealed Cargo artifact.
+ *   GET  /api/outbox/cargo           (authed) → ids of artifacts waiting to be filed.
+ *   POST /api/outbox/cargo/:id/claim (authed) → lease one and get its ciphertext.
+ *   POST /api/outbox/cargo/:id/release (authed) → hand a lease back unfiled.
+ *   POST /api/outbox/cargo/ack       (authed) → delete filed artifacts by id.
+ *
+ * The cargo routes are the agent's `save_cargo` when no app is attached to the
+ * terminal: it seals the artifact to the same account key and the next app to sync
+ * files it as ordinary Cargo. Its own collection with a claim, because filing must
+ * happen once per account rather than once per device, and because older apps ack
+ * every item they fetch — see models/outboxCargoModel.js.
+ *
  * The blob routes carry the media an unattended run produced — the still a
  * routine generated, the clip it composed. Same sealed-box posture as an item
  * (the server holds ciphertext and can't open it) but a separate collection,
@@ -64,6 +76,7 @@ const OutboxBlob = require('../models/outboxBlobModel');
 const { authenticate } = require('../middleware/auth');
 const { outboxPostLimiter, outboxBlobLimiter } = require('../middleware/rateLimiter');
 const { checkBlobAccepted, BLOB_TTL_MS } = require('../services/outboxBlobLimits');
+const outboxCargo = require('../services/outboxCargo');
 const analyticsService = require('../services/analyticsService');
 
 // A sealed item is epk(32)+iv(12)+tag(16) overhead over a summary capped at
@@ -322,6 +335,98 @@ router.post('/blob/ack', authenticate, async (req, res) => {
     Sentry.captureException(error, { tags: { op: 'outbox_blob_ack' } });
     logger.error('Outbox blob ack error:', error);
     res.status(500).json({ message: 'Error acking outbox attachments' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Queued Cargo saves
+// ---------------------------------------------------------------------------
+
+router.post('/cargo', authenticate, outboxBlobLimiter, async (req, res) => {
+  try {
+    const { sealed } = req.body || {};
+    if (typeof sealed !== 'string' || sealed.length === 0) {
+      return res.status(400).json({ message: 'sealed is required (base64)', code: 'NO_SEALED' });
+    }
+    // Length gate before decoding, as for blobs.
+    const early = outboxCargo.checkCargoAccepted({ size: Math.floor((sealed.length * 3) / 4) });
+    if (!early.ok && early.code === 'OUTBOX_CARGO_TOO_LARGE') {
+      return res.status(early.status).json({ message: early.message, code: early.code });
+    }
+    const buf = decodeBase64(sealed);
+    if (!buf) {
+      return res.status(400).json({ message: 'sealed must be valid base64', code: 'BAD_SEALED' });
+    }
+    const verdict = await outboxCargo.enqueueCargo(req.user._id, buf);
+    if (!verdict.ok) {
+      return res.status(verdict.status).json({ message: verdict.message, code: verdict.code });
+    }
+    analyticsService.track('outbox_cargo');
+    res.status(201).json({ id: verdict.id, createdAt: verdict.createdAt });
+  } catch (error) {
+    Sentry.captureException(error, { tags: { op: 'outbox_cargo_post' } });
+    logger.error('Outbox cargo post error:', error);
+    res.status(500).json({ message: 'Error queueing artifact' });
+  }
+});
+
+router.get('/cargo', authenticate, async (req, res) => {
+  try {
+    res.json({ items: await outboxCargo.listPendingCargo(req.user._id) });
+  } catch (error) {
+    Sentry.captureException(error, { tags: { op: 'outbox_cargo_list' } });
+    logger.error('Outbox cargo list error:', error);
+    res.status(500).json({ message: 'Error listing queued artifacts' });
+  }
+});
+
+router.post('/cargo/ack', authenticate, async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    const valid = ids.filter((id) => mongoose.Types.ObjectId.isValid(id)).slice(0, MAX_FETCH);
+    if (valid.length === 0) {
+      return res.status(400).json({ message: 'ids must be a non-empty array of artifact ids', code: 'NO_IDS' });
+    }
+    res.json({ deleted: await outboxCargo.ackCargo(req.user._id, valid) });
+  } catch (error) {
+    Sentry.captureException(error, { tags: { op: 'outbox_cargo_ack' } });
+    logger.error('Outbox cargo ack error:', error);
+    res.status(500).json({ message: 'Error acking queued artifacts' });
+  }
+});
+
+router.post('/cargo/:id/claim', authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ message: 'invalid id', code: 'BAD_ID' });
+    }
+    const claimed = await outboxCargo.claimCargo(req.user._id, id);
+    if (!claimed) {
+      // Filed by another device, expired, or being filed by another device right now.
+      // All three mean the same thing to the caller: not yours to file, move on.
+      return res.status(409).json({ message: 'Artifact already filed or being filed', code: 'OUTBOX_CARGO_TAKEN' });
+    }
+    res.json(claimed);
+  } catch (error) {
+    Sentry.captureException(error, { tags: { op: 'outbox_cargo_claim' } });
+    logger.error('Outbox cargo claim error:', error);
+    res.status(500).json({ message: 'Error claiming artifact' });
+  }
+});
+
+router.post('/cargo/:id/release', authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ message: 'invalid id', code: 'BAD_ID' });
+    }
+    await outboxCargo.releaseCargo(req.user._id, id);
+    res.json({ ok: true });
+  } catch (error) {
+    Sentry.captureException(error, { tags: { op: 'outbox_cargo_release' } });
+    logger.error('Outbox cargo release error:', error);
+    res.status(500).json({ message: 'Error releasing artifact' });
   }
 });
 
