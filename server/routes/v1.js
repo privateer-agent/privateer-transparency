@@ -51,7 +51,7 @@ const express = require('express');
 const multer = require('multer');
 const router = express.Router();
 const logger = require('../utils/logger');
-const { authenticateApiKey } = require('../middleware/apiKeyAuth');
+const { authenticateApiKey, rebindApiKeyContext } = require('../middleware/apiKeyAuth');
 const { apiRateLimiter } = require('../middleware/rateLimiter');
 const { checkCreditBalance } = require('../middleware/checkBalance');
 const { requireDailyCap, requireConcurrencySlot, requireFeature } = require('../middleware/entitlement');
@@ -201,6 +201,10 @@ router.post(
   checkCreditBalance(0.01),
   requireConcurrencySlot({ keyPrefix: 'apikey', cap: API_CONCURRENCY_CAP }),
   upload.single('file'),
+  // Busboy finishes on the socket's own async context, so the key context
+  // opened by authenticateApiKey does not survive multer — re-enter it, or a
+  // transcription bills the account and never counts against the key's limit.
+  rebindApiKeyContext,
   async (req, res) => {
     try {
       let audioBase64, format;

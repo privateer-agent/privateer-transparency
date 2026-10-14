@@ -30,7 +30,10 @@ const crypto = require('crypto');
 // display suffix (keyLast4) so the UI can render "sk-priv-…a1b2" without ever
 // holding the secret. A key authorizes inference against its owner's account —
 // billed to their shared credit balance, bounded by their tier caps (see
-// middleware/apiKeyAuth.js). Keys live until revoked (no TTL).
+// middleware/apiKeyAuth.js). A key lives until it is revoked or reaches its
+// optional expiresAt, and may carry its own credit limit that resets on a
+// calendar schedule (services/apiKeyUsage.js) — a bound on what THIS key may
+// spend, inside the account balance that bounds everything.
 const KEY_PREFIX = 'sk-priv-';
 
 const apiKeySchema = new mongoose.Schema(
@@ -65,6 +68,34 @@ const apiKeySchema = new mongoose.Schema(
       default: null
     },
     revokedAt: {
+      type: Date,
+      default: null
+    },
+    // null = never expires. Checked by apiKeyAuth, which answers an expired
+    // key with its own message rather than "invalid".
+    expiresAt: {
+      type: Date,
+      default: null
+    },
+    // Spend cap for this key in USD; null = no limit beyond the account's.
+    creditLimitUsd: {
+      type: Number,
+      min: 0,
+      default: null
+    },
+    // When the cap's window restarts (UTC calendar windows); null = never.
+    limitReset: {
+      type: String,
+      enum: ['daily', 'weekly', 'monthly', null],
+      default: null
+    },
+    // Spend counted in the window that began at usageWindowStart. Kept for
+    // every key, limited or not, so the app can show what a key has spent.
+    usageUsd: {
+      type: Number,
+      default: 0
+    },
+    usageWindowStart: {
       type: Date,
       default: null
     }

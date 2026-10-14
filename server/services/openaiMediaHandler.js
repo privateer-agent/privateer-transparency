@@ -231,6 +231,9 @@ async function handleVideoSubmit(req, res) {
         kind: 'videoGen', refKey, meta: { modelId, source: 'api' }, estimatorVersion: estimate.estimatorVersion,
       });
     } catch (e) {
+      if (e?.code === 'KEY_LIMIT_EXCEEDED') {
+        return res.status(402).json({ error: { message: e.message, type: 'invalid_request_error', code: 'KEY_LIMIT_EXCEEDED' } });
+      }
       if (e?.code === 'INSUFFICIENT_FUNDS') {
         return res.status(402).json({ error: { message: 'Insufficient balance to reserve this video job.', type: 'invalid_request_error', code: 'INSUFFICIENT_FUNDS' } });
       }
@@ -583,6 +586,9 @@ async function handleModel3dSubmit(req, res) {
         kind: 'modelGen', refKey, meta: { modelId, ...normalized, views: images.length, source: 'api' },
       });
     } catch (e) {
+      if (e?.code === 'KEY_LIMIT_EXCEEDED') {
+        return res.status(402).json({ error: { message: e.message, type: 'invalid_request_error', code: 'KEY_LIMIT_EXCEEDED' } });
+      }
       if (e?.code === 'INSUFFICIENT_FUNDS') {
         return res.status(402).json({
           error: {
