@@ -3,6 +3,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import authService from './authService';
 import { getActionModel, resolveTtsVoice, getRequireZdr, getAllowNonZdrMedia } from './modelService';
 import i18n from '../i18n';
+import { withCreditRenewal } from './creditRenewalText';
 
 /**
  * Network + audio-codec glue for voice chat mode. The state machine and the
@@ -71,7 +72,7 @@ export async function transcribeRecording(uri: string, format?: string): Promise
       throw new VoiceChatError(data?.message || i18n.t('voice.errors.featureLocked'), 'FEATURE_LOCKED');
     }
     if (res.status === 402 || data?.code === 'INSUFFICIENT_FUNDS') {
-      throw new VoiceChatError(i18n.t('voice.errors.creditsStt'), 'INSUFFICIENT_FUNDS');
+      throw new VoiceChatError(await withCreditRenewal(i18n.t('voice.errors.creditsStt')), 'INSUFFICIENT_FUNDS');
     }
     throw new VoiceChatError(i18n.t('voice.errors.sttFailed'), 'STT_FAILED');
   }
@@ -128,7 +129,7 @@ export async function synthesizeSpeechBytes(
       throw new VoiceChatError(i18n.t('voice.errors.zdrBlocked'), 'ZDR_MEDIA_BLOCKED');
     }
     if (res.status === 402 || data?.code === 'INSUFFICIENT_FUNDS') {
-      throw new VoiceChatError(i18n.t('voice.errors.creditsTts'), 'INSUFFICIENT_FUNDS');
+      throw new VoiceChatError(await withCreditRenewal(i18n.t('voice.errors.creditsTts')), 'INSUFFICIENT_FUNDS');
     }
     throw new VoiceChatError(i18n.t('voice.errors.ttsFailed'), 'TTS_FAILED');
   }
@@ -190,7 +191,7 @@ export async function fetchVoicePreview(
       throw new VoiceChatError(i18n.t('voice.errors.zdrBlocked'), 'ZDR_MEDIA_BLOCKED');
     }
     if (res.status === 402 || data?.code === 'INSUFFICIENT_FUNDS') {
-      throw new VoiceChatError(i18n.t('voice.errors.creditsTts'), 'INSUFFICIENT_FUNDS');
+      throw new VoiceChatError(await withCreditRenewal(i18n.t('voice.errors.creditsTts')), 'INSUFFICIENT_FUNDS');
     }
     throw new VoiceChatError(i18n.t('voice.errors.ttsFailed'), 'TTS_FAILED');
   }
