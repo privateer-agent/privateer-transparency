@@ -41,6 +41,9 @@
  *   POST /v1/audio/music            — music generation (Privateer ext., audio bytes)
  *   POST /v1/search                 — web search, server-side (Privateer ext.)
  *   POST /v1/fetch                  — read web pages as text (Privateer ext.)
+ *   GET  /v1/systemone/models       — list decision models (Kev)
+ *   POST /v1/systemone              — typed decisions from a decision model
+ *                                     (TypeSafe System One wire format)
  *
  * sk-priv-… keys instead of the app JWT; downstream model resolution, ZDR,
  * entitlement, and billing are the same account path the app uses. Inference is
@@ -77,6 +80,7 @@ const billingService = require('../services/billingService');
 const { listEnabledModels } = require('../services/inferenceService');
 const { search: braveSearch, SEARCH_COST_USD } = require('../services/braveSearchService');
 const linkAnalysisService = require('../services/linkAnalysisService');
+const phalaDecisions = require('../services/phalaDecisionService');
 
 // Developer /v1 turns get their own concurrency pool ('apikey'), separate from
 // the app's chat slots (the Agent CLI routes hold no slot at all).
@@ -550,6 +554,99 @@ router.post(
       logger.error('[v1 fetch]', err.message);
       return oaError(res, 502, 'Fetch failed.', 'FETCH_FAILED');
     }
+  }
+);
+
+// ── Decisions (System One) ───────────────────────────────────────────────────
+// Kev on Phala: one `state` + typed `questions` in, one calibrated answer per
+// question out (noul / choice / score). The body is TypeSafe's System One format
+// and is forwarded as-is — only `model` is resolved here — so a TypeSafe client
+// pointed at https://api.privateer.pro works unchanged. Phala's 4xx (a malformed
+// question is a 422) come back verbatim and are NOT billed; a 2xx is billed from
+// Phala's own usage.cost at the developer markup. The enclave's receipt id is
+// handed back as x-phala-receipt-id so a caller can tie the answer to Phala's
+// attestation trail. Not E2EE (see the header): TLS to Phala's gateway.
+
+router.get('/systemone/models', apiRateLimiter, async (_req, res) => {
+  try {
+    const models = await phalaDecisions.listDecisionModels();
+    const factor = billingService.apiMarkupFactor();
+    res.json({
+      object: 'list',
+      data: models.map((m) => ({
+        id: m.upstreamId,
+        object: 'model',
+        owned_by: 'phala',
+        context_length: m.contextLength,
+        description: m.description,
+        tee: m.teeStack,
+        pricing: {
+          input_per_m_tokens: m.pricing.promptPerMToken != null ? m.pricing.promptPerMToken * factor : null,
+          output_per_m_tokens: m.pricing.completionPerMToken != null ? m.pricing.completionPerMToken * factor : null,
+        },
+      })),
+    });
+  } catch (err) {
+    logger.error('GET /v1/systemone/models failed:', err.message);
+    res.status(500).json({ error: { message: 'Failed to fetch model list', type: 'server_error', code: 'models_unavailable' } });
+  }
+});
+
+router.post(
+  '/systemone',
+  apiRateLimiter,
+  requireDailyCap('message'),
+  checkCreditBalance(0.01),
+  requireConcurrencySlot({ keyPrefix: 'apikey', cap: API_CONCURRENCY_CAP }),
+  async (req, res) => {
+    const body = req.body || {};
+    if (typeof body.state !== 'string' || !body.state.trim()) {
+      return oaError(res, 400, '`state` is required (a string).', 'STATE_REQUIRED');
+    }
+    const q = body.questions;
+    if (!q || typeof q !== 'object' || Array.isArray(q) || Object.keys(q).length === 0) {
+      return oaError(res, 400, '`questions` is required: an object of named questions.', 'QUESTIONS_REQUIRED');
+    }
+
+    let model;
+    try {
+      model = await phalaDecisions.resolveDecisionModel(body.model);
+    } catch (err) {
+      logger.error('[v1 systemone] catalog', err.message);
+      return oaError(res, 502, 'Decision models are unavailable right now.', 'DECISION_FAILED');
+    }
+    if (!model) {
+      return oaError(res, 400, 'Unknown decision model. See GET /v1/systemone/models.', 'MODEL_NOT_FOUND');
+    }
+
+    let out;
+    try {
+      out = await phalaDecisions.decide(body, { model });
+    } catch (err) {
+      logger.error('[v1 systemone]', err.message);
+      return oaError(res, 502, 'Decision request failed.', 'DECISION_FAILED');
+    }
+    if (out.receiptId) res.set('x-phala-receipt-id', out.receiptId);
+
+    if (out.status >= 400 && out.status < 500 && out.status !== 401 && out.status !== 403 && out.status !== 429) {
+      // The caller's request was wrong — pass Phala's own envelope through.
+      return res.status(out.status).json(out.body || { error: { message: 'The request was rejected as invalid', type: 'invalid_request_error', code: null } });
+    }
+    if (out.status >= 400) {
+      // Our key / Phala's capacity: our problem, not the caller's request.
+      logger.error('[v1 systemone] upstream', out.status, JSON.stringify(out.body || {}).slice(0, 300));
+      return oaError(res, 502, 'Decision request failed.', 'DECISION_FAILED');
+    }
+
+    await billingService.chargeUsd(req.userId, billingService.apiBilledCost({ providerCostUsd: out.providerCostUsd }), {
+      model: `phala/${model}`,
+      tokensPrompt: out.usage.inputTokens,
+      tokensCompletion: out.usage.outputTokens,
+      providerCostUsd: out.providerCostUsd,
+      kind: 'inference',
+      origin: 'api',
+    });
+    return res.json(out.body);
   }
 );
 
