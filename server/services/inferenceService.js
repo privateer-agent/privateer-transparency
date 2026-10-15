@@ -2857,4 +2857,6 @@ module.exports = { generateText, generateTextStream, proxyChatCompletion, proxyR
   getImageModelOutputModalities, resetImageModelInfoCacheForTests,
   // Exported for regression tests (imageGenPricing: image_output vs the legacy
   // `pricing.image`, and the learned per-image price).
-  catalogImagePrice, recordObservedImagePrice };
+  catalogImagePrice, recordObservedImagePrice,
+  // The model picker quotes image prices off the same two sources billing uses.
+  getObservedImagePrice };

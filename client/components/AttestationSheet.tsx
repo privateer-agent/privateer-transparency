@@ -6,11 +6,11 @@ import {
   TouchableOpacity,
   StyleSheet,
   Modal,
-  ActivityIndicator,
   ScrollView,} from 'react-native';
 import { openExternal } from '../utils/openExternal';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../contexts/ThemeContext';
+import Button from './Button';
 import { getTeeAttestation, type OpenRouterModel, type TeeAttestation } from '../services/modelService';
 
 // Public docs explaining how to independently verify an attestation report,
@@ -33,7 +33,7 @@ interface Props {
  * inspection; full on-device cryptographic verification is a follow-up.
  */
 const AttestationSheet: React.FC<Props> = ({ visible, model, onClose }) => {
-  const { theme, ambientScrim, ambientSurface, ambientAccent, ambientOnAccent } = useTheme();
+  const { theme, ambientScrim, ambientSurface } = useTheme();
   const { t } = useTranslation();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -136,26 +136,25 @@ const AttestationSheet: React.FC<Props> = ({ visible, model, onClose }) => {
           </ScrollView>
 
           {!attestation && (
-            <TouchableOpacity
-              style={[s.primaryBtn, { backgroundColor: ambientAccent, opacity: loading ? 0.6 : 1 }]}
+            <Button
+              variant="primary"
+              title={t('attestation.viewReport')}
+              loading={loading}
               onPress={fetchReport}
-              disabled={loading}
-            >
-              {loading ? (
-                <ActivityIndicator color={ambientOnAccent} size="small" />
-              ) : (
-                <Text style={[s.primaryBtnText, { color: ambientOnAccent }]}>{t('attestation.viewReport')}</Text>
-              )}
-            </TouchableOpacity>
+              fullWidth
+              style={s.primaryBtn}
+            />
           )}
 
-          <TouchableOpacity
+          <Button
+            variant="link"
+            size="sm"
+            title={t('attestation.learnMore')}
             onPress={() =>
               openExternal(model?.id.startsWith('tinfoil/') ? TINFOIL_VERIFY_DOCS : NEAR_VERIFY_DOCS)
             }
-          >
-            <Text style={[s.link, { color: ambientAccent }]}>{t('attestation.learnMore')}</Text>
-          </TouchableOpacity>
+            style={s.link}
+          />
         </TouchableOpacity>
       </TouchableOpacity>
     </Modal>
@@ -194,9 +193,8 @@ const styles = (theme: any, ambientSurface: string, ambientScrim: string) =>
     reportTitle: { fontSize: 13, fontWeight: '700', marginBottom: 2 },
     meta: { fontSize: 11, fontFamily: 'monospace' },
     error: { fontSize: 13, marginTop: 12 },
-    primaryBtn: { marginTop: 16, borderRadius: 12, paddingVertical: 13, alignItems: 'center', justifyContent: 'center' },
-    primaryBtnText: { fontSize: 15, fontWeight: '700' },
-    link: { fontSize: 13, fontWeight: '600', textAlign: 'center', marginTop: 14 },
+    primaryBtn: { marginTop: 16 },
+    link: { alignSelf: 'center', marginTop: 14 },
   });
 
 export default AttestationSheet;

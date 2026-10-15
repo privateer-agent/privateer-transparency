@@ -677,7 +677,7 @@ function buildAudioSnapshot(
   backend: ShareSourceBackend,
 ): BuiltSnapshot {
   const clip = source.audio;
-  if (!clip) throw new Error('Nothing to share — this clip has no audio.');
+  if (!clip) throw new Error('Nothing to share: this clip has no audio.');
   if (backend === 'cloud' && (!clip.signedUrl || !clip.encIv)) {
     // Signed URLs expire, so a stale row can reach here with nothing to fetch.
     // A cloud clip with no IV is a legacy unencrypted object — the other
