@@ -124,6 +124,24 @@ kept so it isn't lost. There, and only there:
   mid-reply. Never describe this as E2EE. When the setting is **off** (default), the
   absolute "ciphertext only" guarantee holds unchanged.
 
+**The same consent covers agent chat's model calls** (the on-device agent loop,
+`client/services/agentCore`). There a turn is several model calls through
+`POST /api/app-tools/v1/chat/completions`, and a phone that locks mid-call loses
+that call's stream. With `holdReplyInCloud` on — and only then — each call carries
+`X-Privateer-Hold: 1` and a per-call request id; if the client disconnects, the
+proxy **keeps the generation running to the end** (it would otherwise be cut and
+billed as an abort), stops writing, and holds the call's **exact SSE bytes** in
+Redis (`heldCompletion:<userId>:<requestId>`, TTL default **10 minutes**,
+`HELD_COMPLETION_TTL_MS`, size-capped). The app collects them
+(`GET /api/app-tools/v1/held/:id`), resumes the stream from the byte it had
+reached, and deletes them (`DELETE`). The same `DELETE` is the user's **Stop**:
+while the generation is still running it is marked cancelled and the proxy stops
+reading, so a Stop is never finished and billed in full. Billed once, as a delivered
+stream. Same bounds as above — opt-in, only on an actual disconnect, Redis only,
+deleted on pickup — with a shorter window. Implementation:
+`server/services/heldCompletionStore.js`, hold mode in
+`server/services/openaiProxyHandler.js`, client `agentCore/transport.withHeldResume`.
+
 Note: the composer-**draft** persistence that ships alongside this is **fully
 on-device** (EncryptedStorage only, `services/draftService.ts`) — no server, no
 carve-out.

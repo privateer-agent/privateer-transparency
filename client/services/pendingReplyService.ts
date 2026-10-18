@@ -166,6 +166,27 @@ async function runRecovery(): Promise<number> {
       continue;
     }
 
+    // An agent-chat turn (services/agentCore) has no server-held reply; it has
+    // an on-device checkpoint, and resuming the loop from it finishes the turn.
+    // Dynamic import: connectorChatService reaches back into chatService.
+    try {
+      const { recoverAgentTurn } = await import('./connectors/connectorChatService');
+      const agent = await recoverAgentTurn(marker.pendingMessageId);
+      // Still running in this process (a short lock), or a transient failure:
+      // leave the marker; the live turn or a later pass settles it.
+      if (agent.kind === 'retry' || agent.kind === 'live') continue;
+      if (agent.kind === 'done') {
+        if (agent.response) {
+          await persistRecoveredReply(marker, { response: agent.response, modelUsed: agent.modelUsed, tokensUsed: 0 });
+          recovered += 1;
+        }
+        await clearPendingMarker(marker.pendingMessageId);
+        continue;
+      }
+    } catch (_) {
+      // Fall through to the server-held reply path below.
+    }
+
     try {
       const res = await authService.makeAuthenticatedRequest(
         `/api/chat/pending/${encodeURIComponent(marker.pendingMessageId)}`

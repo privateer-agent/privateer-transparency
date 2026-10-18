@@ -43,6 +43,7 @@ const Sentry = require('@sentry/node');
 const inferenceService = require('./inferenceService');
 const billingService = require('./billingService');
 const { resolveUserModelId, resolveRequireZdr } = require('../controllers/chatController');
+const heldCompletionStore = require('./heldCompletionStore');
 
 /**
  * Apply a surface's billing policy to a provider cost.
@@ -382,12 +383,45 @@ async function handleChatCompletion(req, res, opts = {}) {
     // nothing else, and a character count is all the estimate below needs.
     let completionChars = 0;
     let aborted = false;
-    res.on('close', () => { aborted = true; });
+    // Agent chat's "finish replies in the cloud" (services/heldCompletionStore.js):
+    // only on the app's own route, only when the client opted in for this call.
+    // In hold mode a disconnect does NOT stop the generation — we keep reading to
+    // the end, without writing, and stash the exact bytes for the client to
+    // collect when it comes back. Billing is then the full delivered-stream path,
+    // once; the client collects instead of re-sending.
+    const holdRequestId = kind === 'app_tools' && req.get?.('x-privateer-hold') === '1'
+      ? req.get?.('x-privateer-request-id')
+      : null;
+    const holdMode = !!holdRequestId && heldCompletionStore.validRequestId(holdRequestId);
+    const held = holdMode ? [] : null;
+    let heldBytes = 0;
+    let heldOverflow = false;
+    let clientGone = false;
+    let lastCancelCheck = 0;
+    res.on('close', () => {
+      if (res.writableFinished) return;
+      clientGone = true;
+      if (holdMode) heldCompletionStore.markPending(userId, holdRequestId);
+      else aborted = true;
+    });
 
     while (true) {
       const { done, value } = await reader.read();
       if (done || aborted) break;
-      res.write(Buffer.from(value));
+      const chunk = Buffer.from(value);
+      if (held && !heldOverflow) {
+        heldBytes += chunk.length;
+        if (heldBytes > heldCompletionStore.HELD_COMPLETION_MAX_BYTES) heldOverflow = true;
+        else held.push(chunk);
+      }
+      if (!clientGone) res.write(chunk);
+      // A hold that outgrew its cap has nothing to give back: stop paying for it.
+      if (clientGone && heldOverflow) { aborted = true; break; }
+      // The user pressed Stop (the client's DELETE marks it): stop generating.
+      if (clientGone && holdMode && Date.now() - lastCancelCheck > 1000) {
+        lastCancelCheck = Date.now();
+        if (await heldCompletionStore.isCancelled(userId, holdRequestId)) { aborted = true; break; }
+      }
 
       // Tee a decoded copy to extract the final usage object for billing, and to
       // measure what was generated in case the client leaves before it arrives.
@@ -408,7 +442,11 @@ async function handleChatCompletion(req, res, opts = {}) {
     }
 
     if (aborted) { try { await reader.cancel(); } catch (_) {} }
-    res.end();
+    if (!clientGone) res.end();
+    if (holdMode && clientGone) {
+      if (!aborted && !heldOverflow) await heldCompletionStore.stashComplete(userId, holdRequestId, Buffer.concat(held));
+      else await heldCompletionStore.drop(userId, holdRequestId);
+    }
 
     // A stream that ends without a usable usage chunk is settled on the best
     // source that still has a number — the provider report, OpenRouter's
