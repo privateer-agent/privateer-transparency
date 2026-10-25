@@ -61,10 +61,65 @@ const NEAR_MEDIA_TIMEOUT_MS = Number(process.env.NEAR_MEDIA_TIMEOUT_MS) || 120_0
 // (reasoning_effort / thinking:{type} were not). App paths only — the agent
 // passthrough forwards the caller's body untouched. NEAR_ENABLE_THINKING=true
 // restores the old behaviour.
-function thinkingControl() {
-  return process.env.NEAR_ENABLE_THINKING === 'true'
-    ? {}
-    : { chat_template_kwargs: { enable_thinking: false } };
+//
+// EXCEPT GLM, where the switch now backfires. Measured 2026-10-26: GLM 5.3,
+// GLM 5.3 Flash and NEAR's DeepSeek-V4-Flash alias of it all think anyway with
+// `enable_thinking: false` — but the reasoning parser no longer splits it out,
+// so "The user asks why the sky is blue… Let me craft…" (sometimes ending in a
+// bare `</think>`) arrives as `content` and is shown as the answer. Without the
+// switch the same think goes to `reasoning_content`, which the app drops, and
+// the answer is clean. GLM can't skip its think on NEAR either way.
+const NEAR_THINKS_REGARDLESS = /glm|^deepseek-ai\/deepseek-v4-flash$/i;
+
+function thinkingControl(modelId) {
+  if (process.env.NEAR_ENABLE_THINKING === 'true') return {};
+  if (NEAR_THINKS_REGARDLESS.test(toUpstreamId(modelId))) return {};
+  return { chat_template_kwargs: { enable_thinking: false } };
+}
+
+// Backstop for a template that puts the think in `content` wrapped in tags:
+// drop everything up to the closing `</think>`. Only a reply that OPENS with
+// `<think>` is held back while streaming — an untagged leak can't be told apart
+// from an answer, which is why thinkingControl() is the real fix.
+const THINK_CLOSE = '</think>';
+
+function stripLeadingThink(text) {
+  if (typeof text !== 'string' || !/^\s*<think>/.test(text)) return text;
+  const i = text.indexOf(THINK_CLOSE);
+  return i === -1 ? text.replace(/^\s*<think>/, '') : text.slice(i + THINK_CLOSE.length).replace(/^\s+/, '');
+}
+
+function createThinkStripper(push, onReasoning) {
+  let state = 'start'; // start → (thinking) → pass
+  let head = '';
+  const reason = (t) => {
+    if (t && onReasoning) { try { onReasoning(t); } catch { /* ignore */ } }
+  };
+  return {
+    push(delta) {
+      if (state === 'pass') return push(delta);
+      head += delta;
+      if (state === 'start') {
+        const lead = head.replace(/^\s+/, '');
+        if (!lead) return;
+        if ('<think>'.startsWith(lead)) return; // could still become the tag
+        if (!lead.startsWith('<think>')) { state = 'pass'; const h = head; head = ''; return push(h); }
+        state = 'thinking';
+      }
+      const i = head.indexOf(THINK_CLOSE);
+      if (i === -1) return;
+      reason(head.slice(0, i).replace(/^\s*<think>/, ''));
+      const rest = head.slice(i + THINK_CLOSE.length).replace(/^\s+/, '');
+      head = '';
+      state = 'pass';
+      if (rest) push(rest);
+    },
+    // A think that never closed is all there is — hand it over rather than
+    // reporting an empty reply.
+    end() {
+      if (head) { const h = head; head = ''; push(state === 'thinking' ? h.replace(/^\s*<think>/, '') : h); }
+    },
+  };
 }
 
 function isNearModel(modelId) {
@@ -309,13 +364,13 @@ async function generateText(parts, options = {}) {
     messages,
     temperature: options.temperature ?? 0.8,
     max_tokens: await clampMaxTokens(modelId, options.maxTokens),
-    ...thinkingControl(),
+    ...thinkingControl(modelId),
   };
 
   try {
     const res = await nearChatRequest(body, modelId);
     const data = await res.json();
-    const rawText = data.choices?.[0]?.message?.content || '';
+    const rawText = stripLeadingThink(data.choices?.[0]?.message?.content || '');
     const text = convertTablesToBullets(rawText);
     const inputTokens = data.usage?.prompt_tokens || 0;
     const outputTokens = data.usage?.completion_tokens || 0;
@@ -365,7 +420,7 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
     stream_options: { include_usage: true },
     temperature: options.temperature ?? 0.8,
     max_tokens: maxTokens,
-    ...thinkingControl(),
+    ...thinkingControl(modelId),
   };
 
   const res = await nearChatRequest(body, modelId, { stream: true, signal: options.signal });
@@ -384,6 +439,7 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
   // Persona guard sits last, closest to the wire (see inferenceService).
   const personaGuard = createPersonaGuard(onChunk, options);
   const tableConverter = createStreamingTableConverter((text) => personaGuard.push(text));
+  const thinkStripper = createThinkStripper((text) => tableConverter.push(text), options.onReasoning);
 
   try {
     outer: while (true) {
@@ -413,7 +469,14 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
         try {
           const parsed = JSON.parse(raw);
           const delta = parsed.choices?.[0]?.delta?.content;
-          if (delta) { sawContent = true; tableConverter.push(delta); }
+          if (delta) { sawContent = true; thinkStripper.push(delta); }
+          // GLM's think arrives here (see thinkingControl). Never shown as the
+          // answer; a caller that wants a "thinking" status opts in, as with
+          // inferenceService.generateTextStream.
+          const reasoningDelta = parsed.choices?.[0]?.delta?.reasoning_content ?? parsed.choices?.[0]?.delta?.reasoning;
+          if (reasoningDelta && options.onReasoning) {
+            try { options.onReasoning(reasoningDelta); } catch { /* ignore */ }
+          }
           if (parsed.usage) {
             inputTokens = parsed.usage.prompt_tokens || inputTokens;
             outputTokens = parsed.usage.completion_tokens || outputTokens;
@@ -427,6 +490,7 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
     // (trailing connection reset). Both transformers hold back the trailing
     // window until end(); skipping it drops that tail and cuts the reply off
     // mid-sentence. See inferenceService.js / personaGuard.js.
+    thinkStripper.end();
     tableConverter.end();
     personaGuard.end();
   }
@@ -646,4 +710,4 @@ async function transcribe({ audioBase64, format, language, modelId }) {
   return { text, providerCostUsd };
 }
 
-module.exports = { isNearModel, toUpstreamId, generateText, generateTextStream, proxyChatCompletion, calcNearCost, generateImage, transcribe };
+module.exports = { isNearModel, toUpstreamId, thinkingControl, stripLeadingThink, createThinkStripper, generateText, generateTextStream, proxyChatCompletion, calcNearCost, generateImage, transcribe };

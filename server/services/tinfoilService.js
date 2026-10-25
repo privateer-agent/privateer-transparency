@@ -306,6 +306,12 @@ async function generateTextStream(messages, modelId, options = {}, onChunk) {
           const parsed = JSON.parse(raw);
           const delta = parsed.choices?.[0]?.delta?.content;
           if (delta) { sawContent = true; tableConverter.push(delta); }
+          // Thinking models (Kimi, GLM, DeepSeek) — never the answer; a caller
+          // that shows a live "thinking" status opts in (see inferenceService).
+          const reasoningDelta = parsed.choices?.[0]?.delta?.reasoning_content ?? parsed.choices?.[0]?.delta?.reasoning;
+          if (reasoningDelta && options.onReasoning) {
+            try { options.onReasoning(reasoningDelta); } catch { /* ignore */ }
+          }
           if (parsed.usage) {
             inputTokens = parsed.usage.prompt_tokens || inputTokens;
             outputTokens = parsed.usage.completion_tokens || outputTokens;
