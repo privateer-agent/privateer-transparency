@@ -73,6 +73,8 @@ async function authenticate(req, res, next) {
     // the app and a linked terminal, so it cannot infer the caller from the path the
     // way agentInference/v1/appTools do.
     req.sessionClient = session.client;
+    // The device lineage this session belongs to (legacy rows: their jti).
+    req.sessionFamilyId = session.familyId || decoded.jti;
     next();
   } catch (err) {
     if (err.name === 'TokenExpiredError') {
@@ -103,6 +105,7 @@ async function lightAuthenticate(req, res, next) {
       req.jti = decoded.jti;
       req.authMethod = decoded.authMethod;
       req.sessionClient = session.client;
+      req.sessionFamilyId = session.familyId || decoded.jti;
     }
   } catch (_) {
     // Invalid token — continue without user

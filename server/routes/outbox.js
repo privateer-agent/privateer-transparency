@@ -78,6 +78,7 @@ const { outboxPostLimiter, outboxBlobLimiter } = require('../middleware/rateLimi
 const { checkBlobAccepted, BLOB_TTL_MS } = require('../services/outboxBlobLimits');
 const outboxCargo = require('../services/outboxCargo');
 const analyticsService = require('../services/analyticsService');
+const pushService = require('../services/pushService');
 
 // A sealed item is epk(32)+iv(12)+tag(16) overhead over a summary capped at
 // ~64KiB plaintext. Cap the base64 payload generously above that; the mailbox
@@ -205,6 +206,11 @@ router.post('/', authenticate, outboxPostLimiter, async (req, res) => {
     // holds ciphertext, so there is no status to report and no dimension to add
     // — the count is the whole of what we can honestly know.
     analyticsService.track('outbox_result');
+
+    // Wake the app: its relay socket did not survive being backgrounded, so
+    // nothing else tells it this landed. Content-free and fire-and-forget — a
+    // push failure must never fail the write (services/pushService.js).
+    void pushService.sendInboxNudge(req.user._id);
 
     res.status(201).json({ id: item._id, createdAt: item.createdAt });
   } catch (error) {

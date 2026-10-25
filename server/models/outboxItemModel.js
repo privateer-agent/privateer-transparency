@@ -23,7 +23,8 @@
 const mongoose = require('mongoose');
 
 // Cloud "outbox" for unattended CLI results (completed routines, finished agent
-// tasks) so the app can catch up when it reopens, without push notifications.
+// tasks) so the app can catch up when it reopens. A new item also sends a
+// content-free push ("a result is waiting") — services/pushService.js.
 //
 // Store-and-forward mailbox, NOT an archive: the CLI seals a small summary to
 // the account's outbox public key (X25519 sealed box; see outboxSeal on the

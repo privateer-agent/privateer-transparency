@@ -1107,6 +1107,8 @@ router.post('/account/delete-request', authenticate, async (req, res) => {
     await user.save();
 
     await tokenService.revokeAllUserSessions(user._id);
+    // Its phones stop being told about results now, not at the next send's prune.
+    await require('../models/pushDeviceModel').deleteMany({ userId: user._id }).catch(() => {});
     // Every session is gone — promptly sign out all live terminals too, rather
     // than let them dead-end on their next call. Best-effort (see DELETE handler).
     void signalAllTerminals(user._id).catch((err) => {
