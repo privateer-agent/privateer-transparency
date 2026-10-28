@@ -75,7 +75,9 @@ function tinfoilBase() {
 // live /v1/models fetch 2026-09-19 — still marked `experimental` by Tinfoil).
 // Delisted as of 2026-09-18 (confirmed absent from a live /v1/models fetch):
 // `deepseek-v4-pro`, `qwen3-vl-30b` (delisted 2026-08-03, no direct
-// replacement), `glm-5-2` (→ `glm-5-3`), `kimi-k2-6` (→ `kimi-k3`). A delisted
+// replacement), `glm-5-2` (→ `glm-5-3`), `kimi-k2-6` (→ `kimi-k3`). Also
+// absent from a live fetch 2026-10-27: `glm-5-3-flash` (no direct replacement;
+// it was never a curated pick, so no alias is needed). A delisted
 // id a user may have *persisted* is a different problem — that heals in
 // inferenceService.RETIRED_MODEL_ALIASES.
 const MODEL_INFO = {
