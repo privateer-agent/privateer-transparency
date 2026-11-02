@@ -1623,7 +1623,7 @@ async function getVideoModelRuntimeCaps(modelId) {
  * @returns {{ jobId: string, pollingUrl: string, status: string }}
  */
 async function submitVideoGeneration(prompt, options = {}) {
-  const modelId = options.modelId || process.env.DEFAULT_VIDEO_MODEL || 'kwaivgi/kling-v3.0-std';
+  const modelId = options.modelId || process.env.DEFAULT_VIDEO_GEN_MODEL || process.env.DEFAULT_VIDEO_MODEL || 'kwaivgi/kling-v3.0-std';
 
   const body = {
     model: modelId,
