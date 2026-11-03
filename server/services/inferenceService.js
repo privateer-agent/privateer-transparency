@@ -2674,171 +2674,169 @@ function scoreMemoryAgainstMessage(messageTokens, memoryText) {
 }
 
 /**
- * Pick the subset of stored memories that are relevant to the current user
- * message. Hybrid: heuristic prefilter narrows to a small candidate set, then
- * an LLM judge call returns the final keep-list. On any failure or timeout
- * the heuristic top-N is returned instead.
+ * Pick which saved memories go into this turn's system prompt.
+ *
+ * Saved memories are the user's PROFILE — what the assistant should simply
+ * know about them, the way ChatGPT's saved memories work — so the default is
+ * ALL of them. This used to be a relevance filter (two shared words or the
+ * memory was dropped), which meant "what should I cook tonight?" never saw
+ * "Is vegetarian": memory existed and was almost never used. Whether a fact
+ * applies to the message is the chat model's call, made with the whole
+ * conversation in view; the prompt framing (buildSystemPrompt) tells it to
+ * use them only when relevant and never recite them.
+ *
+ * Only when the list outgrows MEMORY_PROMPT_CHAR_BUDGET do we choose: word
+ * overlap with the message first, then recency (the client sends newest
+ * first), filling the budget. Returned in the order given, so an unchanged
+ * list yields a byte-identical block and the prompt prefix stays cacheable.
+ * No model call — this used to spend a judge round-trip in front of TTFT.
+ *
+ * LOCKSTEP with client/services/pipeline/memory.ts (Sealed mode).
  *
  * @param {{ memories: string[], userMessage: string }} args
  * @returns {Promise<string[]>}
  */
-async function selectRelevantMemories({ memories, userMessage, requireZdr = false }) {
-  const list = Array.isArray(memories) ? memories.filter(m => typeof m === 'string' && m.trim()) : [];
+const MEMORY_PROMPT_CHAR_BUDGET = 6000;
+const MEMORY_PROMPT_MAX_ITEMS = 80;
+
+async function selectRelevantMemories({ memories, userMessage }) {
+  const list = Array.isArray(memories)
+    ? memories.filter(m => typeof m === 'string' && m.trim()).map(m => m.trim())
+    : [];
   if (list.length === 0) return [];
-  if (typeof userMessage !== 'string' || !userMessage.trim()) return [];
 
-  const msgTokens = tokenizeForMemory(userMessage);
-  if (msgTokens.length === 0) return [];
+  const total = list.reduce((n, m) => n + m.length + 3, 0);
+  if (total <= MEMORY_PROMPT_CHAR_BUDGET && list.length <= MEMORY_PROMPT_MAX_ITEMS) return list;
 
-  const scored = list.map((content, idx) => ({ idx, content, score: scoreMemoryAgainstMessage(msgTokens, content) }));
-  scored.sort((a, b) => b.score - a.score);
-
-  // Hard relevance floor — a single incidental token match isn't enough to
-  // surface a memory. Require either a meaningful unigram overlap or any
-  // bigram hit (bigrams count 2× in the score).
-  const MIN_SCORE = 2;
-  const candidates = scored.filter(c => c.score >= MIN_SCORE).slice(0, 10);
-
-  // Nothing cleared the floor — the current message is unrelated to every
-  // stored fact. Returning [] here is what stops topic bleed.
-  if (candidates.length === 0) return [];
-
-  // Fewer than 3 candidates → judge adds noise, not signal. The heuristic
-  // already enforced score ≥ MIN_SCORE, so anything that survived the floor
-  // is worth keeping. Skipping the LLM call here saves the judge round-trip
-  // (up to JUDGE_TIMEOUT_MS) on memory-light turns, which is the common case.
-  if (candidates.length <= 2) return candidates.map(c => c.content);
-
-  const numbered = candidates.map((c, i) => `${i}: ${c.content}`).join('\n');
-  const judgeSystem = [
-    'You decide which of the user\'s stored memories are DIRECTLY relevant to their CURRENT message.',
-    'Default to {"keep":[]}. Only include a memory if applying it would visibly change a good answer to THIS specific message.',
-    'Do NOT keep a memory just because it shares a topic, domain, or vocabulary — require concrete applicability.',
-    'Irrelevant memories cause topic bleed and pollute the assistant\'s response. Precision over recall.',
-    'Return JSON only, no prose, of the form: {"keep":[<indices>]}.'
-  ].join('\n');
-  const judgeUser = `CURRENT MESSAGE:\n${userMessage}\n\nMEMORIES:\n${numbered}\n\nReturn JSON: {"keep":[<indices>]}`;
-
-  // Bounds the worst-case pre-flight tail. The judge now runs concurrently
-  // with intent + model resolution (see streamMessage), so its cost is mostly
-  // overlapped; a tighter cap trims the tail with negligible quality loss —
-  // the heuristic top-N fallback already handles a timeout gracefully.
-  const JUDGE_TIMEOUT_MS = 500;
-
-  try {
-    const result = await Promise.race([
-      openRouterChat(
-        [
-          { role: 'system', content: judgeSystem },
-          { role: 'user', content: judgeUser }
-        ],
-        MEMORY_HELPER_MODEL,
-        { temperature: 0, maxTokens: 200, requireZdr }
-      ),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('memory-judge timeout')), JUDGE_TIMEOUT_MS))
-    ]);
-
-    const raw = result?.choices?.[0]?.message?.content || '';
-    const match = raw.match(/\{[\s\S]*\}/);
-    if (!match) throw new Error('judge: no JSON');
-    const parsed = JSON.parse(match[0]);
-    const keep = Array.isArray(parsed.keep) ? parsed.keep : [];
-    const selected = keep
-      .map(i => candidates[Number(i)])
-      .filter(c => c && typeof c.content === 'string')
-      .slice(0, 4)
-      .map(c => c.content);
-    return selected;
-  } catch (err) {
-    Sentry.captureException(err, { level: 'warning', tags: { op: 'memory_select' } });
-    logger.warn('[selectRelevantMemories] judge failed, falling back to heuristic:', err.message);
-    // Fallback is strict too — only the very top candidates that cleared the
-    // floor. Better to silently drop a relevant memory than bleed an
-    // irrelevant one in.
-    return candidates.slice(0, 2).map(c => c.content);
+  const msgTokens = tokenizeForMemory(typeof userMessage === 'string' ? userMessage : '');
+  const ranked = list
+    .map((content, idx) => ({ idx, content, score: msgTokens.length ? scoreMemoryAgainstMessage(msgTokens, content) : 0 }))
+    .sort((a, b) => (b.score - a.score) || (a.idx - b.idx));
+  const keep = new Set();
+  let used = 0;
+  for (const c of ranked) {
+    if (keep.size >= MEMORY_PROMPT_MAX_ITEMS) break;
+    const cost = c.content.length + 3;
+    if (used + cost > MEMORY_PROMPT_CHAR_BUDGET) continue;
+    keep.add(c.idx);
+    used += cost;
   }
+  return list.filter((_, idx) => keep.has(idx));
 }
 
 /**
- * Inspect a finished chat turn and propose AT MOST ONE durable memory
- * candidate the assistant should remember next time — and only when it clears
- * a high bar (the model must rate it "high" importance; everything else is
- * dropped). The default, expected result is an empty list. Returns plaintext
- * only; the caller is responsible for encrypting + persisting via the standard
- * memory CRUD flow.
+ * Inspect a finished chat turn and propose memories worth keeping — the
+ * "it learns as you use it" half. Up to MEMORY_EXTRACT_MAX candidates rated
+ * high or medium; each may name existing memories it SUPERSEDES ("Lives in
+ * Lisbon" replaces "Lives in Berlin"), returned as their exact text so the
+ * client can delete them by content without the server ever seeing an id.
  *
- * @param {{ userMessage: string, aiResponse: string, existingMemories: string[] }} args
- * @returns {Promise<{ candidates: { content: string }[] }>}
+ * The bar used to be "at most one, high only, default to nothing", which in
+ * practice saved nothing at all. It is now ordinary-useful facts about the
+ * user, with two hard exclusions that are about trust rather than taste:
+ * secrets/credentials/ID numbers are never saved, and sensitive categories
+ * (health, religion, sexuality, politics, precise finances) only when the user
+ * plainly asked for them to be remembered. Memory text is data the next prompt
+ * quotes, so a candidate phrased as an instruction to the assistant is dropped.
+ *
+ * Returns plaintext only; the caller encrypts + persists via the standard
+ * memory CRUD flow. LOCKSTEP with client/services/pipeline/memory.ts.
+ *
+ * @returns {Promise<{ candidates: { content: string, replaces?: string[] }[] }>}
  */
+const MEMORY_EXTRACT_MAX = 3;
+const MEMORY_EXTRACT_EXISTING_MAX = 120;
+
+const MEMORY_EXTRACT_SYSTEM = [
+  'You maintain a long-term memory of facts about the USER so a future conversation can feel like talking to someone who knows them.',
+  'Read the turn and decide whether it revealed anything about the user worth remembering in LATER, DIFFERENT conversations.',
+  'Worth saving: their name, role, job, or field; skills and experience level; ongoing projects, goals, and what they are building; preferences (tone, format, language, tools, stack, food, style); people, pets, and places in their life; where they live or their time zone; lasting constraints (dietary, accessibility, budget, schedule); how they like the assistant to respond.',
+  'Do NOT save: the one-off task or question itself, the topic being discussed, facts about the world, anything only the ASSISTANT said, passing moods or states ("tired today"), or anything already captured by EXISTING MEMORIES.',
+  'NEVER save passwords, API keys, secrets, account or card numbers, government ID numbers, or exact addresses.',
+  'Health conditions, religion, sexual orientation, political views, and precise finances: save ONLY if the user explicitly asked you to remember them.',
+  'If a new fact UPDATES or CONTRADICTS an existing memory, emit the new fact and list the old memory\'s number in "replaces". Prefer one merged, up-to-date fact over two overlapping ones.',
+  `At most ${MEMORY_EXTRACT_MAX} candidates. Most turns reveal nothing new — an empty list is a normal answer. Rate importance "high", "medium", or "low"; only high and medium are kept.`,
+  'Phrase each as a short third-person fact about the user (e.g. "Is vegetarian", "Building a Godot platformer called Skyreach", "Prefers concise answers with code first"). Never phrase one as an instruction to the assistant.',
+  'Return JSON ONLY: {"candidates":[{"content":"...","importance":"high|medium","replaces":[<numbers>]}]}.',
+].join('\n');
+
+// A memory is quoted into every future prompt, so one that reads as a command
+// to the model is an injection vector, whatever the model rated it.
+const MEMORY_INSTRUCTION_RE = /\b(ignore|disregard|override)\b.{0,40}\b(instruction|prompt|rule|previous|above)|\b(system prompt|you must|you are now|act as)\b/i;
+
+function buildMemoryExtractUser({ userMessage, aiResponse, existing }) {
+  const existingBlock = existing.length > 0
+    ? existing.map((m, i) => `${i + 1}. ${m}`).join('\n')
+    : '(none)';
+  return [
+    'EXISTING MEMORIES:',
+    existingBlock,
+    '',
+    'USER MESSAGE:',
+    userMessage.slice(0, 2000),
+    '',
+    'ASSISTANT RESPONSE:',
+    (typeof aiResponse === 'string' ? aiResponse : '').slice(0, 2000),
+    '',
+    'Return JSON: {"candidates":[{"content":"...","importance":"high|medium","replaces":[]}]}',
+  ].join('\n');
+}
+
+/** Parse + gate the extractor's reply. Pure; the client copy must match it. */
+function parseMemoryCandidates(raw, existing) {
+  const match = typeof raw === 'string' ? raw.match(/\{[\s\S]*\}/) : null;
+  if (!match) return [];
+  let parsed;
+  try { parsed = JSON.parse(match[0]); } catch { return []; }
+  const list = Array.isArray(parsed?.candidates) ? parsed.candidates : [];
+  const norm = s => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+  const existingNorm = new Set(existing.map(norm));
+  const seen = new Set();
+  const out = [];
+  for (const c of list) {
+    if (!c || typeof c.content !== 'string') continue;
+    const importance = String(c.importance || '').trim().toLowerCase();
+    if (importance !== 'high' && importance !== 'medium') continue;
+    const content = c.content.replace(/\s+/g, ' ').trim();
+    if (!content || content.length > 500) continue;
+    if (MEMORY_INSTRUCTION_RE.test(content)) continue;
+    const key = norm(content);
+    if (!key || existingNorm.has(key) || seen.has(key)) continue;
+    seen.add(key);
+    const replaces = Array.isArray(c.replaces)
+      ? [...new Set(c.replaces.map(Number).filter(n => Number.isInteger(n) && n >= 1 && n <= existing.length))]
+          .map(n => existing[n - 1])
+      : [];
+    out.push(replaces.length ? { content, replaces } : { content });
+    if (out.length >= MEMORY_EXTRACT_MAX) break;
+  }
+  return out;
+}
+
 async function extractMemoryCandidates({ userMessage, aiResponse, existingMemories, requireZdr = false }) {
   const empty = { candidates: [] };
   if (typeof userMessage !== 'string' || !userMessage.trim()) return empty;
 
   const existing = Array.isArray(existingMemories)
-    ? existingMemories.filter(m => typeof m === 'string' && m.trim()).slice(0, 50)
+    ? existingMemories.filter(m => typeof m === 'string' && m.trim()).map(m => m.trim()).slice(0, MEMORY_EXTRACT_EXISTING_MAX)
     : [];
 
-  const system = [
-    'You extract DURABLE, HIGH-VALUE facts about the user that will materially improve future conversations.',
-    'The bar is HIGH. Saving a memory is a long-term commitment, so the default answer is to save NOTHING.',
-    'Only keep a fact that is ALL of: (a) stable over months, (b) volunteered as a fact about the user themselves (not the topic), (c) likely to change how you answer an UNRELATED future message, and (d) not already implied by EXISTING MEMORIES.',
-    'Keep ONLY things like: a durable stated preference, a long-running project or role, an enduring personal constraint, or the name of a person/pet/place tied to the user.',
-    'Skip everything else, including: one-off questions or tasks, the topic or subject matter being discussed, facts about the world, anything the ASSISTANT said, transient or in-progress state, opinions about your reply, restatable trivia, and anything an unrelated future chat would not benefit from.',
-    'When in doubt, SKIP. An empty array is the correct and expected answer for the large majority of turns. Precision massively over recall.',
-    'At most 1 candidate. Rate each candidate\'s importance as "high", "medium", or "low" — only "high" will be kept, so do not bother emitting a candidate you would not rate "high".',
-    'Phrase each as a concise third-person fact (e.g. "Prefers dark mode in all apps", "Owns a 2019 Tesla Model 3").',
-    'Return JSON ONLY of the form: {"candidates":[{"content":"...","importance":"high"}]}.'
-  ].join('\n');
-
-  const existingBlock = existing.length > 0
-    ? existing.map((m, i) => `${i + 1}. ${m}`).join('\n')
-    : '(none)';
-  const trimmedResponse = (typeof aiResponse === 'string' ? aiResponse : '').slice(0, 2000);
-  const trimmedUser = userMessage.slice(0, 2000);
-
-  const user = [
-    'EXISTING MEMORIES:',
-    existingBlock,
-    '',
-    'USER MESSAGE:',
-    trimmedUser,
-    '',
-    'ASSISTANT RESPONSE:',
-    trimmedResponse,
-    '',
-    'Return JSON: {"candidates":[{"content":"...","importance":"high|medium|low"}]}'
-  ].join('\n');
-
-  const EXTRACT_TIMEOUT_MS = 6000;
+  const EXTRACT_TIMEOUT_MS = 8000;
 
   try {
     const result = await Promise.race([
       openRouterChat(
         [
-          { role: 'system', content: system },
-          { role: 'user', content: user }
+          { role: 'system', content: MEMORY_EXTRACT_SYSTEM },
+          { role: 'user', content: buildMemoryExtractUser({ userMessage, aiResponse, existing }) }
         ],
         MEMORY_HELPER_MODEL,
-        { temperature: 0, maxTokens: 300, requireZdr }
+        { temperature: 0, maxTokens: 400, requireZdr }
       ),
       new Promise((_, reject) => setTimeout(() => reject(new Error('memory-extract timeout')), EXTRACT_TIMEOUT_MS))
     ]);
-
     const raw = result?.choices?.[0]?.message?.content || '';
-    const match = raw.match(/\{[\s\S]*\}/);
-    if (!match) return empty;
-    const parsed = JSON.parse(match[0]);
-    const list = Array.isArray(parsed.candidates) ? parsed.candidates : [];
-    const candidates = list
-      // Strict gate: only explicitly "high" importance survives. A missing or
-      // non-"high" rating is dropped — the default is to save nothing.
-      .filter(c => c && typeof c.content === 'string'
-        && String(c.importance || '').trim().toLowerCase() === 'high')
-      .map(c => c.content.trim())
-      .filter(s => s.length > 0 && s.length <= 500)
-      .slice(0, 1)
-      .map(content => ({ content }));
-    return { candidates };
+    return { candidates: parseMemoryCandidates(raw, existing) };
   } catch (err) {
     Sentry.captureException(err, { level: 'warning', tags: { op: 'memory_extract' } });
     logger.warn('[extractMemoryCandidates] failed:', err.message);
@@ -2846,7 +2844,7 @@ async function extractMemoryCandidates({ userMessage, aiResponse, existingMemori
   }
 }
 
-module.exports = { generateText, generateTextStream, proxyChatCompletion, proxyRequestBounds, withProxyPromptCacheHints, estimateTokens, calcOpenRouterCost, fetchOpenRouterCost, fetchOpenRouterUsage, calcInferenceCost, priceUsage, usageFacts, applyReportedCost, calcImageGenCost, generateImage, submitVideoGeneration, getVideoModelRuntimeCaps, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, listSubscriptionCatalog, formatImageGenErrorForUser, formatVideoGenErrorForUser, formatVideoJobFailureForUser, isInvalidImageError, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, windowHistory, orHeaders, resolveUseZdrKey,
+module.exports = { generateText, generateTextStream, proxyChatCompletion, proxyRequestBounds, withProxyPromptCacheHints, estimateTokens, calcOpenRouterCost, fetchOpenRouterCost, fetchOpenRouterUsage, calcInferenceCost, priceUsage, usageFacts, applyReportedCost, calcImageGenCost, generateImage, submitVideoGeneration, getVideoModelRuntimeCaps, pollVideoGeneration, downloadVideoBuffer, listEnabledModels, listSubscriptionCatalog, formatImageGenErrorForUser, formatVideoGenErrorForUser, formatVideoJobFailureForUser, isInvalidImageError, ensureModelRateConfig, isVideoInputModel, isImageInputModel, selectRelevantMemories, extractMemoryCandidates, parseMemoryCandidates, MEMORY_EXTRACT_SYSTEM, MEMORY_PROMPT_CHAR_BUDGET, windowHistory, orHeaders, resolveUseZdrKey,
   // Shared formatting helpers reused by nearAiService (OpenAI-compatible NEAR path).
   NO_TABLES_DIRECTIVE, withNoTables, convertTablesToBullets, createStreamingTableConverter,
   // og:image enrichment for source cards — also applied to the Brave web-search path.
